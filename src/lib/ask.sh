@@ -61,7 +61,13 @@ cmd_ask() {
         print -P "    ${C[dim]}/ask summarise the last 5 minutes${C[reset]}"
         return 1
     fi
-    if ! command -v claude >/dev/null 2>&1; then
+    # Resolve the active backend up front so we only enforce backend-specific
+    # prerequisites — the claude CLI is NOT needed for the local/lmstudio paths.
+    local backend="claude"
+    if typeset -f title_backend_active >/dev/null; then
+        backend=$(title_backend_active)
+    fi
+    if [[ "$backend" == "claude" ]] && ! command -v claude >/dev/null 2>&1; then
         print -P "${C[red]}error:${C[reset]} ${C[bold]}claude${C[reset]} CLI not found"
         print -P "  Install Claude Code from ${C[dim]}https://claude.com/code${C[reset]}"
         return 1
@@ -133,14 +139,12 @@ ${transcript_text}"
 Question from the user: ${question}"
 
     # Dispatch by the same backend setting that titling uses, so /llm backend
-    # local makes /ask local too. Honours MEETINK_TITLE_BACKEND env override.
-    local backend="claude"
-    if typeset -f title_backend_active >/dev/null; then
-        backend=$(title_backend_active)
-    fi
-
+    # <name> makes /ask follow suit. ($backend was resolved at the top of
+    # cmd_ask, honouring the MEETINK_TITLE_BACKEND env override.)
     if [[ "$backend" == "local" ]]; then
         _ask_local "$prompt"
+    elif [[ "$backend" == "lmstudio" ]]; then
+        _ask_lmstudio "$prompt"
     else
         _ask_claude "$prompt"
     fi
@@ -218,5 +222,20 @@ _ask_local() {
                 for (i = start; i <= last; i++) print collected[i]
             }
         '
+    print -P ""
+}
+
+_ask_lmstudio() {
+    local user_prompt="$1"
+    if ! _lmstudio_available; then
+        print -P "${C[red]}error:${C[reset]} LM Studio not reachable at ${C[bold]}$(lmstudio_endpoint)${C[reset]}"
+        print -P "  Start LM Studio's local server, or switch backend with ${C[bright_cyan]}/llm backend claude${C[reset]}"
+        return 1
+    fi
+    local model=$(lmstudio_model_resolve 2>/dev/null)
+    local system_prompt="You answer questions about a meeting transcript. Be concise and grounded only in the transcript and provided context. If the transcript doesn't contain enough information, say so plainly rather than guessing."
+    print -P "${C[dim]}Asking ${model}...${C[reset]}"
+    print -P ""
+    _generate_lmstudio "$system_prompt" "$user_prompt" 512 0.4
     print -P ""
 }
