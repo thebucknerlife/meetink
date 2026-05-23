@@ -144,7 +144,7 @@ title_backend_active() {
     fi
     if [[ -f "$MK_CONFIG_FILE" ]]; then
         local v=$(grep '^title_backend=' "$MK_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
-        if [[ "$v" == "local" || "$v" == "claude" ]]; then
+        if [[ "$v" == "local" || "$v" == "claude" || "$v" == "lmstudio" ]]; then
             print -n -- "$v"
             return
         fi
@@ -186,8 +186,9 @@ _claude_available() {
 # True when the active backend's deps are present.
 llm_available() {
     case "$(title_backend_active)" in
-        claude) _claude_available ;;
-        *)      _local_available  ;;
+        claude)   _claude_available ;;
+        lmstudio) _lmstudio_available ;;
+        *)        _local_available  ;;
     esac
 }
 
@@ -387,6 +388,13 @@ llm_status() {
         else
             print -P "  ${C[gray]}○${C[reset]} claude CLI not installed ${C[dim]}(install Claude Code)${C[reset]}"
         fi
+    elif [[ "$backend" == "lmstudio" ]]; then
+        print -P "  Endpoint: ${C[bold]}$(lmstudio_endpoint)${C[reset]}"
+        if _lmstudio_reachable; then
+            print -P "  ${C[green]}●${C[reset]} server reachable ${C[dim]}(model: $(lmstudio_model_resolve 2>/dev/null))${C[reset]}"
+        else
+            print -P "  ${C[gray]}○${C[reset]} server not reachable ${C[dim]}(start LM Studio's local server)${C[reset]}"
+        fi
     else
         if command -v llama-completion >/dev/null 2>&1; then
             print -P "  ${C[green]}●${C[reset]} llama.cpp installed"
@@ -474,6 +482,24 @@ Topic (3-5 words):"
         2>/dev/null
 }
 
+_generate_title_lmstudio() {
+    local content="$1"
+    # Note: deliberately omits the local path's "if unclear, output: untitled
+    # session" escape hatch — small LM Studio models (e.g. qwen3-1.7b) latch
+    # onto it and emit "untitled session" for almost any input. generate_title
+    # already treats empty output as "skip rename", so the hatch isn't needed.
+    local system_prompt="You name the SUBJECT of a meeting transcript in 3 to 5 lowercase words.
+Output rules:
+- ONLY the 3-5 word topic, nothing else
+- lowercase, no punctuation, no quotes, no \"title:\" prefix
+- describe what was discussed; do NOT say \"meeting\", \"transcript\", or \"conversation\"
+- always produce a topic from whatever is discussed"
+    local user_prompt="${content}
+
+Topic (3-5 words):"
+    _generate_lmstudio "$system_prompt" "$user_prompt" 30 0.3
+}
+
 _generate_title_claude() {
     local content="$1"
     local model=$(claude_model_active)
@@ -512,8 +538,9 @@ generate_title() {
 
     local raw
     case "$(title_backend_active)" in
-        claude) raw=$(_generate_title_claude "$content") ;;
-        *)      raw=$(_generate_title_local  "$content") ;;
+        claude)   raw=$(_generate_title_claude   "$content") ;;
+        lmstudio) raw=$(_generate_title_lmstudio "$content") ;;
+        *)        raw=$(_generate_title_local    "$content") ;;
     esac
 
     local title=$(_clean_title "$raw")
@@ -657,13 +684,21 @@ cmd_llm() {
             llm_install
             ;;
         list|ls|models)
-            llm_list
+            if [[ "$(title_backend_active)" == "lmstudio" ]]; then
+                lmstudio_list
+            else
+                llm_list
+            fi
             ;;
         download|dl|get)
             llm_download "$2"
             ;;
         use|switch|set)
-            llm_use "$2"
+            if [[ "$(title_backend_active)" == "lmstudio" ]]; then
+                lmstudio_model_set "$2"
+            else
+                llm_use "$2"
+            fi
             ;;
         rm|remove|delete|uninstall)
             llm_remove "$2"
@@ -673,8 +708,9 @@ cmd_llm() {
             case "$choice" in
                 "")
                     print -P "  Backend: ${C[bold]}$(title_backend_active)${C[reset]}"
-                    print -P "  ${C[dim]}/llm backend local${C[reset]}   on-device (Qwen3-0.6B, fast, offline)"
-                    print -P "  ${C[dim]}/llm backend claude${C[reset]}  Claude via subscription (best quality, network)"
+                    print -P "  ${C[dim]}/llm backend local${C[reset]}     on-device MLX (Qwen3.5, fast, offline)"
+                    print -P "  ${C[dim]}/llm backend lmstudio${C[reset]}  models served by LM Studio"
+                    print -P "  ${C[dim]}/llm backend claude${C[reset]}    Claude via subscription (best quality, network)"
                     ;;
                 local)
                     title_backend_set "local"
@@ -688,8 +724,17 @@ cmd_llm() {
                         print -P "  ${C[red]}!${C[reset]} ${C[dim]}claude CLI not found — install Claude Code from https://claude.com/code${C[reset]}"
                     fi
                     ;;
+                lmstudio)
+                    title_backend_set "lmstudio"
+                    print -P "${C[green]}✓${C[reset]} Backend set to ${C[bold]}lmstudio${C[reset]} ${C[dim]}($(lmstudio_endpoint))${C[reset]}"
+                    if ! _lmstudio_reachable; then
+                        print -P "  ${C[red]}!${C[reset]} ${C[dim]}server not reachable — start LM Studio's local server${C[reset]}"
+                    elif [[ -z "$(lmstudio_model_get)" ]]; then
+                        print -P "  ${C[dim]}Using LM Studio's loaded model. Pin one with${C[reset]} ${C[bright_cyan]}/llm use <id>${C[reset]} ${C[dim]}(see /llm list).${C[reset]}"
+                    fi
+                    ;;
                 *)
-                    print -P "${C[red]}unknown backend:${C[reset]} ${C[dim]}$choice${C[reset]} ${C[dim]}(use: local | claude)${C[reset]}"
+                    print -P "${C[red]}unknown backend:${C[reset]} ${C[dim]}$choice${C[reset]} ${C[dim]}(use: local | lmstudio | claude)${C[reset]}"
                     ;;
             esac
             ;;
