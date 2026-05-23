@@ -194,6 +194,17 @@ def cmd_summarize(args) -> int:
         if res.returncode != 0:
             _die(3, f"claude failed: {res.stderr.strip() or 'no stderr'}")
         out = res.stdout
+    elif backend == "lmstudio":
+        try:
+            from llm.server_helper import chat
+        except ImportError:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from llm.server_helper import chat
+        try:
+            out = chat(args.endpoint, model, _SUMMARY_SYSTEM, body,
+                       max_tokens=600, temp=0.3)
+        except Exception as e:  # noqa: BLE001 - surface any client/transport error
+            _die(3, f"lmstudio request failed: {e}")
     else:
         _die(2, f"unknown backend: {backend}")
 
@@ -274,11 +285,13 @@ def main() -> int:
     p_sum = sub.add_parser("summarize")
     p_sum.add_argument("input", help="path to converted .md file")
     p_sum.add_argument("--output", default="-")
-    p_sum.add_argument("--backend", choices=["local", "claude"], required=True)
+    p_sum.add_argument("--backend", choices=["local", "claude", "lmstudio"], required=True)
     p_sum.add_argument("--model", required=True,
                        help="model identifier for frontmatter (e.g., qwen3.5-2b, claude-sonnet-4-6)")
     p_sum.add_argument("--model-path", default="",
                        help="MLX snapshot dir (required for backend=local)")
+    p_sum.add_argument("--endpoint", default="http://127.0.0.1:1234",
+                       help="LM Studio base URL (backend=lmstudio)")
     p_sum.set_defaults(fn=cmd_summarize)
 
     p_tok = sub.add_parser("tokens")
