@@ -79,6 +79,14 @@ _summary_generate_local() {
 }
 
 
+# Same via the LM Studio backend (OpenAI-compatible server). Higher max_tokens
+# than titling because we want the four bullet sections.
+_summary_generate_lmstudio() {
+    local transcript_text="$1"
+    _generate_lmstudio "$(_summary_system_prompt)" "$transcript_text" 600 0.3
+}
+
+
 # Same via Claude. Same flags as titling/ask: no tools, no MCP — fast and
 # costs less of the user's subscription quota.
 _summary_generate_claude() {
@@ -118,6 +126,11 @@ summary_save() {
             fi
             model_label=$(claude_model_active)
             raw=$(_summary_generate_claude "$body") || return 1
+            ;;
+        lmstudio)
+            _lmstudio_available || return 1
+            model_label=$(lmstudio_model_resolve 2>/dev/null)
+            raw=$(_summary_generate_lmstudio "$body") || return 1
             ;;
         *)
             model_label=$(local_llm_active_get)

@@ -24,7 +24,7 @@ _titling_backend() {
     fi
     if [[ -f "$MK_HOME/config" ]]; then
         local v=$(grep '^title_backend=' "$MK_HOME/config" 2>/dev/null | head -1 | cut -d= -f2-)
-        if [[ "$v" == "claude" || "$v" == "local" ]]; then
+        if [[ "$v" == "claude" || "$v" == "local" || "$v" == "lmstudio" ]]; then
             print -n -- "$v"
             return
         fi
@@ -35,6 +35,15 @@ _titling_backend() {
 # Short, human-friendly label for the active titling model. "Sonnet", "Haiku",
 # "Opus" for Claude variants, "Qwen3" for the local model.
 _titling_label() {
+    if [[ "$(_titling_backend)" == "lmstudio" ]]; then
+        local m="${MEETINK_LMSTUDIO_MODEL:-}"
+        if [[ -z "$m" && -f "$MK_HOME/config" ]]; then
+            m=$(grep '^lmstudio_model=' "$MK_HOME/config" 2>/dev/null | head -1 | cut -d= -f2-)
+        fi
+        [[ -z "$m" ]] && m="LM Studio"
+        print -n -- "$m"
+        return
+    fi
     if [[ "$(_titling_backend)" == "claude" ]]; then
         local model="${MEETINK_CLAUDE_MODEL:-}"
         if [[ -z "$model" && -f "$MK_HOME/config" ]]; then
@@ -91,6 +100,11 @@ _active_local_llm_path() {
 _has_titling() {
     if [[ "$(_titling_backend)" == "claude" ]]; then
         command -v claude >/dev/null 2>&1
+    elif [[ "$(_titling_backend)" == "lmstudio" ]]; then
+        # Cheap check (no network ping on the landing page): a model is pinned
+        # via env or config. Real reachability is verified at use time.
+        [[ -n "${MEETINK_LMSTUDIO_MODEL:-}" ]] || \
+            { [[ -f "$MK_HOME/config" ]] && grep -q '^lmstudio_model=' "$MK_HOME/config" 2>/dev/null; }
     else
         # Cheap presence check via the venv's site-packages (avoid spawning
         # python just to print "yes"). Glob for any python* version dir.

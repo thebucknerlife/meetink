@@ -234,6 +234,13 @@ context_add() {
             fi
             model_label=$(claude_model_active)
             ;;
+        lmstudio)
+            if ! _lmstudio_available; then
+                print -P "  ${C[yellow]}⚠${C[reset]} LM Studio not reachable — skipping summary"
+                return 0
+            fi
+            model_label=$(lmstudio_model_resolve 2>/dev/null)
+            ;;
         *)
             model_label=$(local_llm_active_get)
             model_path=$(llm_path "$model_label")
@@ -252,7 +259,8 @@ context_add() {
             --output "$summary_target" \
             --backend "$backend" \
             --model "$model_label" \
-            --model-path "$model_path"; then
+            --model-path "$model_path" \
+            --endpoint "$(lmstudio_endpoint)"; then
         local s_tokens=$(_context_token_count "$summary_target")
         print -P "${C[green]}✓${C[reset]} Summary written ${C[dim]}(${s_tokens} tokens)${C[reset]}"
     else
