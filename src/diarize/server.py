@@ -285,6 +285,15 @@ PROFILE_TIME_DECAY_TAU_S = float(
 # converges in 5-10 iters; 20 is plenty of headroom.
 _KMEANS_MAX_ITERS = 20
 
+# Hard cap on samples retained per profile. The auto-train path (_add_sample)
+# appends a row on every high-confidence /identify match; without a cap a
+# single frequently-matched speaker grows the profile matrix unboundedly over
+# a long-running session — the same np.vstack-growth pattern that fragments
+# libmalloc and leaked tens of GB via the cluster path. 500 recent samples is
+# far more than anyone enrols manually, so this only ever bounds runaway
+# auto-train accumulation. Time-decay still weights within the retained window.
+PROFILE_MAX_SAMPLES = int(os.environ.get("MEETINK_PROFILE_MAX_SAMPLES", "500"))
+
 
 # --- Session whitelist ----------------------------------------------------
 #
@@ -651,6 +660,20 @@ def _outlier_reject(name: str, new_emb_l2: np.ndarray) -> tuple[bool, float]:
     return best_sim < PROFILE_OUTLIER_FLOOR, best_sim
 
 
+def _cap_recent(
+    samples: np.ndarray, timestamps: np.ndarray, n: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep the most-recent `n` (sample, timestamp) rows.
+
+    Returns contiguous copies (NOT slice views) so the oversized pre-cap array
+    is released — a numpy view would keep its base alive and defeat the bound.
+    Capping keeps every subsequent allocation the same size class, so the
+    libmalloc MEDIUM magazine stops fragmenting (root cause of the RSS leak)."""
+    if samples.shape[0] > n:
+        return samples[-n:].copy(), timestamps[-n:].copy()
+    return samples, timestamps
+
+
 def _add_sample(
     name: str, embedding: np.ndarray, source: str = "manual",
 ) -> tuple[int, bool, float]:
@@ -680,6 +703,9 @@ def _add_sample(
         all_samples = np.vstack([profiles[name]["samples"], new[None, :]])
         all_timestamps = np.concatenate(
             [profiles[name]["timestamps"], [now]]
+        )
+        all_samples, all_timestamps = _cap_recent(
+            all_samples, all_timestamps, PROFILE_MAX_SAMPLES,
         )
     else:
         all_samples = new[None, :]
@@ -743,6 +769,9 @@ def _add_samples_bulk(
         all_samples = np.vstack([profiles[name]["samples"], accepted])
         all_timestamps = np.concatenate(
             [profiles[name]["timestamps"], timestamps_new]
+        )
+        all_samples, all_timestamps = _cap_recent(
+            all_samples, all_timestamps, PROFILE_MAX_SAMPLES,
         )
     else:
         all_samples = accepted
@@ -997,8 +1026,17 @@ def identify(emb: np.ndarray) -> dict:
 # the session even if cluster A gets converted to the Alice profile mid-meeting.
 # ---------------------------------------------------------------------------
 
-clusters: list[dict] = []  # each: {"letter": str, "centroid": 1×D, "samples": N×D}
+clusters: list[dict] = []  # each: {"letter": str, "centroid": 1×D, "samples": ≤CLUSTER_MAX_SAMPLES×D}
 _next_cluster_idx: int = 0
+
+# Hard cap on samples retained per session cluster. _cluster_or_create appends
+# a row on EVERY unmatched /identify; an uncapped np.vstack grew the matrix
+# without bound and the monotonic-growth realloc churn fragmented libmalloc's
+# MEDIUM magazine — the confirmed cause of the ~44 GB / 5-day RSS leak. A small
+# recent-window cap keeps the cluster centroid stable (it converges well before
+# 64 samples) while making every allocation the same size class, so the heap
+# stops fragmenting. Override via MEETINK_CLUSTER_MAX_SAMPLES.
+CLUSTER_MAX_SAMPLES = int(os.environ.get("MEETINK_CLUSTER_MAX_SAMPLES", "64"))
 
 
 def _letter_for(idx: int) -> str:
@@ -1029,6 +1067,12 @@ def _cluster_or_create(emb: np.ndarray) -> tuple[str, float]:
         sim = cosine(emb, best["centroid"])
         if sim >= settings["cluster_threshold"]:
             new_samples = np.vstack([best["samples"], _l2(emb)[np.newaxis, :]])
+            # Cap to the most-recent CLUSTER_MAX_SAMPLES rows. .copy() so the
+            # pre-cap array is released (a view would keep its base alive).
+            # This bounds memory AND stops the libmalloc fragmentation that
+            # leaked tens of GB — see CLUSTER_MAX_SAMPLES.
+            if new_samples.shape[0] > CLUSTER_MAX_SAMPLES:
+                new_samples = new_samples[-CLUSTER_MAX_SAMPLES:].copy()
             best["samples"] = new_samples
             best["centroid"] = _centroid(new_samples)
             return best["letter"], round(sim, 3)

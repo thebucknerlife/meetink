@@ -1,6 +1,24 @@
 # Changelog
 
 ## [unreleased] - 2026-05-23
+### Fixes
+- **diarize-server memory leak (~44 GB over 5 days).** `_cluster_or_create`
+  appended a row to a session cluster's sample matrix via `np.vstack` on every
+  unmatched `/identify`, with no cap. The monotonically-growing realloc churn
+  fragmented macOS libmalloc's MEDIUM magazine (which never returns freed
+  blocks to the OS), so RSS ballooned to ~73× the live data and persisted even
+  across `/session/clear`. Root-caused by isolation (constant-input `embed()`
+  plateaus at ~650 MB; the cluster churn alone hit 1.5 GB per 20k calls).
+  Fixed by capping per-cluster samples to the most-recent `CLUSTER_MAX_SAMPLES`
+  (default 64, `MEETINK_CLUSTER_MAX_SAMPLES`) with a contiguous copy, so every
+  allocation stays the same size class and the heap no longer fragments. The
+  same recent-window cap now bounds the auto-train profile path
+  (`PROFILE_MAX_SAMPLES`, default 500, `MEETINK_PROFILE_MAX_SAMPLES`). Verified:
+  the cluster path's RSS growth dropped from +1502 MB/20k calls to +3.3 MB/40k
+  calls (flat); the full `embed()`+cluster `/identify` path plateaus at ~700 MB.
+  Bonus: also removes the latent O(N²) per-call CPU cost of recomputing the
+  centroid over an ever-growing matrix.
+
 ### Features
 - New `lmstudio` LLM backend: titling, per-meeting summaries, context-doc
   summaries, and `/ask` can use models served by LM Studio's local server
