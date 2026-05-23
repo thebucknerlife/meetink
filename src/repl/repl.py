@@ -177,7 +177,7 @@ def profile_count() -> int:
 def _title_backend() -> str:
     """Mirror title_backend_active() in titling.sh: env > config > default."""
     env = os.environ.get("MEETINK_TITLE_BACKEND")
-    if env in ("local", "claude"):
+    if env in ("local", "claude", "lmstudio"):
         return env
     cfg = MK_HOME / "config"
     if cfg.exists():
@@ -185,7 +185,7 @@ def _title_backend() -> str:
             for line in cfg.read_text().splitlines():
                 if line.startswith("title_backend="):
                     val = line.split("=", 1)[1].strip()
-                    if val in ("local", "claude"):
+                    if val in ("local", "claude", "lmstudio"):
                         return val
         except OSError:
             pass
@@ -277,6 +277,18 @@ def _titling_label() -> str:
         if "haiku" in m:  return "Haiku"
         if "opus" in m:   return "Opus"
         return _claude_model()
+    if _title_backend() == "lmstudio":
+        cfg = MK_HOME / "config"
+        if cfg.exists():
+            try:
+                for line in cfg.read_text().splitlines():
+                    if line.startswith("lmstudio_model="):
+                        val = line.split("=", 1)[1].strip()
+                        if val:
+                            return val
+            except OSError:
+                pass
+        return "LM Studio"
     active = ""
     cfg = MK_HOME / "config"
     if cfg.exists():
@@ -613,11 +625,32 @@ def _claude_budget() -> int:
     return 200_000
 
 
+def _lmstudio_budget() -> int:
+    """Context window for the active LM Studio model, persisted as
+    lmstudio_ctx= by `/llm use` (set from the model's loaded/max context).
+    Falls back to a conservative default. Tokens, not characters."""
+    cfg = MK_HOME / "config"
+    if cfg.exists():
+        try:
+            for line in cfg.read_text().splitlines():
+                if line.startswith("lmstudio_ctx="):
+                    val = line.split("=", 1)[1].strip()
+                    if val.isdigit():
+                        return int(val)
+        except OSError:
+            pass
+    return 8_000
+
+
 def _active_backend_budget() -> int:
     """Token budget of whichever backend is currently active. For local
-    that's the per-quant /ask budget; for claude, the model's window."""
-    if _title_backend() == "claude":
+    that's the per-quant /ask budget; for claude, the model's window;
+    for lmstudio, the active model's reported context window."""
+    backend = _title_backend()
+    if backend == "claude":
         return _claude_budget()
+    if backend == "lmstudio":
+        return _lmstudio_budget()
     return _ask_budget_for(_active_local_llm_key())
 
 
@@ -968,7 +1001,7 @@ _NESTED_COMMANDS = {
         "download": _local_llm_completer,
         "use": _local_llm_completer,
         "rm": _local_llm_completer,
-        "backend": {"local": None, "claude": None},
+        "backend": {"local": None, "lmstudio": None, "claude": None},
         "model": {"sonnet": None, "haiku": None, "opus": None},
     },
     "/diarize": {
