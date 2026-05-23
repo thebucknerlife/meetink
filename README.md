@@ -333,7 +333,10 @@ The registry covers `tiny.en`, `base.en`, `small.en` (default), `small.en-tdrz`,
 | `/llm rm <name>` | Delete a snapshot. |
 | `/llm backend` | Show the current backend. |
 | `/llm backend local` | On-device Qwen3.5-*-4bit via MLX. Default. |
+| `/llm backend lmstudio` | Use models served by **LM Studio** (its OpenAI-compatible local server, default `http://127.0.0.1:1234`). Auto-discovers whatever LM Studio has downloaded — no re-download into meetink. Requires LM Studio's local server running (Developer tab → Start Server, or `lms server start`). |
 | `/llm backend claude` | Use `claude -p` (Claude Code in headless mode). Bills against your Claude Pro/Max subscription — no API key. |
+| `/llm list` *(lmstudio)* | When `backend=lmstudio`, lists the models LM Studio serves with quantization, context length, and loaded/not-loaded state instead of the MLX registry. |
+| `/llm use <id>` *(lmstudio)* | When `backend=lmstudio`, pin which LM Studio model meetink uses (e.g. `qwen3-1.7b-mlx` for fast titling, a larger one for `/ask`). Defaults to LM Studio's currently-loaded model. |
 | `/llm model <name>` | When `backend=claude`, pin the Claude model (`sonnet` / `haiku` / `opus` / a full id like `claude-sonnet-4-6`). |
 
 The local model registry:
@@ -346,6 +349,8 @@ The local model registry:
 | `qwen3.5-9b` | 5.4 GB | ~7.5 GB | Best local `/ask` quality. |
 
 `/ask` uses a model-aware token budget (8K / 16K / 16K / 32K) and falls back from full-doc context → per-doc summaries → no past meetings if the prompt would overflow.
+
+**LM Studio backend.** If you already run [LM Studio](https://lmstudio.ai), `/llm backend lmstudio` lets meetink use the models it serves — no separate download into meetink's MLX store. `/llm list` shows whatever LM Studio has (id, quantization, context length, loaded state) by querying its local server; `/llm use <id>` pins one. Titling, summaries, and `/ask` then route to LM Studio's OpenAI-compatible `/v1/chat/completions`. Pick a small model (e.g. `qwen3-1.7b-mlx`) for fast titles and a larger one for `/ask` quality. The `/ask` budget chip uses the model's reported context window. When the server isn't running, titling/summaries no-op gracefully and `/ask` says so — your `local`/`claude` setup is unaffected.
 
 ### Asking questions
 
@@ -796,13 +801,15 @@ Transcripts default to `~/Documents/meetink/` because they're your data — they
 | `MEETINK_PROFILES_DIR` | `$MEETINK_HOME/profiles` | Voice-profile `.npz` files. |
 | `MEETINK_DIARIZE_PORT` | `8179` | Diarize sidecar port. |
 | `MEETINK_LLM_MODEL` | resolved from registry | Path to the local MLX snapshot. Override to point at any locally available MLX-format model. |
+| `MEETINK_LMSTUDIO_URL` | `http://127.0.0.1:1234` | Base URL for the `lmstudio` backend's OpenAI-compatible server. Point at any compatible server (llama.cpp-server, vLLM, …). |
+| `MEETINK_LMSTUDIO_MODEL` | unset | Pin the LM Studio model id without persisting it to `~/.meetink/config`. Wins over `/llm use`. |
 
 ### Behaviour
 
 | Variable | Default | What it controls |
 |---|---|---|
 | `MEETINK_ME_NAME` | unset | Mic-stream label override. Normally set by `/me` via the launcher. |
-| `MEETINK_TITLE_BACKEND` | `local` | `local` or `claude`. Wins over `~/.meetink/config`. |
+| `MEETINK_TITLE_BACKEND` | `local` | `local`, `lmstudio`, or `claude`. Wins over `~/.meetink/config`. |
 | `MEETINK_CLAUDE_MODEL` | `claude-sonnet-4-6` | Which Claude model to use when backend is `claude`. |
 | `MEETINK_MEETINGS_LOG_KEEP` | `50` | Cap on entries in `<project>/meetings.md`. |
 | `MEETINK_CONTEXT_SUMMARY_THRESHOLD` | `800` | Skip summarising context docs shorter than this many tokens. |
