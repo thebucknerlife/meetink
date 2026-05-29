@@ -1,5 +1,34 @@
 # Changelog
 
+## [unreleased] - 2026-05-28
+### Fixes
+- **diarize-server orphaned after terminal-close (multi-GB leak).** The REPL
+  only ran `diarize_stop` on the graceful exit paths (`/quit`, EOF/Ctrl-D) —
+  there was no `HUP`/`TERM`/`EXIT` trap, so closing the terminal window
+  (SIGHUP) or killing the launcher skipped cleanup and orphaned the
+  `disown`ed sidecar. Observed in the wild as a 10-hour, 31 GB python
+  process. Fixed on two layers: (1) `src/lib/repl.sh` now traps
+  `EXIT`/`HUP`/`TERM` to call the (idempotent) `diarize_stop`, covering
+  terminal-close and SIGTERM; `INT` is intentionally left untrapped so
+  Ctrl-C keeps clearing the input line. (2) `src/diarize/server.py` runs a
+  daemon parent-death watchdog that hard-exits when its PPID changes (kernel
+  reparents to launchd on launcher death), covering the paths a trap can't
+  reach — `kill -9`, panics, power-edge crashes.
+
+### Design Rationale
+- Belt-and-suspenders by design: the trap is the primary, fast path; the
+  watchdog is the safety net for un-trappable deaths. `diarize_stop` is
+  pidfile-guarded so firing via both trap and the existing inline post-loop
+  call is a harmless no-op. PPID-change (rather than `== 1`) is the orphan
+  signal — general across platforms and subreapers.
+
+### Notes & Caveats
+- The watchdog polls every 5 s, so an orphaned server lingers at most ~5 s
+  after its launcher dies (negligible vs. the prior unbounded lifetime).
+- `/stop` still deliberately leaves the sidecar running (cluster inspection
+  / `/profile assign` afterwards); lifetime is bound to the REPL, not to an
+  individual recording.
+
 ## [unreleased] - 2026-05-23
 ### Fixes
 - **diarize-server memory leak (~44 GB over 5 days).** `_cluster_or_create`

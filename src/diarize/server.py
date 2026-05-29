@@ -89,6 +89,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -1845,6 +1846,29 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
 
+def _parent_death_watchdog(poll_s: float = 5.0) -> None:
+    """Exit when our launcher dies, so we never outlive `meetink`.
+
+    The launcher starts us backgrounded + disowned and stops us via its
+    EXIT/HUP/TERM trap (see src/lib/repl.sh). That covers terminal-close and
+    SIGTERM. This watchdog is the belt-and-suspenders for the paths a trap
+    can't reach — `kill -9` of the launcher, a panic, a power-edge crash:
+    when the launcher dies the kernel reparents us to launchd, so our PPID
+    flips away from the value captured at boot. On that change we hard-exit,
+    reclaiming the embedding model's RAM instead of lingering for hours.
+    """
+    initial_ppid = os.getppid()
+    while True:
+        time.sleep(poll_s)
+        if os.getppid() != initial_ppid:
+            print(
+                "diarize-server: launcher exited (PPID changed "
+                f"{initial_ppid} -> {os.getppid()}), shutting down",
+                file=sys.stderr,
+            )
+            os._exit(0)
+
+
 if __name__ == "__main__":
     print(
         f"diarize-server ready on 127.0.0.1:{PORT} "
@@ -1853,4 +1877,5 @@ if __name__ == "__main__":
         f"cluster_threshold={settings['cluster_threshold']})",
         file=sys.stderr,
     )
+    threading.Thread(target=_parent_death_watchdog, daemon=True).start()
     HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

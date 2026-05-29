@@ -302,6 +302,22 @@ repl_loop() {
     # Quietly skipped if not installed.
     diarize_start
 
+    # Tie the sidecar's lifetime to this REPL no matter HOW we leave. The
+    # post-loop `diarize_stop` below only runs on the graceful paths (/quit,
+    # EOF/Ctrl-D). Closing the terminal window (SIGHUP) or killing the
+    # process (SIGTERM) skips it, orphaning a disowned, multi-GB python
+    # process (observed: a 10h, 31GB leak). Trapping EXIT/HUP/TERM is the
+    # real guarantee; the inline diarize_stop stays so teardown ordering on
+    # the graceful path is unchanged. diarize_stop is pidfile-guarded and
+    # idempotent, so firing via both trap and inline is harmless.
+    #
+    # NB: INT is deliberately NOT trapped here — Ctrl-C must keep its
+    # existing "clear the current input line" behaviour inside the loop
+    # (see the INT trap a few lines down).
+    trap 'diarize_stop' EXIT
+    trap 'diarize_stop; exit 129' HUP
+    trap 'diarize_stop; exit 143' TERM
+
     # Live footer: ZLE wakes on a 1-second TMOUT and SIGALRM fires our trap,
     # which asks ZLE to redraw the prompt. Under PROMPT_SUBST that re-runs
     # build_prompt so the footer reflects current state (elapsed time, line
