@@ -407,6 +407,7 @@ cmd_setup() {
     print -P ""
     print -P "${C[bright_yellow]}[3/5] whisper model${C[reset]}"
     model_setup_picker
+    model_download_vad
 
     # 4. REPL Python venv + mlx-lm + Qwen3.5 default. Always installed —
     # this is "the only option" path the user asked for.
@@ -461,6 +462,19 @@ start_whisper_server() {
     if [[ "$MK_MODEL" == *-tdrz* ]]; then
         extra_args+=(-tdrz)
         print -P "${C[dim]}  (tdrz model — speaker-turn detection enabled)${C[reset]}"
+    fi
+
+    # Silero VAD: a real speech/non-speech classifier that runs before
+    # inference, so breathing / keyboard / room tone inside a chunk never
+    # reaches the decoder — the model-level fix for silence hallucinations
+    # ("Okay." / "Mm-hmm." / *Sigh*), complementing the capture binary's
+    # cheap RMS gate. Enabled automatically when the VAD model is on disk;
+    # opt out with MEETINK_VAD=off. Model (~900 KB) ships from ggml-org:
+    #   https://huggingface.co/ggml-org/whisper-vad
+    local vad_model="${MEETINK_VAD_MODEL:-$MK_HOME/models/ggml-silero-v5.1.2.bin}"
+    if [[ "${MEETINK_VAD:-on}" != "off" && -f "$vad_model" ]]; then
+        extra_args+=(--vad --vad-model "$vad_model")
+        print -P "${C[dim]}  (VAD enabled — silero-v5.1.2)${C[reset]}"
     fi
 
     print -P "${C[dim]}Starting whisper-server (port $MK_PORT)...${C[reset]}"

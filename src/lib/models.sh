@@ -273,6 +273,22 @@ model_download() {
     fi
 }
 
+# Silero VAD model for whisper-server's --vad flag: a speech/non-speech
+# classifier that keeps silence-hallucination text ("Okay." / "Mm-hmm." /
+# *Sigh*) out of transcripts by never decoding non-speech audio. ~900 KB,
+# soft failure — start_whisper_server only enables VAD when the file exists.
+model_download_vad() {
+    local target="$MK_HOME/models/ggml-silero-v5.1.2.bin"
+    [[ -f "$target" ]] && return 0
+    local url="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
+    print -P "${C[bright_yellow]}▸${C[reset]} Downloading Silero VAD model ${C[dim]}(~900 KB, filters non-speech before transcription)...${C[reset]}"
+    if mk_download_with_progress "$target" "$url" "silero-vad"; then
+        print -P "${C[green]}✓${C[reset]} VAD model ready"
+    else
+        print -P "${C[yellow]}⚠${C[reset]} VAD model unavailable — continuing without it"
+    fi
+}
+
 # Remove a downloaded model. Refuses to remove the active model. Also
 # cleans up the CoreML companion directory if it was extracted.
 model_remove() {
