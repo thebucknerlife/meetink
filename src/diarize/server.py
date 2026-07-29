@@ -1847,26 +1847,47 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _parent_death_watchdog(poll_s: float = 5.0) -> None:
-    """Exit when our launcher dies, so we never outlive `meetink`.
+    """Exit when the owning REPL dies, so we never outlive `meetink`.
 
     The launcher starts us backgrounded + disowned and stops us via its
     EXIT/HUP/TERM trap (see src/lib/repl.sh). That covers terminal-close and
     SIGTERM. This watchdog is the belt-and-suspenders for the paths a trap
-    can't reach — `kill -9` of the launcher, a panic, a power-edge crash:
-    when the launcher dies the kernel reparents us to launchd, so our PPID
-    flips away from the value captured at boot. On that change we hard-exit,
-    reclaiming the embedding model's RAM instead of lingering for hours.
+    can't reach — `kill -9` of the REPL, a panic, a power-edge crash.
+
+    We watch MEETINK_OWNER_PID (the REPL's own pid, exported at REPL start),
+    NOT our PPID: the Python REPL dispatches every slash command through a
+    short-lived `bin/meetink` subprocess, so the process that actually
+    spawned us exits within seconds by design and our PPID flips to launchd
+    while the REPL is very much alive. (The original PPID-change version of
+    this watchdog killed every REPL-started server ~5 s after boot.)
+
+    Without an owner pid (bare-CLI `meetink diarize start`), there is no
+    process whose lifetime we should track — run unmanaged, like pre-watchdog
+    behaviour. Both REPLs export the variable, so the orphan-leak scenario
+    this watchdog exists for (terminal closed, REPL gone) stays covered.
     """
-    initial_ppid = os.getppid()
+    owner = os.environ.get("MEETINK_OWNER_PID", "")
+    if not owner.isdigit():
+        print(
+            "diarize-server: no MEETINK_OWNER_PID — lifetime watchdog "
+            "disabled (stop via /diarize stop)",
+            file=sys.stderr,
+        )
+        return
+    owner_pid = int(owner)
     while True:
         time.sleep(poll_s)
-        if os.getppid() != initial_ppid:
+        try:
+            os.kill(owner_pid, 0)  # signal 0 = liveness probe, no delivery
+        except ProcessLookupError:
             print(
-                "diarize-server: launcher exited (PPID changed "
-                f"{initial_ppid} -> {os.getppid()}), shutting down",
+                f"diarize-server: owner (pid {owner_pid}) exited, "
+                "shutting down",
                 file=sys.stderr,
             )
             os._exit(0)
+        except PermissionError:
+            pass  # pid exists but isn't ours — still alive
 
 
 if __name__ == "__main__":

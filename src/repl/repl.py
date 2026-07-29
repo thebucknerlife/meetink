@@ -2024,6 +2024,14 @@ session: PromptSession = PromptSession(
 
 
 def main() -> int:
+    # Every slash command dispatches through a short-lived `bin/meetink`
+    # subprocess, so anything those subprocesses spawn-and-disown (the
+    # diarize sidecar) is orphaned within seconds — its PPID says nothing
+    # about whether the REPL is still alive. Publish our own PID so
+    # long-lived sidecars can bind their lifetime to the REPL itself
+    # (see _parent_death_watchdog in src/diarize/server.py).
+    os.environ["MEETINK_OWNER_PID"] = str(os.getpid())
+
     # Welcome banner — print directly to the TTY so the launcher's tput cols
     # sees the real terminal width and the banner renders full-size.
     subprocess.run([str(LAUNCHER), "welcome"], check=False)

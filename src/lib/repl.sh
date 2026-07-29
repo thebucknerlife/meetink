@@ -281,6 +281,11 @@ repl_loop() {
     # `-p '$(build_prompt)'` re-evaluate the prompt on every redraw.
     setopt local_options no_errexit prompt_subst
 
+    # Publish our pid so long-lived sidecars (diarize-server) can bind their
+    # lifetime to this REPL rather than to whatever transient subprocess
+    # spawned them. See _parent_death_watchdog in src/diarize/server.py.
+    export MEETINK_OWNER_PID=$$
+
     welcome_screen
     # Defensive cleanup: if a previous (buggy) run left our marker title on
     # this very window, clear it now so /stop can never match self.
