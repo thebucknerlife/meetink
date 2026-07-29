@@ -146,7 +146,6 @@ typeset -gA MK_MODEL_REGISTRY=(
     [small.en]="466M|EN — balanced default. Handles accents/jargon for typical meetings.|900"
     [small.en-tdrz]="466M|EN + speaker-turn detection. Same as small.en, plus THEM-A/B/C labels.|900"
     [medium.en]="1.4G|EN — better proper nouns + accents. ~2× slower than small.|2500"
-    [medium.en-tdrz]="1.4G|EN + speaker-turn detection. Same as medium.en, plus THEM-A/B/C labels.|2500"
     [large-v3-turbo]="1.5G|Multilingual — modern, fast + accurate. Mixed-language calls.|2500"
     [large-v3]="2.9G|Multilingual — highest accuracy, slow on Apple Silicon. Legal / verbatim.|4000"
 )
@@ -158,7 +157,6 @@ typeset -ga MK_MODEL_ORDER=(
     small.en
     small.en-tdrz
     medium.en
-    medium.en-tdrz
     large-v3-turbo
     large-v3
 )
@@ -233,7 +231,12 @@ model_download() {
 
     if (( ! already_have_bin )); then
         local size="${MK_MODEL_REGISTRY[$name]%%|*}"
-        local url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${name}.bin"
+        # tdrz (tinydiarize) fine-tunes are not mirrored in ggerganov/whisper.cpp;
+        # they live in the author's repo (same source whisper.cpp's own
+        # download-ggml-model.sh uses).
+        local repo="ggerganov/whisper.cpp"
+        [[ "$name" == *-tdrz ]] && repo="akashmjn/tinydiarize-whisper.cpp"
+        local url="https://huggingface.co/${repo}/resolve/main/ggml-${name}.bin"
         print -P "${C[bright_yellow]}▸${C[reset]} Downloading whisper model ${C[bold]}$name${C[reset]} ${C[dim]}(~$size)...${C[reset]}"
         if ! mk_download_with_progress "$target" "$url" "$name"; then
             print -P "${C[red]}error:${C[reset]} download failed"

@@ -963,7 +963,7 @@ def _context_names() -> list[str]:
 # Whisper model names match titles in src/lib/models.sh's MK_MODEL_REGISTRY.
 _WHISPER_MODELS = [
     "tiny.en", "base.en", "small.en", "small.en-tdrz",
-    "medium.en", "medium.en-tdrz", "large-v3-turbo", "large-v3",
+    "medium.en", "large-v3-turbo", "large-v3",
 ]
 
 # Local LLM names — keep in sync with MK_LLM_REGISTRY in src/lib/titling.sh.

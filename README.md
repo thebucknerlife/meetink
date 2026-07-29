@@ -319,7 +319,7 @@ When `/profile add`, `/profile train`, `/profile assign`, or `/profile rename` s
 | `/model download <name>` | Fetch the GGML weights + CoreML companion. |
 | `/model rm <name>` | Delete weights and CoreML dir. |
 
-The registry covers `tiny.en`, `base.en`, `small.en` (default), `small.en-tdrz`, `medium.en`, `medium.en-tdrz`, `large-v3-turbo`, `large-v3`. The `*-tdrz` variants emit speaker-turn markers for the cluster fallback (`THEM-A` / `THEM-B` / …) when the diarize-server isn't running.
+The registry covers `tiny.en`, `base.en`, `small.en` (default), `small.en-tdrz`, `medium.en`, `large-v3-turbo`, `large-v3`. The `*-tdrz` variants emit speaker-turn markers for the cluster fallback (`THEM-A` / `THEM-B` / …) when the diarize-server isn't running.
 
 ### Local LLM (titling / summary / `/ask`)
 
