@@ -135,10 +135,30 @@ final class AudioBuffer: @unchecked Sendable {
 
 // MARK: - Transcription via whisper-server
 
-func hasAudio(_ samples: [Float], threshold: Float = 0.005) -> Bool {
-    guard !samples.isEmpty else { return false }
-    let rms = sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(samples.count))
-    return rms > threshold
+/// RMS floor below which a chunk is treated as silence and never sent to
+/// whisper. The default is deliberately permissive (quiet speakers survive),
+/// which means room tone can clear it — the filler-only hallucination filter
+/// is the second line of defence. Raise via env if your mic picks up a noisy
+/// room and fillers still leak through.
+let audioRMSThreshold: Float =
+    Float(ProcessInfo.processInfo.environment["MEETINK_RMS_THRESHOLD"] ?? "") ?? 0.005
+
+func chunkRMS(_ samples: [Float]) -> Float {
+    guard !samples.isEmpty else { return 0 }
+    return sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(samples.count))
+}
+
+func hasAudio(_ samples: [Float], threshold: Float = audioRMSThreshold) -> Bool {
+    return chunkRMS(samples) > threshold
+}
+
+/// Log a chunk's gate decision with its RMS so users can calibrate
+/// MEETINK_RMS_THRESHOLD against their actual room noise floor: run a short
+/// recording sitting silent, then eyeball the rms= values in the capture log
+/// and pick a threshold between the silent floor and spoken levels.
+func logGate(_ label: String, _ samples: [Float], sent: Bool) {
+    let rms = chunkRMS(samples)
+    fputs("  gate [\(label)]: rms=\(String(format: "%.4f", rms)) threshold=\(String(format: "%.4f", audioRMSThreshold)) → \(sent ? "transcribe" : "skip")\n", stderr)
 }
 
 /// Track last transcription per speaker for context carry-over
@@ -220,6 +240,14 @@ let youtubeHallucinations: [String] = [
     "done.", "done!", "thank you.",
 ]
 
+/// Filler tokens whisper hallucinates from near-silence. Kept conservative:
+/// only sounds that carry no content on their own. A chunk made up entirely
+/// of these is dropped; mixed with real words they pass through.
+let fillerTokens: Set<String> = [
+    "you", "yeah", "um", "uh", "hmm", "hm", "mm", "mmm", "mm-hmm", "mmhmm",
+    "uh-huh", "okay", "ok", "kay", "done",
+]
+
 func isHallucination(_ text: String) -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.isEmpty { return true }
@@ -236,8 +264,22 @@ func isHallucination(_ text: String) -> Bool {
     // emits these too, especially on the system-audio stream during quiet
     // moments. Same length cap as the parenthetical rule.
     if lower.hasPrefix("[") && lower.hasSuffix("]") && lower.count < 40 { return true }
-    // Single filler word
-    if ["you", "yeah", "um", "uh", "hmm", "okay", "ok", "done", "done."].contains(lower) { return true }
+    // And in asterisks: *Sigh* *Silence* *Crickets* *Door opens* — a third
+    // annotation style whisper uses for non-speech noise. Same length cap.
+    if lower.hasPrefix("*") && lower.hasSuffix("*") && lower.count < 40 { return true }
+    // Filler-only chunks. Near-silence that clears the RMS gate makes whisper
+    // hallucinate fillers with punctuation ("Okay.", "Mm-hmm.", "'Kay. 'Kay."),
+    // so compare token-by-token with punctuation stripped, and drop the chunk
+    // only when *every* token is a filler — fillers inside real sentences
+    // ("okay, let's ship it") survive.
+    let fillerSeparators = CharacterSet.alphanumerics
+        .union(CharacterSet(charactersIn: "-'"))
+        .inverted
+    let tokens = lower
+        .components(separatedBy: fillerSeparators)
+        .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "-'")) }
+        .filter { !$0.isEmpty }
+    if !tokens.isEmpty && tokens.allSatisfy({ fillerTokens.contains($0) }) { return true }
 
     // Copyright/watermark hallucinations
     if lower.contains("© ") || lower.contains("copyright") || lower.contains("bf-watch") { return true }
@@ -295,8 +337,16 @@ final class TranscriptMerger: @unchecked Sendable {
     private var currentText: String = ""
     private var lastAddTime: Date = Date()
     private var bufferStartTime: Date = Date()
-    private let mergeGapSeconds: TimeInterval = 2.0
-    private let maxBufferAgeSeconds: TimeInterval = 5.0
+    // The idle gap must exceed the steady-state interval between chunk adds
+    // (3 s chunk cadence + transcription latency), or flushIfStale fires
+    // between every pair of chunks and same-speaker merging never happens —
+    // one sentence per 3 s chunk instead of one line per utterance.
+    private let mergeGapSeconds: TimeInterval =
+        TimeInterval(ProcessInfo.processInfo.environment["MEETINK_MERGE_GAP_S"] ?? "") ?? 4.0
+    // How long one line may keep accumulating before it's forced out. Larger
+    // = fewer, longer lines but the live tail lags further behind the audio.
+    private let maxBufferAgeSeconds: TimeInterval =
+        TimeInterval(ProcessInfo.processInfo.environment["MEETINK_MERGE_MAX_BUFFER_S"] ?? "") ?? 8.0
 
     func add(timestamp: String, speaker: String, text: String) {
         lock.lock()
@@ -1149,19 +1199,27 @@ struct LocalSpeechCapture {
             if let chunks = audioBuffer.tryExtractChunks() {
                 let idx = audioBuffer.chunkIndex
 
-                if let sysSamples = chunks.system, hasAudio(sysSamples) {
-                    let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_\(idx)_them.wav")
-                    try writeWAV(samples: sysSamples, to: wavURL)
-                    DispatchQueue.global().async {
-                        transcribe(wavURL: wavURL, chunkIndex: idx, speaker: "THEM")
+                if let sysSamples = chunks.system {
+                    let sent = hasAudio(sysSamples)
+                    logGate("sys", sysSamples, sent: sent)
+                    if sent {
+                        let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_\(idx)_them.wav")
+                        try writeWAV(samples: sysSamples, to: wavURL)
+                        DispatchQueue.global().async {
+                            transcribe(wavURL: wavURL, chunkIndex: idx, speaker: "THEM")
+                        }
                     }
                 }
 
-                if let micSamples = chunks.mic, hasAudio(micSamples) {
-                    let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_\(idx)_me.wav")
-                    try writeWAV(samples: micSamples, to: wavURL)
-                    DispatchQueue.global().async {
-                        transcribe(wavURL: wavURL, chunkIndex: idx, speaker: meName)
+                if let micSamples = chunks.mic {
+                    let sent = hasAudio(micSamples)
+                    logGate("mic", micSamples, sent: sent)
+                    if sent {
+                        let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_\(idx)_me.wav")
+                        try writeWAV(samples: micSamples, to: wavURL)
+                        DispatchQueue.global().async {
+                            transcribe(wavURL: wavURL, chunkIndex: idx, speaker: meName)
+                        }
                     }
                 }
             }

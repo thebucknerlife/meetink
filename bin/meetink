@@ -574,6 +574,16 @@ cmd_start() {
         curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?clear=true" >/dev/null 2>&1 || true
     fi
 
+    # Silence-gate RMS floor for the capture binary. Precedence matches the
+    # rest of the config surface: env var wins, else the rms_threshold config
+    # key, else the binary's built-in default. Calibrate by reading the
+    # "gate [mic]: rms=…" lines in /tmp/meetink-capture.log from a silent
+    # test recording and picking a value between room tone and speech.
+    if [[ -z "$MEETINK_RMS_THRESHOLD" && -f "$MK_CONFIG_FILE" ]]; then
+        local rms_cfg=$(grep '^rms_threshold=' "$MK_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+        [[ -n "$rms_cfg" ]] && export MEETINK_RMS_THRESHOLD="$rms_cfg"
+    fi
+
     MEETINK_MODEL="$MK_MODEL" \
     MEETINK_TRANSCRIPT="$session_file" \
     MEETINK_PROMPT="$MK_PROMPT" \
