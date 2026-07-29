@@ -610,7 +610,10 @@ cmd_start() {
     print -P "${C[green]}${C[bold]}● Recording started${C[reset]}  (PID $(cat "$PID_FILE"))"
     print -P "  Transcript: ${C[bright_cyan]}${session_file/$HOME/~}${C[reset]}"
     print -P "  Live link:  ${C[dim]}${MK_TRANSCRIPT/$HOME/~}${C[reset]}"
-    print -P "  Stop with: ${C[bright_cyan]}/stop${C[reset]}"
+    # cmd_start serves both the REPL (which shells out here) and the bare
+    # CLI; show both stop spellings so a CLI user isn't told to type a
+    # slash command their shell doesn't know.
+    print -P "  Stop with: ${C[bright_cyan]}/stop${C[reset]} ${C[dim]}(REPL)${C[reset]} or ${C[bright_cyan]}meetink stop${C[reset]} ${C[dim]}(shell)${C[reset]}"
 
     # Surface the RAG indexer install hint when the deps aren't there
     # yet — /start is the moment users notice they're committing to a
