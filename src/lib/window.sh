@@ -1,6 +1,7 @@
 #!/bin/zsh
-# Tail-window management — open / close / raise a separate Terminal.app
-# window running `tail -f` on the live transcript.
+# Tail-window management — open / close / raise a separate terminal
+# window running `tail -f` on the live transcript. Uses the terminal app
+# the user launched from (iTerm2 or Terminal.app).
 #
 # Tracks "our" windows by setting a custom title marker. On every operation
 # that could affect a window, we additionally compare the window's tty to
@@ -12,6 +13,21 @@
 MK_TAIL_PIDFILE="/tmp/meetink-tail.tailpid"
 MK_TAIL_TITLE="meetink-tail"
 
+# Which terminal app should host the tail window. Prefer the one the user
+# is actually running in (TERM_PROGRAM survives through the REPL's
+# subprocess dispatch); default to Terminal.app everywhere else. Overridable
+# via MEETINK_TAIL_APP=iTerm2|Terminal for users who want the tail somewhere
+# other than their launch terminal.
+window_terminal_app() {
+    if [[ -n "$MEETINK_TAIL_APP" ]]; then
+        print -n -- "$MEETINK_TAIL_APP"
+    elif [[ "$TERM_PROGRAM" == "iTerm.app" || -n "$ITERM_SESSION_ID" ]]; then
+        print -n -- "iTerm2"
+    else
+        print -n -- "Terminal"
+    fi
+}
+
 # /dev/ttysNNN of the current shell. Used to exclude self from window matches.
 window_self_tty() {
     tty 2>/dev/null
@@ -21,7 +37,29 @@ window_self_tty() {
 window_tail_exists() {
     local self_tty=$(window_self_tty)
     local count
-    count=$(osascript 2>/dev/null <<APPLESCRIPT
+    if [[ "$(window_terminal_app)" == "iTerm2" ]]; then
+        # iTerm2's object model is window → tabs → sessions; the OSC title
+        # lands on the session's name.
+        count=$(osascript 2>/dev/null <<APPLESCRIPT
+tell application "iTerm2"
+    set n to 0
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                try
+                    if name of s starts with "$MK_TAIL_TITLE" and tty of s is not "$self_tty" then
+                        set n to n + 1
+                    end if
+                end try
+            end repeat
+        end repeat
+    end repeat
+    return n
+end tell
+APPLESCRIPT
+)
+    else
+        count=$(osascript 2>/dev/null <<APPLESCRIPT
 tell application "Terminal"
     set n to 0
     repeat with w in windows
@@ -37,13 +75,34 @@ tell application "Terminal"
 end tell
 APPLESCRIPT
 )
+    fi
     [[ -n "$count" && "$count" != "0" ]]
 }
 
 # Bring the (non-self) tracked tail window to the front (no-op if none).
 window_raise_tail() {
     local self_tty=$(window_self_tty)
-    osascript >/dev/null 2>&1 <<APPLESCRIPT
+    if [[ "$(window_terminal_app)" == "iTerm2" ]]; then
+        osascript >/dev/null 2>&1 <<APPLESCRIPT
+tell application "iTerm2"
+    activate
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                try
+                    if name of s starts with "$MK_TAIL_TITLE" and tty of s is not "$self_tty" then
+                        select w
+                        select t
+                        return
+                    end if
+                end try
+            end repeat
+        end repeat
+    end repeat
+end tell
+APPLESCRIPT
+    else
+        osascript >/dev/null 2>&1 <<APPLESCRIPT
 tell application "Terminal"
     activate
     repeat with w in windows
@@ -58,6 +117,7 @@ tell application "Terminal"
     end repeat
 end tell
 APPLESCRIPT
+    fi
 }
 
 # Open a Terminal.app window running tail -f. Sets the title on the window
@@ -96,7 +156,9 @@ window_open_tail() {
 #!/bin/bash
 # Wipe screen + scrollback (the .zshrc banner and command-echo noise).
 printf '\033c'
-# $3 is the window-title marker; OSC-2 sets the Terminal "custom title".
+# $3 is the window-title marker. OSC-2 sets Terminal.app's "custom title";
+# OSC-1 sets iTerm2's session name. Emit both — each app ignores the other's.
+printf '\033]1;%s\007' "$3"
 printf '\033]2;%s\007' "$3"
 printf '\033[1;36m✎  meetink\033[0m  \033[2mlive transcript\033[0m\n'
 printf '\033[2m%s\033[0m\n\n' "$1"
@@ -109,12 +171,24 @@ exec tail -F "$1"
 RUNNER
     chmod +x "$runner"
 
-    osascript >/dev/null 2>&1 <<APPLESCRIPT
+    if [[ "$(window_terminal_app)" == "iTerm2" ]]; then
+        # `create window … command` runs the command directly (no login
+        # shell), so the runner's screen-reset is barely even needed — but
+        # keep the same runner for both apps so behaviour stays identical.
+        osascript >/dev/null 2>&1 <<APPLESCRIPT
+tell application "iTerm2"
+    activate
+    create window with default profile command "/bin/bash $runner '$transcript' '$MK_TAIL_PIDFILE' '$MK_TAIL_TITLE'"
+end tell
+APPLESCRIPT
+    else
+        osascript >/dev/null 2>&1 <<APPLESCRIPT
 tell application "Terminal"
     activate
     do script "exec $runner '$transcript' '$MK_TAIL_PIDFILE' '$MK_TAIL_TITLE'"
 end tell
 APPLESCRIPT
+    fi
 }
 
 # Close any tracked tail window OTHER than self. Two-step: kill tail (so the
@@ -131,7 +205,24 @@ window_close_tail() {
     sleep 0.3
 
     local self_tty=$(window_self_tty)
-    osascript >/dev/null 2>&1 <<APPLESCRIPT
+    if [[ "$(window_terminal_app)" == "iTerm2" ]]; then
+        osascript >/dev/null 2>&1 <<APPLESCRIPT
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                try
+                    if name of s starts with "$MK_TAIL_TITLE" and tty of s is not "$self_tty" then
+                        close s
+                    end if
+                end try
+            end repeat
+        end repeat
+    end repeat
+end tell
+APPLESCRIPT
+    else
+        osascript >/dev/null 2>&1 <<APPLESCRIPT
 tell application "Terminal"
     repeat with w in (every window)
         try
@@ -144,6 +235,7 @@ tell application "Terminal"
     end repeat
 end tell
 APPLESCRIPT
+    fi
 }
 
 # Defensive cleanup: if our own window has the tail-marker title stuck on
@@ -151,7 +243,25 @@ APPLESCRIPT
 # never even consider it. Called once on REPL entry.
 window_clear_self_title() {
     local self_tty=$(window_self_tty)
-    osascript >/dev/null 2>&1 <<APPLESCRIPT
+    if [[ "$(window_terminal_app)" == "iTerm2" ]]; then
+        osascript >/dev/null 2>&1 <<APPLESCRIPT
+tell application "iTerm2"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                try
+                    if name of s starts with "$MK_TAIL_TITLE" and tty of s is "$self_tty" then
+                        set name of s to ""
+                        return
+                    end if
+                end try
+            end repeat
+        end repeat
+    end repeat
+end tell
+APPLESCRIPT
+    else
+        osascript >/dev/null 2>&1 <<APPLESCRIPT
 tell application "Terminal"
     repeat with w in windows
         try
@@ -165,4 +275,5 @@ tell application "Terminal"
     end repeat
 end tell
 APPLESCRIPT
+    fi
 }
