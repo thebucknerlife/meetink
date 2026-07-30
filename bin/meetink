@@ -44,6 +44,7 @@ source "$MK_ROOT/src/lib/projects.sh"
 source "$MK_ROOT/src/lib/identity.sh"
 source "$MK_ROOT/src/lib/ask.sh"
 source "$MK_ROOT/src/lib/summary.sh"
+source "$MK_ROOT/src/lib/names.sh"
 source "$MK_ROOT/src/lib/context.sh"
 source "$MK_ROOT/src/lib/index.sh"
 source "$MK_ROOT/src/lib/watch.sh"
@@ -672,6 +673,15 @@ cmd_stop() {
     # diarize_consolidate_transcript in src/lib/diarize.sh.
     if typeset -f diarize_consolidate_transcript >/dev/null 2>&1; then
         diarize_consolidate_transcript "$MK_TRANSCRIPT"
+    fi
+
+    # Infer real names for the surviving Speaker-N labels from the
+    # conversation itself ("thanks, Melanie") — assigns the cluster as a
+    # voice profile and rewrites the transcript, so titling/summary below
+    # see named speakers. Conservative by design; disable with
+    # MEETINK_INFER_NAMES=off or infer_names=false in config.
+    if typeset -f infer_speaker_names >/dev/null 2>&1; then
+        infer_speaker_names "$MK_TRANSCRIPT"
     fi
 
     # Run AI titling on the just-finished session (no-op if llama.cpp + the
