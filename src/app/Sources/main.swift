@@ -13,16 +13,20 @@ import Foundation
 //   - Titling on /stop RENAMES the file and retargets the live.txt symlink,
 //     so the symlink is re-resolved on every poll.
 //   - Scroll, selection, copy and ⌘F must all be native. NSTextView gives us
-//     every one of them for free (usesFindBar), which is the whole reason
-//     this app exists — a terminal tail can't pin a status header without
-//     sacrificing scrollback.
+//     every one of them — but ONLY if the app has a real main menu: key
+//     equivalents (⌘F/⌘C/⌘A/⌘W) resolve through NSApp.mainMenu, which apps
+//     launched via bare NSApplication.run() don't get for free.
 //
-// The app only READS (live.txt + the localhost status ports). The one write
-// path is Start/Stop, which shells out to the launcher. NOTE: when recording
-// is started from here, macOS attributes the mic/screen permissions to THIS
-// app (the responsible process), not the terminal — first Start triggers
-// fresh permission prompts. That's expected; the ad-hoc codesign in
-// build_app gives the bundle a stable TCC identity so it's a one-time grant.
+// Activation policy is dynamic: .regular while the transcript window is
+// open (so the app appears in ⌘Tab and the Dock and can't be "lost"),
+// .accessory when the window closes (menubar-only, no Dock clutter).
+//
+// The app only READS (live.txt + the localhost status ports). The write
+// paths are Start/Stop and speaker assignment, which shell out to the
+// launcher. NOTE: when recording is started from here, macOS attributes the
+// mic/screen permissions to THIS app (the responsible process) — first
+// Start triggers fresh permission prompts; the ad-hoc codesign in build_app
+// keeps the bundle identity (and therefore the grants) stable.
 
 // MARK: - Paths & config
 
@@ -73,6 +77,51 @@ func recordingPID() -> Int32? {
     return kill(pid, 0) == 0 ? pid : nil
 }
 
+/// Enrolled profile names, for the assignment dialog's suggestions.
+func enrolledProfiles() -> [String] {
+    let dir = "\(mkHome)/profiles"
+    let items = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+    return items.filter { $0.hasSuffix(".npz") }
+        .map { String($0.dropLast(4)) }
+        .sorted()
+}
+
+// MARK: - The M-waveform mark
+
+/// Draws the meetink mark: a five-bar waveform whose silhouette reads as an
+/// "M" — outer bars tall, valleys between, a mid-height center. Used at
+/// 18 pt (template) in the menu bar and at 512 pt (tinted tile) as the
+/// Dock/⌘Tab icon, so there's no .icns asset to keep in sync.
+func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> NSImage {
+    let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+        if let tile = tile {
+            let inset = rect.insetBy(dx: size * 0.04, dy: size * 0.04)
+            let bg = NSBezierPath(roundedRect: inset,
+                                  xRadius: size * 0.22, yRadius: size * 0.22)
+            tile.setFill()
+            bg.fill()
+        }
+        // Heights as fractions of the drawable height: M silhouette.
+        let heights: [CGFloat] = [0.95, 0.42, 0.70, 0.42, 0.95]
+        let drawable = rect.insetBy(dx: size * 0.18, dy: size * 0.22)
+        let barWidth = drawable.width * 0.12
+        let gap = (drawable.width - barWidth * CGFloat(heights.count))
+            / CGFloat(heights.count - 1)
+        barColor.setFill()
+        for (i, h) in heights.enumerated() {
+            let barHeight = drawable.height * h
+            let x = drawable.minX + CGFloat(i) * (barWidth + gap)
+            let y = drawable.midY - barHeight / 2
+            let bar = NSBezierPath(
+                roundedRect: NSRect(x: x, y: y, width: barWidth, height: barHeight),
+                xRadius: barWidth / 2, yRadius: barWidth / 2)
+            bar.fill()
+        }
+        return true
+    }
+    return img
+}
+
 // MARK: - Transcript model
 
 struct TranscriptLine {
@@ -81,15 +130,37 @@ struct TranscriptLine {
     let text: String
 }
 
+/// Consecutive lines from the same speaker, rendered as one block —
+/// the 3 s chunk cadence produces runs of short lines from one voice, and
+/// reading them as a paragraph beats reading them as a transcript of hiccups.
+struct SpeakerBlock {
+    let timestamp: String   // first line's timestamp
+    let speaker: String
+    var text: String
+}
+
 struct TranscriptSnapshot {
-    var headerLines: [String] = []
     var lines: [TranscriptLine] = []
     var startedAt: Date?
     var endedAt: Date?
 
+    var blocks: [SpeakerBlock] {
+        var out: [SpeakerBlock] = []
+        for l in lines {
+            if var last = out.last, last.speaker == l.speaker {
+                last.text += " " + l.text
+                out[out.count - 1] = last
+            } else {
+                out.append(SpeakerBlock(timestamp: l.timestamp,
+                                        speaker: l.speaker, text: l.text))
+            }
+        }
+        return out
+    }
+
     /// Char-count share per speaker — a cheap, surprisingly good proxy for
-    /// talk time (labels appear once per merged utterance, so line counts
-    /// under-weight long monologues; characters don't).
+    /// talk time (characters don't under-weight long monologues the way
+    /// line counts do).
     var talkShare: [(speaker: String, fraction: Double)] {
         var counts: [String: Int] = [:]
         for l in lines { counts[l.speaker, default: 0] += l.text.count }
@@ -100,7 +171,7 @@ struct TranscriptSnapshot {
 }
 
 let lineRegex = try! NSRegularExpression(pattern: #"^\[(\d{2}:\d{2}:\d{2})\] ([^:]+): (.*)$"#)
-let isoParser: ISO8601DateFormatter = ISO8601DateFormatter()
+let isoParser = ISO8601DateFormatter()
 
 func parseTranscript(_ text: String) -> TranscriptSnapshot {
     var snap = TranscriptSnapshot()
@@ -114,11 +185,11 @@ func parseTranscript(_ text: String) -> TranscriptSnapshot {
                 speaker: ns.substring(with: m.range(at: 2)),
                 text: ns.substring(with: m.range(at: 3))
             )
-        } else if var c = current, !rawLine.isEmpty {
+        } else if var c = current, !rawLine.isEmpty, !rawLine.hasPrefix("---") {
             // Continuation of a wrapped utterance (whisper text can contain
             // embedded newlines) — belongs to the previous speaker line.
             c = TranscriptLine(timestamp: c.timestamp, speaker: c.speaker,
-                               text: c.text + "\n" + rawLine)
+                               text: c.text + " " + rawLine)
             current = c
         } else {
             if rawLine.hasPrefix("Started:") {
@@ -131,7 +202,6 @@ func parseTranscript(_ text: String) -> TranscriptSnapshot {
                     from: rawLine.replacingOccurrences(of: "Ended: ", with: "")
                         .trimmingCharacters(in: .whitespaces))
             }
-            if !rawLine.isEmpty { snap.headerLines.append(rawLine) }
         }
     }
     if let c = current { snap.lines.append(c) }
@@ -153,17 +223,29 @@ func speakerColor(_ speaker: String) -> NSColor {
     return speakerPalette[h % speakerPalette.count]
 }
 
+let unknownSpeakerRegex = try! NSRegularExpression(pattern: #"^Speaker (\d+)$"#)
+
+func unknownSpeakerNumber(_ speaker: String) -> String? {
+    let ns = speaker as NSString
+    guard let m = unknownSpeakerRegex.firstMatch(
+        in: speaker, range: NSRange(location: 0, length: ns.length)) else { return nil }
+    return ns.substring(with: m.range(at: 1))
+}
+
 // MARK: - Transcript window
 
-final class TranscriptWindowController: NSWindowController {
+final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     private let textView = NSTextView()
     private let headerField = NSTextField(labelWithString: "")
     private let statusDot = NSTextField(labelWithString: "●")
+    private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
+    private let jumpButton = NSButton(title: "", target: nil, action: nil)
 
     private var pollTimer: Timer?
     private var lastInode: UInt64 = 0
     private var lastSize: UInt64 = 0
     private var lastResolvedPath: String = ""
+    private var rawText: String = ""
     private var snapshot = TranscriptSnapshot()
 
     convenience init() {
@@ -188,8 +270,8 @@ final class TranscriptWindowController: NSWindowController {
     private func buildUI() {
         guard let content = window?.contentView else { return }
 
-        // Header bar: recording dot + elapsed + talk-share, pinned above the
-        // text view — the thing the terminal tail could never have.
+        // Header bar: recording dot + elapsed + talk-share + copy button,
+        // pinned above the text view.
         let header = NSStackView()
         header.orientation = .horizontal
         header.spacing = 8
@@ -199,8 +281,18 @@ final class TranscriptWindowController: NSWindowController {
         statusDot.font = NSFont.systemFont(ofSize: 12)
         headerField.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         headerField.lineBreakMode = .byTruncatingTail
+        headerField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        copyButton.bezelStyle = .rounded
+        copyButton.controlSize = .small
+        copyButton.font = NSFont.systemFont(ofSize: 11)
+        copyButton.target = self
+        copyButton.action = #selector(copyAll)
+
         header.addArrangedSubview(statusDot)
         header.addArrangedSubview(headerField)
+        header.addArrangedSubview(NSView())   // spacer
+        header.addArrangedSubview(copyButton)
 
         let divider = NSBox()
         divider.boxType = .separator
@@ -217,23 +309,42 @@ final class TranscriptWindowController: NSWindowController {
         textView.usesFindBar = true                    // ⌘F, native find bar
         textView.isIncrementalSearchingEnabled = true
         textView.autoresizingMask = [.width]
-        textView.textContainerInset = NSSize(width: 10, height: 10)
+        textView.textContainerInset = NSSize(width: 12, height: 10)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.textContainer?.widthTracksTextView = true
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                                   height: CGFloat.greatestFiniteMagnitude)
+        // Speaker labels carry .link attributes for click-to-name; empty
+        // linkTextAttributes stops AppKit repainting them blue-underlined
+        // over our per-speaker colors.
+        textView.linkTextAttributes = [.cursor: NSCursor.pointingHand]
+        textView.delegate = self
         scroll.documentView = textView
+
+        // Floating "jump to live" button — appears only when the user has
+        // scrolled away from the bottom, so catching up is one click.
+        jumpButton.translatesAutoresizingMaskIntoConstraints = false
+        jumpButton.bezelStyle = .rounded
+        jumpButton.controlSize = .regular
+        jumpButton.title = " Jump to live"
+        jumpButton.image = NSImage(systemSymbolName: "arrow.down.to.line",
+                                   accessibilityDescription: "Jump to live")
+        jumpButton.imagePosition = .imageLeading
+        jumpButton.target = self
+        jumpButton.action = #selector(jumpToLive)
+        jumpButton.isHidden = true
 
         content.addSubview(header)
         content.addSubview(divider)
         content.addSubview(scroll)
+        content.addSubview(jumpButton)
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: content.topAnchor),
             header.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            header.heightAnchor.constraint(equalToConstant: 30),
+            header.heightAnchor.constraint(equalToConstant: 32),
             divider.topAnchor.constraint(equalTo: header.bottomAnchor),
             divider.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: content.trailingAnchor),
@@ -241,7 +352,17 @@ final class TranscriptWindowController: NSWindowController {
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            jumpButton.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            jumpButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
+
+        // Track scrolling so the jump button can show/hide live.
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scroll.contentView, queue: .main) { [weak self] _ in
+                self?.updateJumpButton()
+            }
     }
 
     /// Pinned-to-bottom detection: only auto-scroll after content changes if
@@ -254,6 +375,91 @@ final class TranscriptWindowController: NSWindowController {
         return visible.maxY >= docHeight - 40
     }
 
+    private func updateJumpButton() {
+        jumpButton.isHidden = pinnedToBottom
+    }
+
+    @objc private func jumpToLive() {
+        textView.scrollToEndOfDocument(nil)
+        jumpButton.isHidden = true
+    }
+
+    @objc private func copyAll() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(rawText.isEmpty ? textView.string : rawText, forType: .string)
+        // Momentary feedback without a popover's ceremony.
+        copyButton.title = "Copied ✓"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.copyButton.title = "Copy All"
+        }
+    }
+
+    // MARK: Click-to-name (NSTextViewDelegate)
+
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        guard let url = link as? URL, url.scheme == "meetink-assign",
+              let number = url.host else { return false }
+        promptForName(speakerNumber: number)
+        return true
+    }
+
+    private func promptForName(speakerNumber: String) {
+        let alert = NSAlert()
+        alert.messageText = "Who is Speaker \(speakerNumber)?"
+        alert.informativeText = "Names the speaker, rewrites the transcript, and "
+            + "enrolls their voice so future meetings recognize them automatically. "
+            + "Works while the diarize server still holds this session's voices."
+        alert.addButton(withTitle: "Assign")
+        alert.addButton(withTitle: "Cancel")
+
+        let combo = NSComboBox(frame: NSRect(x: 0, y: 0, width: 220, height: 25))
+        combo.addItems(withObjectValues: enrolledProfiles())
+        combo.placeholderString = "Name"
+        combo.completes = true
+        alert.accessoryView = combo
+        alert.window.initialFirstResponder = combo
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = combo.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, !name.contains("."), !name.contains("/") else { return }
+
+        runAssign(number: speakerNumber, name: name)
+    }
+
+    private func runAssign(number: String, name: String) {
+        guard let launcher = launcherPath() else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["profile", "assign", number, name]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        DispatchQueue.global().async { [weak self] in
+            do { try proc.run() } catch { return }
+            proc.waitUntilExit()
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                             encoding: .utf8) ?? ""
+            // Success rewrites the transcript on disk — the poll picks the
+            // change up within 0.5 s, no manual refresh needed. Only surface
+            // failures (e.g. cluster no longer in the server's memory).
+            if proc.terminationStatus != 0 || out.lowercased().contains("error") {
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Couldn't assign Speaker \(number)"
+                    // Strip ANSI colors from launcher output for display.
+                    let plain = out.replacingOccurrences(
+                        of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
+                    alert.informativeText = plain.trimmingCharacters(in: .whitespacesAndNewlines)
+                    alert.runModal()
+                }
+            }
+            _ = self  // keep controller alive through the callback
+        }
+    }
+
+    // MARK: File watching + render
+
     func refreshIfChanged(force: Bool = false) {
         let symlink = liveSymlinkPath()
         let resolved = (try? FileManager.default.destinationOfSymbolicLink(atPath: symlink))
@@ -264,6 +470,7 @@ final class TranscriptWindowController: NSWindowController {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: resolved) else {
             if force || !snapshot.lines.isEmpty || !lastResolvedPath.isEmpty {
                 snapshot = TranscriptSnapshot()
+                rawText = ""
                 lastResolvedPath = ""
                 lastInode = 0; lastSize = 0
                 render(empty: true)
@@ -279,6 +486,7 @@ final class TranscriptWindowController: NSWindowController {
         if force || inode != lastInode || size != lastSize || resolved != lastResolvedPath {
             lastInode = inode; lastSize = size; lastResolvedPath = resolved
             if let text = try? String(contentsOfFile: resolved, encoding: .utf8) {
+                rawText = text
                 snapshot = parseTranscript(text)
                 render(empty: false)
             }
@@ -298,24 +506,39 @@ final class TranscriptWindowController: NSWindowController {
                 string: "No transcript yet.\n\nStart a recording from the menu bar icon, or run `meetink start`.",
                 attributes: [.font: bodyFont, .foregroundColor: NSColor.secondaryLabelColor]))
         } else {
-            let para = NSMutableParagraphStyle()
-            para.paragraphSpacing = 6
-            for line in snapshot.lines {
+            let headerPara = NSMutableParagraphStyle()
+            headerPara.paragraphSpacingBefore = 10
+            let bodyPara = NSMutableParagraphStyle()
+            bodyPara.paragraphSpacing = 2
+            bodyPara.lineSpacing = 1.5
+
+            for block in snapshot.blocks {
+                var speakerAttrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.boldSystemFont(ofSize: 13),
+                    .foregroundColor: speakerColor(block.speaker),
+                    .paragraphStyle: headerPara,
+                ]
+                // Unknown speakers are clickable → click-to-name dialog.
+                // The tooltip advertises it; enrolled names aren't links.
+                if let num = unknownSpeakerNumber(block.speaker),
+                   let url = URL(string: "meetink-assign://\(num)") {
+                    speakerAttrs[.link] = url
+                    speakerAttrs[.toolTip] = "Click to name this speaker"
+                    speakerAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                    speakerAttrs[.underlineColor] = speakerColor(block.speaker)
+                        .withAlphaComponent(0.35)
+                }
+                out.append(NSAttributedString(string: block.speaker, attributes: speakerAttrs))
                 out.append(NSAttributedString(
-                    string: line.timestamp + "  ",
+                    string: "  \(block.timestamp)\n",
                     attributes: [.font: monoFont,
                                  .foregroundColor: NSColor.tertiaryLabelColor,
-                                 .paragraphStyle: para]))
+                                 .paragraphStyle: headerPara]))
                 out.append(NSAttributedString(
-                    string: line.speaker + "  ",
-                    attributes: [.font: NSFont.boldSystemFont(ofSize: 13),
-                                 .foregroundColor: speakerColor(line.speaker),
-                                 .paragraphStyle: para]))
-                out.append(NSAttributedString(
-                    string: line.text + "\n",
+                    string: block.text + "\n",
                     attributes: [.font: bodyFont,
                                  .foregroundColor: NSColor.labelColor,
-                                 .paragraphStyle: para]))
+                                 .paragraphStyle: bodyPara]))
             }
         }
 
@@ -323,6 +546,7 @@ final class TranscriptWindowController: NSWindowController {
         if wasPinned {
             textView.scrollToEndOfDocument(nil)
         }
+        updateJumpButton()
         updateHeader()
     }
 
@@ -332,11 +556,9 @@ final class TranscriptWindowController: NSWindowController {
 
         var parts: [String] = []
         if let started = snapshot.startedAt {
-            let end = snapshot.endedAt ?? (recording ? Date() : snapshot.endedAt ?? Date())
-            let secs = Int(end.timeIntervalSince(started))
-            if secs >= 0 {
-                parts.append(String(format: "%02d:%02d", secs / 60, secs % 60))
-            }
+            let end = snapshot.endedAt ?? Date()
+            let secs = max(0, Int(end.timeIntervalSince(started)))
+            parts.append(String(format: "%02d:%02d", secs / 60, secs % 60))
         }
         parts.append("\(snapshot.lines.count) lines")
         if !recording && snapshot.endedAt != nil { parts.append("ended") }
@@ -353,7 +575,7 @@ final class TranscriptWindowController: NSWindowController {
     }
 }
 
-// MARK: - Menubar
+// MARK: - Menubar + app lifecycle
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
@@ -362,6 +584,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastRecording = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        buildMainMenu()
+        // Dock/⌘Tab icon, drawn at runtime — no .icns asset to maintain.
+        NSApp.applicationIconImage = mWaveformImage(
+            size: 512, barColor: .white, tile: NSColor.systemIndigo)
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         updateStatusIcon(recording: false)
         rebuildMenu()
@@ -369,6 +596,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.pollState()
         }
+
+        // Window-close drops us back to menubar-only (.accessory) so the
+        // Dock/⌘Tab entry only exists while there's a window to switch to.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] note in
+                guard let self, let closing = note.object as? NSWindow,
+                      closing == self.transcriptWC?.window else { return }
+                NSApp.setActivationPolicy(.accessory)
+            }
+
         showTranscript()
     }
 
@@ -376,6 +613,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                        hasVisibleWindows flag: Bool) -> Bool {
         showTranscript()
         return true
+    }
+
+    /// Key equivalents (⌘F/⌘C/⌘A/⌘W/⌘Q) resolve through the main menu —
+    /// which a bare NSApplication.run() app doesn't have until we build one.
+    private func buildMainMenu() {
+        let main = NSMenu()
+
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About Meetink",
+                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Meetink",
+                        action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+
+        let fileItem = NSMenuItem()
+        main.addItem(fileItem)
+        let fileMenu = NSMenu(title: "File")
+        fileMenu.addItem(withTitle: "Close Window",
+                         action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        fileItem.submenu = fileMenu
+
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Copy",
+                         action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Select All",
+                         action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(.separator())
+        let find = NSMenuItem(title: "Find…",
+                              action: #selector(NSResponder.performTextFinderAction(_:)),
+                              keyEquivalent: "f")
+        find.tag = Int(NSTextFinder.Action.showFindInterface.rawValue)
+        editMenu.addItem(find)
+        let findNext = NSMenuItem(title: "Find Next",
+                                  action: #selector(NSResponder.performTextFinderAction(_:)),
+                                  keyEquivalent: "g")
+        findNext.tag = Int(NSTextFinder.Action.nextMatch.rawValue)
+        editMenu.addItem(findNext)
+        let findPrev = NSMenuItem(title: "Find Previous",
+                                  action: #selector(NSResponder.performTextFinderAction(_:)),
+                                  keyEquivalent: "G")
+        findPrev.tag = Int(NSTextFinder.Action.previousMatch.rawValue)
+        editMenu.addItem(findPrev)
+        editItem.submenu = editMenu
+
+        let windowItem = NSMenuItem()
+        main.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Minimize",
+                           action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowItem.submenu = windowMenu
+        NSApp.windowsMenu = windowMenu
+
+        NSApp.mainMenu = main
     }
 
     private func pollState() {
@@ -390,15 +686,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusIcon(recording: Bool) {
         guard let button = statusItem.button else { return }
         if recording {
-            let img = NSImage(systemSymbolName: "record.circle.fill",
-                              accessibilityDescription: "Recording")?
-                .withSymbolConfiguration(.init(paletteColors: [.systemRed]))
-            img?.isTemplate = false
+            let img = mWaveformImage(size: 18, barColor: .systemRed)
+            img.isTemplate = false
             button.image = img
         } else {
-            let img = NSImage(systemSymbolName: "waveform.circle",
-                              accessibilityDescription: "Meetink")
-            img?.isTemplate = true
+            let img = mWaveformImage(size: 18, barColor: .black)
+            img.isTemplate = true   // adapts to menubar light/dark
             button.image = img
         }
     }
@@ -477,6 +770,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if transcriptWC == nil {
             transcriptWC = TranscriptWindowController()
         }
+        // Visible window → appear in ⌘Tab and the Dock so the app can't be
+        // "lost" behind other windows. Back to .accessory on window close.
+        NSApp.setActivationPolicy(.regular)
         transcriptWC?.showWindow(nil)
         transcriptWC?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
