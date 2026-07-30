@@ -182,6 +182,68 @@ build_agent() {
     print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$app${C[reset]}"
 }
 
+# --- Build the Meetink companion app ---
+# Meetink.app is the native face: an NSStatusItem in the menu bar
+# (start/stop/status at a glance) plus a live transcript window — the
+# graduated form of the terminal tail, with a pinned header (elapsed,
+# talk-time %) that a `tail -F` window could never have without breaking
+# scrollback. Same swiftc-app-bundle pattern as MeetinkAgent.app.
+#
+# Permission note: when recording is STARTED FROM THE APP, macOS attributes
+# the mic/screen-recording grants to Meetink.app (the responsible process),
+# not the terminal — the first in-app Start triggers fresh permission
+# prompts. Starting from a terminal keeps using that terminal's grants.
+build_app() {
+    print -P "${C[bright_yellow]}▸${C[reset]} Building Meetink.app (menubar + transcript window)..."
+    if ! command -v swiftc >/dev/null 2>&1; then
+        print -P "${C[red]}error:${C[reset]} ${C[bold]}swiftc${C[reset]} not found"
+        print -P "  Install Xcode Command Line Tools:"
+        print -P "  ${C[bright_cyan]}xcode-select --install${C[reset]}"
+        exit 1
+    fi
+
+    local sdk
+    if ! sdk=$(find_sdk); then
+        print -P "${C[red]}error:${C[reset]} no macOS SDK found"
+        exit 1
+    fi
+
+    local app="$MK_HOME/bin/Meetink.app"
+    local macos_dir="$app/Contents/MacOS"
+    mkdir -p "$macos_dir"
+
+    swiftc -O -o "$macos_dir/meetink-app" "$MK_ROOT/src/app/Sources/main.swift" \
+        -framework Foundation -framework AppKit \
+        -sdk "$sdk" \
+        -target arm64-apple-macosx14.0 || {
+            print -P "${C[red]}error:${C[reset]} app build failed"
+            exit 1
+        }
+
+    cp "$MK_ROOT/src/app/Resources/Info.plist" "$app/Contents/Info.plist"
+
+    # Ad-hoc sign for a stable TCC identity — same reasoning as build_agent:
+    # without it every rebuild looks like a new app and permission grants
+    # (mic, screen recording when started from the app) reset each time.
+    if command -v codesign >/dev/null 2>&1; then
+        codesign --force --sign - "$app" 2>/dev/null || true
+    fi
+
+    print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$app${C[reset]}"
+}
+
+# Launch (building first if needed). `meetink app build` forces a rebuild —
+# needed after editing src/app/Sources/main.swift, same two-locations
+# story as the capture binary.
+cmd_app() {
+    local app="$MK_HOME/bin/Meetink.app"
+    if [[ "$1" == "build" || ! -d "$app" ]]; then
+        build_app
+    fi
+    open "$app"
+    print -P "${C[green]}✓${C[reset]} Meetink.app launched ${C[dim]}(menu bar icon + transcript window)${C[reset]}"
+}
+
 # --- Download whisper model ---
 download_model() {
     local model_name="${1:-small.en}"
@@ -779,6 +841,7 @@ cmd_help() {
     bullet "stop     " "stop recording, save transcript"
     bullet "status   " "show whether recording is active"
     bullet "tail     " "follow the live transcript"
+    bullet "app      " "launch Meetink.app (menu bar + native transcript window)"
     bullet "help     " "show this help"
     print -P ""
     print -P "${C[bright_yellow]}OUTPUT${C[reset]}"
@@ -831,6 +894,7 @@ case "${1:-}" in
     context)           shift; cmd_context "$@" ;;
     index)             shift; cmd_index "$@" ;;
     watch)             shift; cmd_watch "$@" ;;
+    app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
     _build_capture)    build_capture ;;
     prompt|vocab)

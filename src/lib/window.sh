@@ -13,14 +13,18 @@
 MK_TAIL_PIDFILE="/tmp/meetink-tail.tailpid"
 MK_TAIL_TITLE="meetink-tail"
 
-# Which terminal app should host the tail window. Prefer the one the user
-# is actually running in (TERM_PROGRAM survives through the REPL's
-# subprocess dispatch); default to Terminal.app everywhere else. Overridable
-# via MEETINK_TAIL_APP=iTerm2|Terminal for users who want the tail somewhere
-# other than their launch terminal.
+# Which app should host the tail window. Precedence:
+#   1. MEETINK_TAIL_APP=app|iTerm2|Terminal (explicit override)
+#   2. Meetink.app if built (`meetink app`) — the native viewer supersedes
+#      terminal tails once it exists
+#   3. the terminal the user is running in (TERM_PROGRAM survives through
+#      the REPL's subprocess dispatch)
+#   4. Terminal.app
 window_terminal_app() {
     if [[ -n "$MEETINK_TAIL_APP" ]]; then
         print -n -- "$MEETINK_TAIL_APP"
+    elif [[ -d "$MK_HOME/bin/Meetink.app" ]]; then
+        print -n -- "app"
     elif [[ "$TERM_PROGRAM" == "iTerm.app" || -n "$ITERM_SESSION_ID" ]]; then
         print -n -- "iTerm2"
     else
@@ -131,6 +135,14 @@ window_open_tail() {
         return 1
     fi
 
+    # Native viewer: Meetink.app watches live.txt itself (symlink re-resolve
+    # + truncation-aware), so opening it IS the tail. `open` is idempotent —
+    # already-running just activates.
+    if [[ "$(window_terminal_app)" == "app" ]]; then
+        open "$MK_HOME/bin/Meetink.app" 2>/dev/null
+        return 0
+    fi
+
     if window_tail_exists; then
         window_raise_tail
         return 0
@@ -195,6 +207,11 @@ APPLESCRIPT
 # shell exits cleanly via the trailing `; exit 0`), then AppleScript-close
 # any window that wasn't auto-closed by the user's profile.
 window_close_tail() {
+    # Native viewer: deliberately NOT closed on /stop. It's a reader the
+    # user owns — after the recording ends it shows the final (titled,
+    # consolidated) transcript, which is exactly when they want to read it.
+    [[ "$(window_terminal_app)" == "app" ]] && return 0
+
     if [[ -f "$MK_TAIL_PIDFILE" ]]; then
         local pid=$(< "$MK_TAIL_PIDFILE")
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
