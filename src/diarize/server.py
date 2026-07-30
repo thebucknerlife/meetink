@@ -1039,6 +1039,125 @@ _next_cluster_idx: int = 0
 # stops fragmenting. Override via MEETINK_CLUSTER_MAX_SAMPLES.
 CLUSTER_MAX_SAMPLES = int(os.environ.get("MEETINK_CLUSTER_MAX_SAMPLES", "64"))
 
+# --- Splinter control -------------------------------------------------------
+# Greedy per-chunk assignment against a fixed threshold shatters one real
+# voice into many letters on multi-person calls: ~3 s windows of the same
+# speaker routinely score below CLUSTER_THRESHOLD against their own cluster,
+# and every miss seeds a fresh letter (observed: one speaker -> THEM-A..I in
+# a 30-min 1:1). Two mechanisms — the same shape commercial live diarizers
+# use — keep clusters coherent:
+#
+# 1. Sticky-speaker prior. Conversation is temporally sticky: the voice in
+#    this chunk is overwhelmingly likely to be the voice from the previous
+#    chunk. A near-miss (>= STICKY_THRESHOLD but < CLUSTER_THRESHOLD) against
+#    the LAST-assigned cluster, within STICKY_WINDOW_S of that assignment,
+#    stays on that letter instead of seeding a new one. A genuinely new voice
+#    is unaffected: WeSpeaker cross-speaker cosine sits far below the sticky
+#    floor (< ~0.4).
+#
+# 2. Retroactive merging. When two cluster centroids converge above
+#    CLUSTER_MERGE_THRESHOLD, they were the same person all along (each
+#    seeded from one noisy window) — fold the smaller into the larger and
+#    record the alias. /identify returns the surviving letter from then on,
+#    and the launcher rewrites the already-written transcript lines from
+#    GET /session/aliases on /stop. Live labels are provisional; evidence
+#    accumulates; earlier decisions get healed — same philosophy as Otter's
+#    post-hoc re-clustering, scoped to what a per-chunk pipeline can do.
+STICKY_THRESHOLD = float(os.environ.get("MEETINK_CLUSTER_STICKY_THRESHOLD", "0.58"))
+STICKY_WINDOW_S = float(os.environ.get("MEETINK_CLUSTER_STICKY_WINDOW_S", "12"))
+CLUSTER_MERGE_THRESHOLD = float(os.environ.get("MEETINK_CLUSTER_MERGE_THRESHOLD", "0.74"))
+# A cluster with <= SMALL_MAX samples is one-or-two noisy windows, not a
+# centroid estimate — one bad chunk that dodged both the join bar and the
+# sticky prior. Requiring the full MERGE_THRESHOLD against such a "centroid"
+# strands it as a permanent orphan letter, so small clusters merge at a
+# lower bar. 0.60 stays far above WeSpeaker cross-speaker cosine (< ~0.4,
+# the same calibration PROFILE_OUTLIER_FLOOR documents), so a genuinely
+# different voice that spoke only once keeps its own letter.
+CLUSTER_MERGE_SMALL_MAX = int(os.environ.get("MEETINK_CLUSTER_MERGE_SMALL_MAX", "2"))
+CLUSTER_MERGE_SMALL_THRESHOLD = float(
+    os.environ.get("MEETINK_CLUSTER_MERGE_SMALL_THRESHOLD", "0.60"))
+
+_last_cluster_letter: str | None = None
+_last_cluster_ts: float = 0.0
+# loser letter -> surviving letter, kept transitively resolved (values are
+# always live cluster letters, never other losers).
+cluster_aliases: dict[str, str] = {}
+
+
+def _touch_sticky(letter: str) -> None:
+    global _last_cluster_letter, _last_cluster_ts
+    _last_cluster_letter = letter
+    _last_cluster_ts = time.time()
+
+
+def _resolve_alias(letter: str) -> str:
+    """Map a possibly-merged-away letter to its surviving cluster letter."""
+    return cluster_aliases.get(letter, letter)
+
+
+def _record_alias(loser: str, winner: str) -> None:
+    global _last_cluster_letter
+    # Keep the map transitively flat: anything that resolved to the loser
+    # now resolves to the winner (C->B recorded, then B loses to A: C->A).
+    for k, v in list(cluster_aliases.items()):
+        if v == loser:
+            cluster_aliases[k] = winner
+    cluster_aliases[loser] = winner
+    if _last_cluster_letter == loser:
+        _last_cluster_letter = winner
+
+
+def _add_to_cluster(cluster: dict, emb: np.ndarray) -> None:
+    new_samples = np.vstack([cluster["samples"], _l2(emb)[np.newaxis, :]])
+    # Cap to the most-recent CLUSTER_MAX_SAMPLES rows. .copy() so the
+    # pre-cap array is released — see CLUSTER_MAX_SAMPLES (leak history).
+    if new_samples.shape[0] > CLUSTER_MAX_SAMPLES:
+        new_samples = new_samples[-CLUSTER_MAX_SAMPLES:].copy()
+    cluster["samples"] = new_samples
+    cluster["centroid"] = _centroid(new_samples)
+
+
+def _maybe_merge_clusters() -> None:
+    """Fold together any cluster pair whose centroids exceed
+    CLUSTER_MERGE_THRESHOLD. Called after every sample add (the only time
+    centroids move). Loops until no pair qualifies — a merge moves the
+    winner's centroid, which can bring a third cluster into range."""
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                a, b = clusters[i], clusters[j]
+                sim = cosine(a["centroid"], b["centroid"])
+                small = min(a["samples"].shape[0], b["samples"].shape[0]) \
+                    <= CLUSTER_MERGE_SMALL_MAX
+                bar = CLUSTER_MERGE_SMALL_THRESHOLD if small \
+                    else CLUSTER_MERGE_THRESHOLD
+                if sim < bar:
+                    continue
+                # More samples wins (more evidence behind its centroid);
+                # ties go to the earlier letter.
+                winner, loser = (a, b) if (
+                    a["samples"].shape[0] >= b["samples"].shape[0]
+                ) else (b, a)
+                combined = np.vstack([winner["samples"], loser["samples"]])
+                if combined.shape[0] > CLUSTER_MAX_SAMPLES:
+                    combined = combined[-CLUSTER_MAX_SAMPLES:].copy()
+                winner["samples"] = combined
+                winner["centroid"] = _centroid(combined)
+                clusters.remove(loser)
+                _record_alias(loser["letter"], winner["letter"])
+                print(
+                    f"cluster merge: {loser['letter']} -> {winner['letter']} "
+                    f"(centroid sim={sim:.3f}, "
+                    f"combined={combined.shape[0]} samples)",
+                    file=sys.stderr,
+                )
+                merged = True
+                break
+            if merged:
+                break
+
 
 def _letter_for(idx: int) -> str:
     """0→A, 1→B, … 25→Z, 26→AA, 27→AB, … (monotonic, never reused)."""
@@ -1061,23 +1180,31 @@ def _new_cluster(emb: np.ndarray) -> dict:
 
 
 def _cluster_or_create(emb: np.ndarray) -> tuple[str, float]:
-    """Find closest cluster ≥ CLUSTER_THRESHOLD, else seed a new one.
-    Returns (letter, similarity_to_chosen_cluster_centroid)."""
+    """Find closest cluster ≥ CLUSTER_THRESHOLD; else give the LAST-assigned
+    cluster a discounted second chance (sticky-speaker prior); else seed a
+    new one. Returns (letter, similarity_to_chosen_cluster_centroid)."""
     if clusters:
         best = max(clusters, key=lambda c: cosine(emb, c["centroid"]))
         sim = cosine(emb, best["centroid"])
         if sim >= settings["cluster_threshold"]:
-            new_samples = np.vstack([best["samples"], _l2(emb)[np.newaxis, :]])
-            # Cap to the most-recent CLUSTER_MAX_SAMPLES rows. .copy() so the
-            # pre-cap array is released (a view would keep its base alive).
-            # This bounds memory AND stops the libmalloc fragmentation that
-            # leaked tens of GB — see CLUSTER_MAX_SAMPLES.
-            if new_samples.shape[0] > CLUSTER_MAX_SAMPLES:
-                new_samples = new_samples[-CLUSTER_MAX_SAMPLES:].copy()
-            best["samples"] = new_samples
-            best["centroid"] = _centroid(new_samples)
-            return best["letter"], round(sim, 3)
+            _add_to_cluster(best, emb)
+            _touch_sticky(best["letter"])
+            _maybe_merge_clusters()
+            return _resolve_alias(best["letter"]), round(sim, 3)
+        # Sticky prior: below the normal join bar, but the previous chunk's
+        # speaker gets a lower one — people don't change mid-sentence.
+        if _last_cluster_letter is not None and \
+                time.time() - _last_cluster_ts <= STICKY_WINDOW_S:
+            last = _find_cluster(_last_cluster_letter)
+            if last is not None:
+                sim_last = cosine(emb, last["centroid"])
+                if sim_last >= STICKY_THRESHOLD:
+                    _add_to_cluster(last, emb)
+                    _touch_sticky(last["letter"])
+                    _maybe_merge_clusters()
+                    return _resolve_alias(last["letter"]), round(sim_last, 3)
     cluster = _new_cluster(emb)
+    _touch_sticky(cluster["letter"])
     return cluster["letter"], 1.0  # similarity to itself
 
 
@@ -1090,9 +1217,12 @@ def _find_cluster(letter: str) -> dict | None:
 
 def session_clear() -> None:
     """Reset clusters and the lettering counter. Called on /start."""
-    global _next_cluster_idx
+    global _next_cluster_idx, _last_cluster_letter, _last_cluster_ts
     clusters.clear()
     _next_cluster_idx = 0
+    cluster_aliases.clear()
+    _last_cluster_letter = None
+    _last_cluster_ts = 0.0
     # Auto-train log is a per-session counter; resetting it on /start
     # makes the footer chip honestly track THIS recording's activity.
     _auto_train_log.clear()
@@ -1242,6 +1372,12 @@ class Handler(BaseHTTPRequestHandler):
                     for c in clusters
                 ]
             })
+            return
+        if path == "/session/aliases":
+            # Retroactive merges this session: loser letter -> surviving
+            # letter (transitively flattened). The launcher reads this on
+            # /stop to rewrite already-written THEM-<loser> transcript lines.
+            self._json(200, {"aliases": dict(cluster_aliases)})
             return
         self._json(404, {"error": "not found"})
 
@@ -1467,6 +1603,9 @@ class Handler(BaseHTTPRequestHandler):
                 if any(c in name for c in "/\\.."):
                     self._json(400, {"error": "invalid name (no slashes or dots)"})
                     return
+                # The letter may have been merged away since the user saw it
+                # in /profile clusters — follow the alias to the survivor.
+                letter = _resolve_alias(letter)
                 cluster = _find_cluster(letter)
                 if cluster is None:
                     self._json(404, {"error": f"no cluster named {letter}"})
@@ -1518,9 +1657,14 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(404, {"error": "unknown cluster letter"})
                     return
                 merged = np.vstack([dst["samples"], src["samples"]])
+                if merged.shape[0] > CLUSTER_MAX_SAMPLES:
+                    merged = merged[-CLUSTER_MAX_SAMPLES:].copy()
                 dst["samples"] = merged
                 dst["centroid"] = _centroid(merged)
                 clusters.remove(src)
+                # Manual merges get the same alias bookkeeping as automatic
+                # ones, so the /stop transcript consolidation covers both.
+                _record_alias(src_letter, dst_letter)
                 count = int(merged.shape[0])
                 print(f"session: cluster {src_letter} merged into {dst_letter} ({count} samples)", file=sys.stderr)
                 self._json(200, {

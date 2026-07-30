@@ -1024,6 +1024,39 @@ _resp_ok() {
 # Used by profile_assign / profile_merge after the diarize-server has confirmed
 # the change. Anchors on `] OLD:` so transcript text mentioning the label
 # (e.g. "THEM-A is…" inside someone's quoted speech) doesn't get clobbered.
+# Rewrite THEM-<loser>: labels for clusters the server retroactively merged
+# during the session (one voice splintered across letters, centroids later
+# converged). Reads GET /session/aliases; called from cmd_stop BEFORE
+# titling so the summary sees consolidated speakers. Soft no-op when the
+# sidecar is down or nothing merged.
+#   $1 = transcript path (symlink or file)
+diarize_consolidate_transcript() {
+    local transcript="$1"
+    [[ -n "$transcript" ]] || return 0
+    local resp=$(curl -s -m 2 "http://127.0.0.1:$MK_DIARIZE_PORT/session/aliases" 2>/dev/null)
+    [[ -z "$resp" ]] && return 0
+    # {"aliases": {"C": "B", ...}} → one "C B" pair per line. Python rather
+    # than sed: the dict nests arbitrarily many pairs and order matters not.
+    local pairs=$(print -- "$resp" | python3 -c '
+import json, sys
+try:
+    for k, v in json.load(sys.stdin).get("aliases", {}).items():
+        print(k, v)
+except Exception:
+    pass' 2>/dev/null)
+    [[ -z "$pairs" ]] && return 0
+    local from to n=0
+    while read -r from to; do
+        [[ -z "$from" || -z "$to" ]] && continue
+        if _rewrite_transcript_label "$transcript" "THEM-$from" "THEM-$to"; then
+            n=$((n + 1))
+        fi
+    done <<< "$pairs"
+    if (( n > 0 )); then
+        print -P "  ${C[dim]}Speaker labels consolidated: ${n} split cluster(s) merged${C[reset]}"
+    fi
+}
+
 _rewrite_transcript_label() {
     local file="$1" old="$2" new="$3"
     local actual="$file"

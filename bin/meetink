@@ -666,6 +666,14 @@ cmd_stop() {
 
     print -P "${C[green]}✓${C[reset]} Stopped."
 
+    # Heal splintered speaker labels before titling/summary read the file:
+    # clusters the diarize-server merged mid-session leave stale THEM-<x>
+    # letters on lines written before the merge. See
+    # diarize_consolidate_transcript in src/lib/diarize.sh.
+    if typeset -f diarize_consolidate_transcript >/dev/null 2>&1; then
+        diarize_consolidate_transcript "$MK_TRANSCRIPT"
+    fi
+
     # Run AI titling on the just-finished session (no-op if llama.cpp + the
     # tiny LLM aren't installed). title_session_file may rename the file and
     # update the live.txt symlink target.
