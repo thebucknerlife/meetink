@@ -61,7 +61,7 @@ If you take a lot of meetings on your Mac and want a private transcript, you usu
 - **AI titles and summaries.** Finished meetings are renamed `2026-05-07_14-32_design-review-followup.txt`, and a `<name>.summary.md` (Topics, Decisions, Action items, Open questions) is generated automatically. Backend is `local` (on-device Qwen3.5-4bit via MLX) or `claude` (your Claude Pro/Max subscription via the `claude` CLI).
 - **`/ask` over the meeting.** Stream answers about the current or most-recent transcript, with project context and prior `/ask` turns automatically threaded in.
 - **Auto-record from your calendar.** `/watch on` polls Calendar.app, fires a 1-minute notification before each event with a Skip button, then auto-starts recording at the scheduled time — and auto-stops within **~10 s** of the conferencing app going away (tightened browser URL regex + fast-confirm polling: the moment we see one inactive poll mid-recording the cadence drops from 30 s to 5 s and stop fires after one more). Catches impromptu calls too: a meeting that starts without a calendar event triggers a confirmation notification ~30 s in. State persists across REPL restarts.
-- **Speaker identification, tunable per meeting.** Optional sidecar (sherpa-onnx + WeSpeaker) labels recurring voices by name once you've enrolled a `/profile`. Unknown voices get clustered live as `THEM-A`, `THEM-B`, … Three sensitivity presets (`focused` / `default` / `strict`) auto-applied from the calendar event's attendee count, plus a per-session **whitelist** that restricts matching to people who are actually in the room — so Mike's voice can never be misidentified as Alice in a 1:1 with Mike. When the whitelist narrows to one profile, a higher absolute floor kicks in to prevent the "the only candidate wins by default" failure mode.
+- **Speaker identification, tunable per meeting.** Optional sidecar (sherpa-onnx + WeSpeaker) labels recurring voices by name once you've enrolled a `/profile`. Unknown voices get clustered live as `Speaker 1`, `Speaker 2`, … Three sensitivity presets (`focused` / `default` / `strict`) auto-applied from the calendar event's attendee count, plus a per-session **whitelist** that restricts matching to people who are actually in the room — so Mike's voice can never be misidentified as Alice in a 1:1 with Mike. When the whitelist narrows to one profile, a higher absolute floor kicks in to prevent the "the only candidate wins by default" failure mode.
 - **Self-improving profiles, that keep getting better.** Four mechanisms compound: (1) high-confidence `/identify` matches fold back into the matched profile (auto-train, with a tightness-hysteresis pause that suspends auto-train on any profile whose samples have started spreading — catches runaway drift before it snowballs); (2) `/profile train <name>` mid-meeting adopts the most recent system-audio embedding from the call rather than re-recording your mic, so you can click "train Mike" right after Mike speaks and actually grab *his* voice; (3) each profile holds up to 3 k-means centroids so a person's *different voice modes* (different mic, mood, accent variation) all match their best mode instead of being averaged together; (4) time decay (180-day half-life) keeps the centroid tracking the speaker's current voice, not their voice from a year ago. Outlier rejection guards every sample-add path (`/enroll`, `/train`, `/assign`, `/rename`, auto-train) so one bad sample can't pollute a centroid. Recoverable per-sample via `/profile undo`; full diagnostic via `/profile diagnose <name>`.
 - **Hot-swap mics mid-call.** Unplug your headphones, switch Bluetooth, pick a new mic in System Settings — the capture binary subscribes to `AVAudioEngineConfigurationChange` and rebuilds the tap on the new device without losing the recording. No more "I switched mics and my voice disappeared from the transcript."
 - **Projects.** Group recordings, summaries, and reference docs by client / topic. `/ask` automatically pulls in past meetings and curated context for the active project.
@@ -270,7 +270,7 @@ When `/watch` auto-records:
 | `/diarize sensitivity` | Show current matching preset and thresholds. |
 | `/diarize sensitivity focused\|default\|strict` | Switch preset. Hot-applied — takes effect on the very next `/identify`, no restart needed. `/watch` auto-picks based on attendee count. |
 | `/diarize whitelist` | Show the current per-session whitelist (subset of profiles `/identify` will consider). |
-| `/diarize whitelist <name1> <name2> …` | Restrict matching to those profiles. Voices that resemble any other enrolled profile fall through to clustering (THEM-X). |
+| `/diarize whitelist <name1> <name2> …` | Restrict matching to those profiles. Voices that resemble any other enrolled profile fall through to clustering (Speaker N). |
 | `/diarize whitelist auto` | Re-derive the whitelist from the live recording's `# attendees:` header. Picks up profiles enrolled mid-meeting. |
 | `/diarize whitelist clear` | Drop the restriction (match against all enrolled profiles). |
 | `/diarize auto-train` | Show auto-train state. When on (default), high-confidence `/identify` matches fold back into the matched profile, sharpening its centroid from real conversational audio. |
@@ -302,9 +302,9 @@ When `/watch` auto-records:
 | `/profile rm <name>` | Delete a profile. |
 | `/profile rm all` | Delete *every* profile (with confirmation). Use after a training mistake polluted multiple profiles and you want a clean slate. Also accepts `/profile rm-all` and `/profile nuke`. |
 | `/profile rename <old> <new>` | Rename a profile. If `<new>` already exists, **folds** `<old>`'s samples into it (use case: two enrollments turn out to be the same person). Rewrites uppercase labels in the live transcript. Outlier filter drops samples that don't actually match the destination. |
-| `/profile clusters` | Show the live "unknown" voice clusters (`THEM-A`, `THEM-B`, …) the current session has accumulated. |
-| `/profile assign <letter> <name>` | Convert a live cluster into a real profile **and** rewrite past lines in the current transcript: `THEM-A` → `ALICE`. Re-assigning into an existing name vstacks samples (so cluster intelligence is preserved). Outlier filter drops cluster samples that don't fit the target. |
-| `/profile clear <letter>` | Drop one in-memory cluster (e.g. `THEM-A`) — future utterances re-cluster as a fresh letter. Use when a cluster has accumulated two distinct voices and you want them split. |
+| `/profile clusters` | Show the live "unknown" voice clusters (`Speaker 1`, `Speaker 2`, …) the current session has accumulated. |
+| `/profile assign <letter> <name>` | Convert a live cluster into a real profile **and** rewrite past lines in the current transcript: `Speaker 1` → `ALICE`. Re-assigning into an existing name vstacks samples (so cluster intelligence is preserved). Outlier filter drops cluster samples that don't fit the target. |
+| `/profile clear <letter>` | Drop one in-memory cluster (e.g. `Speaker 1`) — future utterances re-cluster as a fresh letter. Use when a cluster has accumulated two distinct voices and you want them split. |
 | `/profile split <letter> [k]` | k-means split one cluster into k sub-clusters (default 2). Largest sub keeps the original letter; the rest get fresh letters. Inspect the result with `/profile clusters` then assign each sub to the right person. |
 | `/profile merge <from> <into>` | Fold one cluster into another. Useful when one voice gets split across two clusters by background noise. |
 
@@ -319,7 +319,7 @@ When `/profile add`, `/profile train`, `/profile assign`, or `/profile rename` s
 | `/model download <name>` | Fetch the GGML weights + CoreML companion. |
 | `/model rm <name>` | Delete weights and CoreML dir. |
 
-The registry covers `tiny.en`, `base.en`, `small.en` (default), `small.en-tdrz`, `medium.en`, `large-v3-turbo`, `large-v3`. The `*-tdrz` variants emit speaker-turn markers for the cluster fallback (`THEM-A` / `THEM-B` / …) when the diarize-server isn't running.
+The registry covers `tiny.en`, `base.en`, `small.en` (default), `small.en-tdrz`, `medium.en`, `large-v3-turbo`, `large-v3`. The `*-tdrz` variants emit speaker-turn markers for the cluster fallback (`Speaker 1` / `Speaker 2` / …) when the diarize-server isn't running.
 
 ### Local LLM (titling / summary / `/ask`)
 
@@ -425,8 +425,8 @@ Persisted in `~/.meetink/config` as `me_name=Stijn`.
 By default, system-audio lines are labelled `THEM:`. With `/diarize on` and a profile-equipped sidecar, you get per-line speaker decisions:
 
 - **Enrolled profile match.** Each `/profile add <name>` records 3 × 5 s samples, embeds them via WeSpeaker, L2-normalises, then runs k-means to derive up to 3 cluster centroids (one for sparse profiles; more as samples accumulate). Persisted as `<name>.npz` with centroids, samples, cluster_ids, and per-sample timestamps. At identify time, the top profile must clear cosine ≥ 0.65 against its **best-matching** centroid *and* beat the runner-up by ≥ 0.07 — otherwise we don't claim a match.
-- **Online clustering fallback.** Unknown embeddings are grouped into in-memory clusters and labelled `THEM-A`, `THEM-B`, … so the live transcript still distinguishes voices. Cluster state is per-session (cleared on `/start`).
-- **Recovery.** After the meeting, `/profile assign A Alice` converts cluster A into a real profile *and* rewrites past `THEM-A` lines to `ALICE` in the transcript file. `/profile merge A B` folds two clusters together if one voice got split.
+- **Online clustering fallback.** Unknown embeddings are grouped into in-memory clusters and labelled `Speaker 1`, `Speaker 2`, … so the live transcript still distinguishes voices. Cluster state is per-session (cleared on `/start`).
+- **Recovery.** After the meeting, `/profile assign 1 Alice` converts cluster A into a real profile *and* rewrites past `Speaker 1` lines to `ALICE` in the transcript file. `/profile merge A B` folds two clusters together if one voice got split.
 
 Per-chunk diarization: each ~3 s WAV chunk is identified individually (synchronous, ~300 ms via the local sidecar) before the line is written, so the labels you see live are the same labels in the final file.
 
@@ -448,7 +448,7 @@ Controls fall into three layers: **session-level** knobs you reach for from the 
 **Safety guards** run on every sample addition (`/enroll`, `/profile train`, `/profile assign`, `/profile rename`, auto-train):
 
 - **Outlier rejection.** A new sample's cosine against the profile's nearest existing centroid must clear `PROFILE_OUTLIER_FLOOR` (default 0.40, calibrated for 256-D WeSpeaker embeddings where same-speaker similarity ≥ 0.5 and distinct-speaker similarity < 0.4). Catches a different voice bleeding into a `/profile train` recording, or a `/profile rename` fold where the two profiles turn out to be different people. Rejected samples are surfaced in the response so you see "6 of 13 samples dropped as outliers" and know your assumption about cluster identity was wrong.
-- **Identify-side rejection logging.** When `/identify` falls below threshold / margin / single-floor, the diarize-server stderr-logs the gate that failed and the score gap (`identify reject: Ethan@0.61 vs Mike@0.55 gap=0.06 < margin=0.07`). Tail `/tmp/meetink-diarize.log` (or `/diarize log`) when an enrolled person is silently labeled `THEM-X` and you want to know why.
+- **Identify-side rejection logging.** When `/identify` falls below threshold / margin / single-floor, the diarize-server stderr-logs the gate that failed and the score gap (`identify reject: Ethan@0.61 vs Mike@0.55 gap=0.06 < margin=0.07`). Tail `/tmp/meetink-diarize.log` (or `/diarize log`) when an enrolled person is silently labeled `Speaker N` and you want to know why.
 
 **Mid-meeting `/profile train` adopts the call audio.** Pre-v0.1.1, training another person mid-call recorded from your mic — which captured silence (you're listening) and added noise to that person's profile. Now: the diarize-server keeps a 10-entry ring of recent `/identify` embeddings (the call audio); `/profile train Mike` POSTs to `/session/adopt-last` which folds the most-recent embedding into Mike's profile. The CLI auto-routes: your own name → mic; others → call-audio ring (or a helpful error when there's no recording in flight).
 
@@ -625,17 +625,17 @@ Turn the watcher on once. It survives REPL restarts (config flag), polls Calenda
 
 ```
 > /stop
-# transcript has THEM-A, THEM-B, THEM-C lines
+# transcript has Speaker 1, Speaker 2, Speaker 3 lines
 > /profile clusters
   A   12 utterances, last seen 14:31:08
   B   24 utterances, last seen 14:32:14
   C    3 utterances, last seen 14:28:42
 
-> /profile assign A Alice
-✓ Renamed THEM-A → ALICE in 2026-05-07_14-32_design-review-followup.txt
+> /profile assign 1 Alice
+✓ Renamed Speaker 1 → ALICE in 2026-05-07_14-32_design-review-followup.txt
 
-> /profile assign B Bob
-> /profile merge C B        # C was Bob with background noise
+> /profile assign 2 Bob
+> /profile merge 3 2        # C was Bob with background noise
 ```
 
 ### Diagnosing why someone keeps getting mis-labeled

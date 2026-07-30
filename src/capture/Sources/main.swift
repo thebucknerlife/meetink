@@ -609,7 +609,9 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
     if speaker == "THEM" && !wavData.isEmpty {
         if let identified = diarizeSpeaker(wavData: wavData, chunkIndex: chunkIndex) {
             let prev = diarizeBuffer.getCurrentSpeaker()
-            let next = identified.uppercased()
+            // Label casing is the server's job now: enrolled names arrive
+            // pre-uppercased (MELANIE), cluster labels arrive as "Speaker 1".
+            let next = identified
             diarizeBuffer.setCurrentSpeaker(next)
             if prev != next {
                 fputs("  speaker changed: \(prev) -> \(next)\n", stderr)
@@ -721,7 +723,7 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
 
     // Non-tdrz path: THEM uses whatever the diarize-server most recently
     // returned via the 10s embedding window — either a matched profile name
-    // (e.g. "ALICE") or a cluster label ("THEM-A", "THEM-B", …) for voices
+    // (e.g. "ALICE") or a cluster label ("Speaker 1", "Speaker 2", …) for voices
     // that don't match any enrolled profile. Stays "THEM" only when the
     // server is unreachable or no window has been processed yet. ME stays ME.
     if isHallucination(text) {

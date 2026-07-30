@@ -10,7 +10,7 @@ Identification is two-stage:
   1. Compare to enrolled profiles. If top match clears THRESHOLD and beats
      the runner-up by MARGIN, return that name.
   2. Otherwise the embedding is "unknown" → group it into an in-memory
-     cluster (online clustering) and return `THEM-A`, `THEM-B`, ... so the
+     cluster (online clustering) and return `Speaker 1`, `Speaker 2`, ... so the
      live transcript still distinguishes voices. After the meeting the user
      runs `/profile assign A Alice`, which converts the cluster to a real
      profile and lets the launcher rewrite past transcript lines.
@@ -68,7 +68,7 @@ GET    /session/whitelist             current per-session profile whitelist
 POST   /session/whitelist?profiles=alex,stacey
                                       restrict /identify to a subset of
                                       profiles (others won't match → cluster
-                                      as THEM-X). Eliminates the "Mike's
+                                      as Speaker N). Eliminates the "Mike's
                                       voice scores 0.89 against ALEX" risk
                                       when going into a meeting with people
                                       who aren't all enrolled.
@@ -118,7 +118,7 @@ PORT = int(os.environ.get("MEETINK_DIARIZE_PORT", "8179"))
 #            failure: Flavio scoring 0.66 against BOB and 0.62 against
 #            FLAVIO, false-naming as BOB). Low CLUSTER_THRESHOLD keeps
 #            an unmatched speaker as one cluster instead of splintering
-#            into THEM-A/THEM-B/THEM-C across the call.
+#            into Speaker 1/2/3 across the call.
 #
 # default  — what shipped before sensitivity was a runtime knob. Kept as
 #            a baseline for backwards compatibility, not because it's
@@ -300,7 +300,7 @@ PROFILE_MAX_SAMPLES = int(os.environ.get("MEETINK_PROFILE_MAX_SAMPLES", "500"))
 #
 # When set, /identify only considers this subset of profiles. Voices that
 # would otherwise have matched a profile outside the whitelist fall through
-# to clustering (THEM-X) — which is exactly what you want when you go into
+# to clustering (Speaker N) — which is exactly what you want when you go into
 # a meeting with people who aren't all enrolled. Auto-train naturally
 # inherits the restriction (it operates on identify's output).
 #
@@ -910,7 +910,7 @@ def identify(emb: np.ndarray) -> dict:
 
     # Apply session whitelist if set. Profiles outside it are simply
     # invisible to this match — voices that resemble them fall through
-    # to clustering (THEM-X) just like any other unknown speaker.
+    # to clustering (Speaker N) just like any other unknown speaker.
     candidates = profiles
     if session_whitelist is not None:
         candidates = {
@@ -974,7 +974,7 @@ def identify(emb: np.ndarray) -> dict:
             accepted = True
     # Stderr-log every rejection with the gate that failed and the gap.
     # This is the missing diagnostic users have been hitting: their
-    # enrolled person silently falls to THEM-X with no signal as to why.
+    # enrolled person silently falls to Speaker N with no signal as to why.
     # `/diarize log` (tails the same file) now surfaces it.
     if not accepted:
         if reason == "below_single_floor":
@@ -1020,7 +1020,7 @@ def identify(emb: np.ndarray) -> dict:
 # When `identify()` doesn't match an enrolled profile, we keep the embedding
 # in a per-session in-memory cluster pool. New embeddings join the closest
 # existing cluster (cosine ≥ CLUSTER_THRESHOLD) or seed a new one. The cluster
-# letter is what the live transcript shows: THEM-A, THEM-B, …
+# letter is the cluster id; the live transcript shows it as Speaker 1, Speaker 2, …
 #
 # Lettering is monotonic — never reused after a cluster is assigned/merged
 # away. So the user's mental model "A was Alice" stays valid for the rest of
@@ -1160,10 +1160,11 @@ def _maybe_merge_clusters() -> None:
 
 
 def _letter_for(idx: int) -> str:
-    """0→A, 1→B, … 25→Z, 26→AA, 27→AB, … (monotonic, never reused)."""
-    if idx < 26:
-        return chr(ord("A") + idx)
-    return _letter_for(idx // 26 - 1) + chr(ord("A") + idx % 26)
+    """0→"1", 1→"2", … (monotonic, never reused). Cluster ids are 1-based
+    speaker numbers; the live transcript renders them as "Speaker <n>".
+    (Historically these were letters — THEM-A/B/C — hence the function
+    name, kept to avoid churn at the call sites.)"""
+    return str(idx + 1)
 
 
 def _new_cluster(emb: np.ndarray) -> dict:
@@ -1376,7 +1377,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/session/aliases":
             # Retroactive merges this session: loser letter -> surviving
             # letter (transitively flattened). The launcher reads this on
-            # /stop to rewrite already-written THEM-<loser> transcript lines.
+            # /stop to rewrite already-written Speaker <loser> transcript lines.
             self._json(200, {"aliases": dict(cluster_aliases)})
             return
         self._json(404, {"error": "not found"})
@@ -1402,7 +1403,7 @@ class Handler(BaseHTTPRequestHandler):
                     # No profile match — assign to a cluster so the live
                     # transcript still distinguishes voices.
                     letter, sim = _cluster_or_create(emb)
-                    resp["speaker"] = f"THEM-{letter}"
+                    resp["speaker"] = f"Speaker {letter}"
                     resp["cluster"] = letter
                     resp["cluster_confidence"] = sim
                 else:
@@ -1427,6 +1428,12 @@ class Handler(BaseHTTPRequestHandler):
                             f"total={profiles[resp['speaker']]['samples'].shape[0]})",
                             file=sys.stderr,
                         )
+                    # Transcript display convention: enrolled names appear
+                    # uppercased, matching the mic-side ME/<NAME> labels.
+                    # Done server-side (after auto-train, which needs the raw
+                    # profile-dict key) so the capture client writes the
+                    # label verbatim — cluster labels stay "Speaker N".
+                    resp["speaker"] = str(resp["speaker"]).upper()
                 self._json(200, resp)
                 return
             if url.path == "/session/cluster/clear":

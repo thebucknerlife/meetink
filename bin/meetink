@@ -568,7 +568,7 @@ cmd_start() {
     start_whisper_server
     # diarize-server is optional; quietly skipped if not installed.
     diarize_start
-    # Clear cluster state from any previous recording so THEM-A in this
+    # Clear cluster state from any previous recording so Speaker 1 in this
     # session is truly a new voice, not yesterday's leftover. Best-effort —
     # silently skipped if the server isn't up.
     curl -s -o /dev/null -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/clear" 2>/dev/null || true
@@ -667,8 +667,8 @@ cmd_stop() {
     print -P "${C[green]}✓${C[reset]} Stopped."
 
     # Heal splintered speaker labels before titling/summary read the file:
-    # clusters the diarize-server merged mid-session leave stale THEM-<x>
-    # letters on lines written before the merge. See
+    # clusters the diarize-server merged mid-session leave stale
+    # "Speaker <x>" labels on lines written before the merge. See
     # diarize_consolidate_transcript in src/lib/diarize.sh.
     if typeset -f diarize_consolidate_transcript >/dev/null 2>&1; then
         diarize_consolidate_transcript "$MK_TRANSCRIPT"

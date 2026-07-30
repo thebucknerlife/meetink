@@ -1023,8 +1023,8 @@ _resp_ok() {
 # Rewrite a transcript label in-place: `[HH:MM:SS] OLD:` → `[HH:MM:SS] NEW:`.
 # Used by profile_assign / profile_merge after the diarize-server has confirmed
 # the change. Anchors on `] OLD:` so transcript text mentioning the label
-# (e.g. "THEM-A is…" inside someone's quoted speech) doesn't get clobbered.
-# Rewrite THEM-<loser>: labels for clusters the server retroactively merged
+# (e.g. "Speaker 1 is…" inside someone's quoted speech) doesn't get clobbered.
+# Rewrite "Speaker <loser>:" labels for clusters the server retroactively merged
 # during the session (one voice splintered across letters, centroids later
 # converged). Reads GET /session/aliases; called from cmd_stop BEFORE
 # titling so the summary sees consolidated speakers. Soft no-op when the
@@ -1048,7 +1048,7 @@ except Exception:
     local from to n=0
     while read -r from to; do
         [[ -z "$from" || -z "$to" ]] && continue
-        if _rewrite_transcript_label "$transcript" "THEM-$from" "THEM-$to"; then
+        if _rewrite_transcript_label "$transcript" "Speaker $from" "Speaker $to"; then
             n=$((n + 1))
         fi
     done <<< "$pairs"
@@ -1107,10 +1107,10 @@ except Exception:
     print -P ""
     print -P "${C[bright_yellow]}ACTIVE CLUSTERS${C[reset]}"
     print -- "$lines" | while read -r letter count; do
-        print -P "  ${C[green]}●${C[reset]} ${C[bold]}THEM-${letter}${C[reset]}  ${C[dim]}(${count} samples)${C[reset]}"
+        print -P "  ${C[green]}●${C[reset]} ${C[bold]}Speaker ${letter}${C[reset]}  ${C[dim]}(${count} samples)${C[reset]}"
     done
     print -P ""
-    print -P "  ${C[dim]}/profile assign <letter> <name>${C[reset]}   promote cluster → real profile"
+    print -P "  ${C[dim]}/profile assign <number> <name>${C[reset]}   promote cluster → real profile"
     print -P "  ${C[dim]}/profile merge <from> <into>${C[reset]}      fold one cluster into another"
     print -P "  ${C[dim]}/profile rename <old> <new>${C[reset]}       rename a profile (or fold into existing)"
     print -P ""
@@ -1120,7 +1120,7 @@ except Exception:
 profile_assign() {
     local letter="$1" name="$2"
     if [[ -z "$letter" || -z "$name" ]]; then
-        print -P "${C[red]}usage:${C[reset]} /profile assign <cluster-letter> <name>"
+        print -P "${C[red]}usage:${C[reset]} /profile assign <number> <name>"
         return 1
     fi
     if [[ "$name" == *.* || "$name" == */* ]]; then
@@ -1148,9 +1148,9 @@ profile_assign() {
     fi
 
     local up_name=$(print -n -- "$name" | tr '[:lower:]' '[:upper:]')
-    if [[ -L "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "THEM-${up_letter}" "$up_name"; then
+    if [[ -L "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "Speaker ${up_letter}" "$up_name"; then
         local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
-        print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}THEM-${up_letter}${C[reset]} → ${C[bold]}${up_name}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
+        print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}Speaker ${up_letter}${C[reset]} → ${C[bold]}${up_name}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
     fi
 
     # If the meeting was auto-recorded by /watch, the whitelist may have
@@ -1213,7 +1213,7 @@ PY
     if [[ -z "$matched" ]]; then
         # Attendees header exists but no enrolled profiles match. Clear
         # any stale whitelist so /identify returns to match-all (every
-        # voice falls through to clustering as THEM-X), rather than
+        # voice falls through to clustering as Speaker N), rather than
         # carrying the previous meeting's whitelist forward.
         curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?clear=true" >/dev/null
         print -P "  ${C[dim]}Whitelist cleared${C[reset]} ${C[dim]}(no enrolled profiles matched the attendees)${C[reset]}"
@@ -1232,7 +1232,7 @@ PY
 cluster_clear() {
     local letter="$1"
     if [[ -z "$letter" ]]; then
-        print -P "${C[red]}usage:${C[reset]} /profile clear <letter>"
+        print -P "${C[red]}usage:${C[reset]} /profile clear <number>"
         return 1
     fi
     if ! diarize_running; then
@@ -1247,7 +1247,7 @@ cluster_clear() {
         return 1
     fi
     local cleared=$(print -- "$resp" | sed -nE 's/.*"cleared_samples":[[:space:]]*([0-9]+).*/\1/p')
-    print -P "${C[green]}✓${C[reset]} Cluster ${C[bold]}THEM-${up_letter}${C[reset]} cleared ${C[dim]}(${cleared} samples discarded — past transcript labels unchanged)${C[reset]}"
+    print -P "${C[green]}✓${C[reset]} Cluster ${C[bold]}Speaker ${up_letter}${C[reset]} cleared ${C[dim]}(${cleared} samples discarded — past transcript labels unchanged)${C[reset]}"
 }
 
 # Run k-means on a cluster's samples and split into K sub-clusters.
@@ -1257,7 +1257,7 @@ cluster_clear() {
 cluster_split() {
     local letter="$1" k="${2:-2}"
     if [[ -z "$letter" ]]; then
-        print -P "${C[red]}usage:${C[reset]} /profile split <letter> [k]"
+        print -P "${C[red]}usage:${C[reset]} /profile split <number> [k]"
         return 1
     fi
     if ! [[ "$k" =~ ^[0-9]+$ ]] || (( k < 2 )); then
@@ -1277,8 +1277,8 @@ cluster_split() {
     fi
     local new_letters=$(print -- "$resp" | sed -nE 's/.*"new_letters":[[:space:]]*\[([^]]*)\].*/\1/p' | sed 's/"//g')
     local sizes=$(print -- "$resp" | sed -nE 's/.*"sizes":[[:space:]]*\[([^]]*)\].*/\1/p')
-    print -P "${C[green]}✓${C[reset]} Split ${C[bold]}THEM-${up_letter}${C[reset]} into ${C[bold]}${up_letter}, ${new_letters}${C[reset]} ${C[dim]}(sample sizes: ${sizes})${C[reset]}"
-    print -P "  ${C[dim]}Past transcript lines tagged THEM-${up_letter} stay tagged — only future /identify calls route to the right sub-cluster.${C[reset]}"
+    print -P "${C[green]}✓${C[reset]} Split ${C[bold]}Speaker ${up_letter}${C[reset]} into ${C[bold]}${up_letter}, ${new_letters}${C[reset]} ${C[dim]}(sample sizes: ${sizes})${C[reset]}"
+    print -P "  ${C[dim]}Past transcript lines tagged Speaker ${up_letter} stay tagged — only future /identify calls route to the right sub-cluster.${C[reset]}"
 }
 
 # Pop the last N samples off a profile and recompute its centroid.
@@ -1380,9 +1380,9 @@ profile_merge() {
     fi
     print -P "${C[green]}✓${C[reset]} Merged cluster ${C[bold]}$up_from${C[reset]} into ${C[bold]}$up_into${C[reset]}"
 
-    if [[ -L "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "THEM-${up_from}" "THEM-${up_into}"; then
+    if [[ -L "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "Speaker ${up_from}" "Speaker ${up_into}"; then
         local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
-        print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}THEM-${up_from}${C[reset]} → ${C[dim]}THEM-${up_into}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
+        print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}Speaker ${up_from}${C[reset]} → ${C[dim]}Speaker ${up_into}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
     fi
 }
 
@@ -1419,7 +1419,7 @@ cmd_profile() {
             print -P "  ${C[dim]}/profile rm all${C[reset]}                  delete every profile (asks to confirm)"
             print -P "  ${C[dim]}/profile diagnose <name>${C[reset]}         full diagnostic dump (tightness, cross-matches, auto-train)"
             print -P "  ${C[dim]}/profile clusters${C[reset]}                show active speaker clusters"
-            print -P "  ${C[dim]}/profile assign <letter> <name>${C[reset]}  cluster → profile + rewrite transcript"
+            print -P "  ${C[dim]}/profile assign <number> <name>${C[reset]}  cluster → profile + rewrite transcript"
             print -P "  ${C[dim]}/profile merge <from> <into>${C[reset]}     fold one cluster into another"
             ;;
     esac
