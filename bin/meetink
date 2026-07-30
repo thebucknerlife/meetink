@@ -210,7 +210,8 @@ build_app() {
 
     local app="$MK_HOME/bin/Meetink.app"
     local macos_dir="$app/Contents/MacOS"
-    mkdir -p "$macos_dir"
+    local resources_dir="$app/Contents/Resources"
+    mkdir -p "$macos_dir" "$resources_dir"
 
     swiftc -O -o "$macos_dir/meetink-app" "$MK_ROOT/src/app/Sources/main.swift" \
         -framework Foundation -framework AppKit \
@@ -221,6 +222,10 @@ build_app() {
         }
 
     cp "$MK_ROOT/src/app/Resources/Info.plist" "$app/Contents/Info.plist"
+    # Bundle icon — Dock, ⌘Tab, and Finder all read the .icns via
+    # CFBundleIconFile; a runtime applicationIconImage alone leaves the
+    # generic placeholder in the app switcher.
+    cp "$MK_ROOT/src/app/Resources/Meetink.icns" "$resources_dir/Meetink.icns"
 
     # Ad-hoc sign for a stable TCC identity — same reasoning as build_agent:
     # without it every rebuild looks like a new app and permission grants

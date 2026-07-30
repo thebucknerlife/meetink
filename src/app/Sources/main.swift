@@ -582,6 +582,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var transcriptWC: TranscriptWindowController?
     private var pollTimer: Timer?
     private var lastRecording = false
+    private var reallyQuit = false
+
+    /// ⌘Q / Dock-quit / switcher-quit means "put the window away" — the
+    /// menubar presence is the app and should survive (Slack/Discord
+    /// pattern). Real exit is the menubar's "Quit Completely". System
+    /// shutdown/logout must still work: those quit events carry a 'why?'
+    /// reason attribute, and we always honor them.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if reallyQuit { return .terminateNow }
+        if let event = NSAppleEventManager.shared().currentAppleEvent,
+           event.attributeDescriptor(forKeyword: AEKeyword(0x7768793F) /* 'why?' */) != nil {
+            return .terminateNow   // shutdown / restart / logout
+        }
+        transcriptWC?.window?.close()
+        NSApp.setActivationPolicy(.accessory)
+        return .terminateCancel
+    }
+
+    @objc private func quitCompletely() {
+        reallyQuit = true
+        NSApp.terminate(nil)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMainMenu()
@@ -627,7 +649,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit Meetink",
+        // ⌘Q routes through applicationShouldTerminate → retreats to the
+        // menu bar rather than exiting (see note there).
+        appMenu.addItem(withTitle: "Quit to Menu Bar",
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
@@ -731,8 +755,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(folder)
 
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit Meetink",
-                              action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit Completely",
+                              action: #selector(quitCompletely), keyEquivalent: "")
+        quit.target = self
         menu.addItem(quit)
 
         statusItem.menu = menu
