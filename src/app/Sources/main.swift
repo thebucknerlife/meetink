@@ -607,9 +607,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMainMenu()
-        // Dock/⌘Tab icon, drawn at runtime — no .icns asset to maintain.
+        // Dock/⌘Tab icon: the bundle's Meetink.icns is the source of truth;
+        // this runtime copy only covers running the bare binary outside the
+        // bundle (dev/testing). Indigo glyph on a light tile — the glyph
+        // carries the color so macOS 26's auto dark-mode icon variant
+        // (dark tile, glyph preserved) stays recognizable.
         NSApp.applicationIconImage = mWaveformImage(
-            size: 512, barColor: .white, tile: NSColor.systemIndigo)
+            size: 512,
+            barColor: NSColor(srgbRed: 0.345, green: 0.337, blue: 0.839, alpha: 1),
+            tile: NSColor(srgbRed: 0.98, green: 0.98, blue: 1.0, alpha: 1))
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         updateStatusIcon(recording: false)
