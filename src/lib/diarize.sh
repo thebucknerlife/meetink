@@ -16,6 +16,17 @@ MK_DIARIZE_VENV="$MK_HOME/diarize-venv"
 MK_DIARIZE_MODEL="$MK_HOME/models/speaker-embedding.onnx"
 MK_DIARIZE_PROFILES="$MK_HOME/profiles"
 MK_DIARIZE_PORT=8179
+
+# Percent-encode a string for use as a URL query value or path segment.
+# Profile names come from users ("Test 2", "Mary Jane") and raw
+# interpolation into the curl URL makes curl reject the whole request as
+# malformed the moment a name contains a space — the failure mode is an
+# opaque "error:" with no body. Every $name that crosses into a URL below
+# goes through this.
+_mk_urlq() {
+    print -rn -- "$1" | python3 -c \
+        'import sys, urllib.parse; sys.stdout.write(urllib.parse.quote(sys.stdin.read(), safe=""))'
+}
 MK_DIARIZE_PIDFILE="/tmp/meetink-diarize.pid"
 MK_DIARIZE_LOG="/tmp/meetink-diarize.log"
 # WeSpeaker English ResNet34 (VoxCeleb-trained), ~25 MB. The release tag has
@@ -439,7 +450,9 @@ PY
             print -P "  ${C[dim]}attendees header missing or none of your profiles map to those names${C[reset]}"
             return 1
         fi
-        local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$matched")
+        local matched_q=$(print -rn -- "$matched" | python3 -c \
+            'import sys, urllib.parse; print(",".join(urllib.parse.quote(x, safe="") for x in sys.stdin.read().split(",")), end="")')
+        local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$matched_q")
         if ! _resp_ok "$resp"; then
             print -P "${C[red]}error:${C[reset]} $resp"
             return 1
@@ -453,7 +466,11 @@ PY
     # query string, URL-safety-wise these are simple identifiers (no
     # slashes/dots permitted by /profile add).
     local names=("$@")
-    local joined="${(j:,:)names}"
+    # Encode each name, keep commas literal (the server splits on them).
+    local -a names_q=()
+    local _n
+    for _n in "${names[@]}"; do names_q+=("$(_mk_urlq "$_n")"); done
+    local joined="${(j:,:)names_q}"
     local resp=$(curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$joined")
     if ! _resp_ok "$resp"; then
         print -P "${C[red]}error:${C[reset]} $resp"
@@ -672,7 +689,7 @@ profile_add() {
         resp=$(curl -s -X POST \
             -H "Content-Type: audio/wav" \
             --data-binary "@$sample" \
-            "http://127.0.0.1:$MK_DIARIZE_PORT/enroll?name=$name")
+            "http://127.0.0.1:$MK_DIARIZE_PORT/enroll?name=$(_mk_urlq "$name")")
         rm -f "$sample"
 
         if ! _resp_ok "$resp"; then
@@ -726,7 +743,7 @@ _profile_train_via_mic() {
     resp=$(curl -s -X POST \
         -H "Content-Type: audio/wav" \
         --data-binary "@$sample" \
-        "http://127.0.0.1:$MK_DIARIZE_PORT/enroll?name=$name")
+        "http://127.0.0.1:$MK_DIARIZE_PORT/enroll?name=$(_mk_urlq "$name")")
     rm -f "$sample"
 
     if _resp_ok "$resp"; then
@@ -796,7 +813,7 @@ profile_train() {
     # embeddings in a small ring).
     local resp
     resp=$(curl -s -X POST \
-        "http://127.0.0.1:$MK_DIARIZE_PORT/session/adopt-last?name=$name&age_max_s=20")
+        "http://127.0.0.1:$MK_DIARIZE_PORT/session/adopt-last?name=$(_mk_urlq "$name")&age_max_s=20")
 
     if _resp_ok "$resp"; then
         local total=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
@@ -849,7 +866,7 @@ profile_diagnose() {
         return 1
     fi
     local resp
-    resp=$(curl -s "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$name/diagnose")
+    resp=$(curl -s "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$(_mk_urlq "$name")/diagnose")
     if ! _resp_ok "$resp"; then
         # No "ok" key on diagnose, treat anything with "error" as failure
         if [[ "$resp" == *'"error"'* ]]; then
@@ -971,7 +988,7 @@ except Exception:
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
         local resp
-        resp=$(curl -s -X DELETE "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$name")
+        resp=$(curl -s -X DELETE "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$(_mk_urlq "$name")")
         if _resp_ok "$resp"; then
             (( removed++ ))
         else
@@ -1005,7 +1022,7 @@ profile_remove() {
         return 1
     fi
     local resp
-    resp=$(curl -s -X DELETE "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$name")
+    resp=$(curl -s -X DELETE "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$(_mk_urlq "$name")")
     if _resp_ok "$resp"; then
         print -P "${C[green]}✓${C[reset]} Removed profile: ${C[bold]}$name${C[reset]}"
     else
@@ -1069,7 +1086,13 @@ _rewrite_transcript_label() {
     # Truncate-and-write keeps the same inode so tail/editors keep
     # streaming the new content.
     local tmp=$(mktemp -t meetink-rewrite) || return 1
-    if sed -E "s|] ${old}:|] ${new}:|g" "$actual" > "$tmp"; then
+    # Escape both sides for sed: labels are user-chosen names, and an
+    # unescaped "&" (whole-match backreference) or "|" (our delimiter)
+    # would corrupt the rewrite. Pattern side escapes ERE metacharacters;
+    # replacement side escapes \ & and the delimiter.
+    local old_esc=$(print -rn -- "$old" | sed -e 's/[][\.*^$()+?{}|\\]/\\&/g')
+    local new_esc=$(print -rn -- "$new" | sed -e 's/[\\&|]/\\&/g')
+    if sed -E "s|] ${old_esc}:|] ${new_esc}:|g" "$actual" > "$tmp"; then
         cat "$tmp" > "$actual"
     fi
     rm -f "$tmp"
@@ -1134,7 +1157,7 @@ profile_assign() {
 
     local up_letter=$(print -n -- "$letter" | tr '[:lower:]' '[:upper:]')
     local resp=$(curl -s -X POST \
-        "http://127.0.0.1:$MK_DIARIZE_PORT/session/assign?cluster=$up_letter&name=$name")
+        "http://127.0.0.1:$MK_DIARIZE_PORT/session/assign?cluster=$(_mk_urlq "$up_letter")&name=$(_mk_urlq "$name")")
     if ! _resp_ok "$resp"; then
         print -P "${C[red]}error:${C[reset]} $resp"
         return 1
@@ -1219,7 +1242,9 @@ PY
         print -P "  ${C[dim]}Whitelist cleared${C[reset]} ${C[dim]}(no enrolled profiles matched the attendees)${C[reset]}"
         return 0
     fi
-    curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$matched" >/dev/null
+    local matched_q=$(print -rn -- "$matched" | python3 -c \
+        'import sys, urllib.parse; print(",".join(urllib.parse.quote(x, safe="") for x in sys.stdin.read().split(",")), end="")')
+    curl -s -X POST "http://127.0.0.1:$MK_DIARIZE_PORT/session/whitelist?profiles=$matched_q" >/dev/null
     local pretty=$(print -- "$matched" | sed 's/,/, /g')
     print -P "  ${C[dim]}Whitelist updated:${C[reset]} ${C[bright_cyan]}${pretty}${C[reset]}"
 }
@@ -1299,7 +1324,7 @@ profile_undo() {
         return 1
     fi
     local resp=$(curl -s -X POST \
-        "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$name/pop?count=$count")
+        "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$(_mk_urlq "$name")/pop?count=$count")
     if ! _resp_ok "$resp"; then
         print -P "${C[red]}error:${C[reset]} $resp"
         return 1
@@ -1329,7 +1354,7 @@ profile_rename() {
     fi
 
     local resp=$(curl -s -X POST \
-        "http://127.0.0.1:$MK_DIARIZE_PORT/session/rename?from=$from&to=$to")
+        "http://127.0.0.1:$MK_DIARIZE_PORT/session/rename?from=$(_mk_urlq "$from")&to=$(_mk_urlq "$to")")
     if ! _resp_ok "$resp"; then
         print -P "${C[red]}error:${C[reset]} $resp"
         return 1

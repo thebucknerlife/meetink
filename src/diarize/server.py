@@ -93,7 +93,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
@@ -1276,7 +1276,9 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         if path.startswith("/profiles/") and path.endswith("/diagnose"):
-            name = path[len("/profiles/"):-len("/diagnose")].strip()
+            # Query values are auto-decoded by parse_qs; path segments are NOT —
+            # "Test%202" must become "Test 2" before the profiles lookup.
+            name = unquote(path[len("/profiles/"):-len("/diagnose")]).strip()
             if not name or name not in profiles:
                 self._json(404, {"error": f"no profile named {name}"})
                 return
@@ -1890,7 +1892,7 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
             if url.path.startswith("/profiles/") and url.path.endswith("/pop"):
-                name = url.path[len("/profiles/"):-len("/pop")].strip()
+                name = unquote(url.path[len("/profiles/"):-len("/pop")]).strip()
                 if not name:
                     self._json(400, {"error": "missing profile name"})
                     return
@@ -1980,7 +1982,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         url = urlparse(self.path)
         if url.path.startswith("/profiles/"):
-            name = url.path[len("/profiles/"):].strip()
+            name = unquote(url.path[len("/profiles/"):]).strip()
             removed = False
             for ext in (".npz", ".npy"):
                 p = PROFILES_DIR / f"{name}{ext}"
