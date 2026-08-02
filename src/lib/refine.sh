@@ -131,4 +131,14 @@ cmd_refine() {
     if typeset -f title_session_file >/dev/null 2>&1; then
         title_session_file "$out"
     fi
+
+    # Machine-readable final location (titling may have renamed the file).
+    # The app's import window parses this line to know what to display.
+    local final="$out"
+    if [[ -L "$MK_TRANSCRIPT" ]]; then
+        local t=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
+        [[ -n "$t" && -f "$t" && "${t:t}" == *import* ]] && final="$t"
+    fi
+    [[ -f "$final" ]] || final="$out"
+    print -- "TRANSCRIPT_PATH: $final"
 }

@@ -1171,7 +1171,10 @@ profile_assign() {
     fi
 
     local up_name=$(print -n -- "$name" | tr '[:lower:]' '[:upper:]')
-    if [[ -L "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "Speaker ${up_letter}" "$up_name"; then
+    # -e not -L: imported transcripts are plain files (the app's import
+    # window passes MEETINK_TRANSCRIPT pointing straight at one), and
+    # _rewrite_transcript_label handles both.
+    if [[ -e "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "Speaker ${up_letter}" "$up_name"; then
         local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
         print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}Speaker ${up_letter}${C[reset]} → ${C[bold]}${up_name}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
     fi

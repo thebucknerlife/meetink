@@ -244,6 +244,7 @@ let audioExtensions: Set<String> = [
 /// extension list can be generous.
 final class DropContainerView: NSView {
     var onAudioDrop: ((URL) -> Void)?
+    var onDragState: ((Bool) -> Void)?   // drives the "drop to transcribe" overlay
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -260,10 +261,21 @@ final class DropContainerView: NSView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        return audioURL(from: sender) != nil ? .copy : []
+        let ok = audioURL(from: sender) != nil
+        onDragState?(ok)
+        return ok ? .copy : []
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        onDragState?(false)
+    }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        onDragState?(false)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        onDragState?(false)
         guard let url = audioURL(from: sender) else { return false }
         onAudioDrop?(url)
         return true
@@ -285,21 +297,41 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     private var lastResolvedPath: String = ""
     private var rawText: String = ""
     private var snapshot = TranscriptSnapshot()
-    private var importStatus: String? = nil   // header override during imports
 
-    convenience init() {
+    // Import windows watch ONE specific transcript file; the main window
+    // (fixedPath == nil) follows the live.txt symlink.
+    private var fixedPath: String? = nil
+    // True while an import is transcribing into this window — the poll
+    // stays quiet so the progress UI isn't replaced by the empty state.
+    var suspendWatching = false
+    // Routed to AppDelegate.startImport — drops open a NEW window there.
+    var importHandler: ((URL) -> Void)?
+
+    private let dropOverlay = NSBox()
+    private let progressBox = NSStackView()
+    private let progressBar = NSProgressIndicator()
+    private let progressLabel = NSTextField(labelWithString: "")
+
+    convenience init(fixedPath: String? = nil) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 780, height: 640),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
-        window.title = "Meetink — Live Transcript"
+        window.title = fixedPath.map { ($0 as NSString).lastPathComponent }
+            ?? "Meetink — Live Transcript"
         window.center()
-        window.setFrameAutosaveName("MeetinkTranscriptWindow")
+        if fixedPath == nil {
+            window.setFrameAutosaveName("MeetinkTranscriptWindow")
+        }
         self.init(window: window)
+        self.fixedPath = fixedPath
         // Wrap the content view so audio files can be dropped anywhere in
         // the window to transcribe them (routes through `meetink refine`).
         let container = DropContainerView(frame: window.contentView?.bounds ?? .zero)
-        container.onAudioDrop = { [weak self] url in self?.importAudio(url) }
+        container.onAudioDrop = { [weak self] url in self?.importHandler?(url) }
+        container.onDragState = { [weak self] active in
+            self?.dropOverlay.isHidden = !active
+        }
         window.contentView = container
         buildUI()
         // 0.5s stat-poll: cheap (one lstat + one stat), and simpler + more
@@ -400,6 +432,56 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
             jumpButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
 
+        // Drag-over affordance: indigo dashed panel with a prompt, shown by
+        // DropContainerView's drag-state callback.
+        dropOverlay.boxType = .custom
+        dropOverlay.cornerRadius = 14
+        dropOverlay.borderWidth = 2
+        dropOverlay.borderColor = NSColor.systemIndigo.withAlphaComponent(0.8)
+        dropOverlay.fillColor = NSColor.systemIndigo.withAlphaComponent(0.10)
+        dropOverlay.translatesAutoresizingMaskIntoConstraints = false
+        dropOverlay.isHidden = true
+        let dropLabel = NSTextField(labelWithString: "Drop audio file to transcribe")
+        dropLabel.font = NSFont.boldSystemFont(ofSize: 18)
+        dropLabel.textColor = .systemIndigo
+        dropLabel.translatesAutoresizingMaskIntoConstraints = false
+        dropOverlay.contentView?.addSubview(dropLabel)
+        content.addSubview(dropOverlay)
+
+        // Import-progress panel: filename + bar + status, centered over the
+        // text area while `meetink refine` chews on a dropped file.
+        progressBox.orientation = .vertical
+        progressBox.alignment = .centerX
+        progressBox.spacing = 10
+        progressBox.translatesAutoresizingMaskIntoConstraints = false
+        progressBox.isHidden = true
+        progressLabel.font = NSFont.boldSystemFont(ofSize: 14)
+        progressLabel.alignment = .center
+        progressBar.style = .bar
+        progressBar.minValue = 0
+        progressBar.maxValue = 100
+        progressBar.translatesAutoresizingMaskIntoConstraints = false
+        let progressHint = NSTextField(
+            labelWithString: "Parakeet · roughly a minute per hour of audio")
+        progressHint.font = NSFont.systemFont(ofSize: 11)
+        progressHint.textColor = .secondaryLabelColor
+        progressBox.addArrangedSubview(progressLabel)
+        progressBox.addArrangedSubview(progressBar)
+        progressBox.addArrangedSubview(progressHint)
+        content.addSubview(progressBox)
+
+        NSLayoutConstraint.activate([
+            dropOverlay.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 14),
+            dropOverlay.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            dropOverlay.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            dropOverlay.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14),
+            dropLabel.centerXAnchor.constraint(equalTo: dropOverlay.centerXAnchor),
+            dropLabel.centerYAnchor.constraint(equalTo: dropOverlay.centerYAnchor),
+            progressBox.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            progressBox.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            progressBar.widthAnchor.constraint(equalToConstant: 320),
+        ])
+
         // Track scrolling so the jump button can show/hide live.
         scroll.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(
@@ -407,6 +489,37 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
             object: scroll.contentView, queue: .main) { [weak self] _ in
                 self?.updateJumpButton()
             }
+    }
+
+    // MARK: Import progress (driven by AppDelegate.startImport)
+
+    func beginImportProgress(filename: String) {
+        suspendWatching = true
+        progressLabel.stringValue = "Transcribing \(filename)…"
+        progressBar.isIndeterminate = true
+        progressBar.startAnimation(nil)
+        progressBox.isHidden = false
+        statusDot.textColor = .systemOrange
+        headerField.stringValue = "Importing \(filename)"
+    }
+
+    func updateImportProgress(_ pct: Int) {
+        if progressBar.isIndeterminate {
+            progressBar.isIndeterminate = false
+            progressBar.stopAnimation(nil)
+        }
+        progressBar.doubleValue = Double(pct)
+    }
+
+    /// nil path = failure (window keeps its empty state; caller alerts).
+    func finishImport(path: String?) {
+        progressBox.isHidden = true
+        suspendWatching = false
+        if let p = path {
+            fixedPath = p
+            window?.title = (p as NSString).lastPathComponent
+        }
+        refreshIfChanged(force: true)
     }
 
     /// Pinned-to-bottom detection: only auto-scroll after content changes if
@@ -476,6 +589,12 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launcher)
         proc.arguments = ["profile", "assign", number, name]
+        // Rewrite THIS window's transcript: import windows watch a plain
+        // file that isn't the live symlink, and profile_assign rewrites
+        // whatever MEETINK_TRANSCRIPT names.
+        var env = ProcessInfo.processInfo.environment
+        env["MEETINK_TRANSCRIPT"] = fixedPath ?? liveSymlinkPath()
+        proc.environment = env
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
@@ -502,55 +621,11 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         }
     }
 
-    // MARK: Drag-and-drop import
-
-    private func importAudio(_ url: URL) {
-        if recordingPID() != nil {
-            let alert = NSAlert()
-            alert.messageText = "Recording in progress"
-            alert.informativeText = "Stop the current recording before importing an audio file."
-            alert.runModal()
-            return
-        }
-        guard let launcher = launcherPath() else { return }
-
-        importStatus = "Transcribing \(url.lastPathComponent)… (parakeet — ~1 min per hour of audio)"
-        updateHeader()
-
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: launcher)
-        proc.arguments = ["refine", url.path]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-        DispatchQueue.global().async { [weak self] in
-            do { try proc.run() } catch { return }
-            proc.waitUntilExit()
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
-                             encoding: .utf8) ?? ""
-            DispatchQueue.main.async {
-                self?.importStatus = nil
-                // Success retargets live.txt at the new transcript, so the
-                // 0.5 s poll shows the result on its own. Only surface
-                // failures.
-                if proc.terminationStatus != 0 {
-                    let alert = NSAlert()
-                    alert.messageText = "Couldn't transcribe \(url.lastPathComponent)"
-                    let plain = out.replacingOccurrences(
-                        of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
-                    alert.informativeText = String(plain.suffix(400))
-                    alert.runModal()
-                } else {
-                    self?.refreshIfChanged(force: true)
-                }
-            }
-        }
-    }
-
     // MARK: File watching + render
 
     func refreshIfChanged(force: Bool = false) {
-        let symlink = liveSymlinkPath()
+        if suspendWatching { return }
+        let symlink = fixedPath ?? liveSymlinkPath()
         let resolved = (try? FileManager.default.destinationOfSymbolicLink(atPath: symlink))
             .map { dest -> String in
                 dest.hasPrefix("/") ? dest : (symlink as NSString).deletingLastPathComponent + "/" + dest
@@ -640,11 +715,7 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     }
 
     private func updateHeader() {
-        if let status = importStatus {
-            statusDot.textColor = .systemOrange
-            headerField.stringValue = status
-            return
-        }
+        if suspendWatching { return }   // progress panel owns the header
         let recording = recordingPID() != nil
         statusDot.textColor = recording ? .systemRed : .tertiaryLabelColor
 
@@ -674,6 +745,7 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var transcriptWC: TranscriptWindowController?
+    private var importWCs: [TranscriptWindowController] = []
     private var pollTimer: Timer?
     private var lastRecording = false
     private var reallyQuit = false
@@ -719,13 +791,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.pollState()
         }
 
-        // Window-close drops us back to menubar-only (.accessory) so the
-        // Dock/⌘Tab entry only exists while there's a window to switch to.
+        // Window-close drops us back to menubar-only (.accessory) once the
+        // LAST window (main or import) goes away, so the Dock/⌘Tab entry
+        // only exists while there's a window to switch to.
         NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] note in
-                guard let self, let closing = note.object as? NSWindow,
-                      closing == self.transcriptWC?.window else { return }
-                NSApp.setActivationPolicy(.accessory)
+                guard let self, let closing = note.object as? NSWindow else { return }
+                self.importWCs.removeAll { $0.window == closing }
+                let mainOpen = self.transcriptWC?.window.map {
+                    $0.isVisible && $0 != closing } ?? false
+                let importsOpen = self.importWCs.contains {
+                    $0.window.map { $0.isVisible && $0 != closing } ?? false }
+                if !mainOpen && !importsOpen {
+                    NSApp.setActivationPolicy(.accessory)
+                }
             }
 
         showTranscript()
@@ -894,6 +973,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showTranscript() {
         if transcriptWC == nil {
             transcriptWC = TranscriptWindowController()
+            transcriptWC?.importHandler = { [weak self] url in self?.startImport(url) }
         }
         // Visible window → appear in ⌘Tab and the Dock so the app can't be
         // "lost" behind other windows. Back to .accessory on window close.
@@ -901,6 +981,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         transcriptWC?.showWindow(nil)
         transcriptWC?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // MARK: Audio-file import (drag-and-drop → dedicated window)
+
+    private func startImport(_ url: URL) {
+        if recordingPID() != nil {
+            let alert = NSAlert()
+            alert.messageText = "Recording in progress"
+            alert.informativeText =
+                "Stop the current recording before importing an audio file."
+            alert.runModal()
+            return
+        }
+        guard let launcher = launcherPath() else { return }
+
+        // Each import gets its own window: progress panel now, the
+        // finished transcript (click-to-name and all) when done.
+        let wc = TranscriptWindowController()
+        wc.importHandler = { [weak self] u in self?.startImport(u) }
+        wc.window?.title = "Import — \(url.lastPathComponent)"
+        importWCs.append(wc)
+        NSApp.setActivationPolicy(.regular)
+        wc.showWindow(nil)
+        wc.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        wc.beginImportProgress(filename: url.lastPathComponent)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["refine", url.path]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+
+        // Stream the launcher's output live: "refine: progress <label> <pct>"
+        // lines drive the bar; "TRANSCRIPT_PATH: ..." names the final file
+        // (titling renames it, so the pre-import name is useless).
+        var lineBuffer = Data()
+        var finalPath: String? = nil
+        var allOutput = ""
+        pipe.fileHandleForReading.readabilityHandler = { [weak wc] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            lineBuffer.append(data)
+            while let nl = lineBuffer.firstIndex(of: 0x0A) {
+                let lineData = lineBuffer.subdata(in: lineBuffer.startIndex..<nl)
+                lineBuffer.removeSubrange(lineBuffer.startIndex...nl)
+                guard let raw = String(data: lineData, encoding: .utf8) else { continue }
+                let line = raw.replacingOccurrences(
+                    of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespaces)
+                allOutput += line + "\n"
+                if line.hasPrefix("refine: progress"),
+                   let pct = Int(line.split(separator: " ").last ?? "") {
+                    DispatchQueue.main.async { wc?.updateImportProgress(pct) }
+                } else if line.hasPrefix("TRANSCRIPT_PATH: ") {
+                    finalPath = String(line.dropFirst("TRANSCRIPT_PATH: ".count))
+                }
+            }
+        }
+        proc.terminationHandler = { [weak wc] p in
+            pipe.fileHandleForReading.readabilityHandler = nil
+            DispatchQueue.main.async {
+                if p.terminationStatus == 0, let path = finalPath {
+                    wc?.finishImport(path: path)
+                } else {
+                    wc?.finishImport(path: nil)
+                    let alert = NSAlert()
+                    alert.messageText = "Couldn't transcribe \(url.lastPathComponent)"
+                    alert.informativeText = String(allOutput.suffix(400))
+                    alert.runModal()
+                }
+            }
+        }
+        try? proc.run()
     }
 }
 

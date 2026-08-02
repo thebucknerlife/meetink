@@ -68,6 +68,13 @@ def decode_to_raw(input_path: str) -> bytes:
     return proc.stdout
 
 
+# Chunked decoding: whole-file attention on a long recording tries to
+# allocate memory quadratic in length (observed: a ~1 h video -> a 520 GB
+# Metal allocation). 120 s windows with the library's default 15 s overlap
+# keep memory flat with no measurable accuracy cost at the seams.
+CHUNK_S = 120.0
+
+
 def transcribe_sentences(model, raw: bytes, label_for_log: str) -> list[dict]:
     """Parakeet over one stream → [{start, end, text}] sentence segments."""
     if len(raw) < SAMPLE_RATE * 2:  # < 1 s of audio
@@ -75,8 +82,18 @@ def transcribe_sentences(model, raw: bytes, label_for_log: str) -> list[dict]:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         raw_to_wav(raw, f.name)
         wav_path = f.name
+
+    def on_chunk(*args):
+        # chunk_callback(current, total): emit machine-readable progress on
+        # STDOUT (flushed) — the app streams these into its progress bar,
+        # and they double as a CLI heartbeat on long files.
+        if len(args) >= 2 and args[1]:
+            pct = min(100, int(100 * float(args[0]) / float(args[1])))
+            print(f"refine: progress {label_for_log} {pct}", flush=True)
+
     try:
-        result = model.transcribe(wav_path)
+        result = model.transcribe(
+            wav_path, chunk_duration=CHUNK_S, chunk_callback=on_chunk)
     finally:
         Path(wav_path).unlink(missing_ok=True)
     sentences = getattr(result, "sentences", None) or []
