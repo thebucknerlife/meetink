@@ -20,6 +20,34 @@
 MK_SPOOL_DIR="${MEETINK_SPOOL_DIR:-$MK_HOME/spool}"
 MK_PARAKEET_VENV="$MK_HOME/parakeet-venv"
 
+# One transcription at a time, machine-wide. Two concurrent refines would
+# double-load the parakeet model AND interleave their /identify calls into
+# the same diarize session (file A's speakers contaminating file B's
+# clusters). Windows/queues stay concurrent — the WORK serializes here.
+# mkdir is the atomic primitive; a pid file inside expires stale locks.
+_refine_lock() {
+    local lock="/tmp/meetink-refine.lock"
+    local announced=0
+    while ! mkdir "$lock" 2>/dev/null; do
+        local owner=$(cat "$lock/pid" 2>/dev/null)
+        if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -rf "$lock"    # crashed holder — reclaim
+            continue
+        fi
+        if (( ! announced )); then
+            # Parsed by the app's import window ("refine: status ...").
+            print -- "refine: status queued behind another transcription"
+            announced=1
+        fi
+        sleep 2
+    done
+    echo $$ > "$lock/pid"
+}
+
+_refine_unlock() {
+    rm -rf /tmp/meetink-refine.lock
+}
+
 refine_available() {
     [[ -x "$MK_PARAKEET_VENV/bin/python" ]]
 }
@@ -66,7 +94,13 @@ refine_session() {
     [[ -s "$mic" ]] && args+=(--mic "$mic")
     [[ -s "$sys" ]] && args+=(--sys "$sys")
 
-    if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log; then
+    _refine_lock
+    # `|| rc=$?`: the launcher runs with set -e — a bare failing command
+    # would kill the whole script before the error branch runs.
+    local rc=0
+    "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log || rc=$?
+    _refine_unlock
+    if (( rc == 0 )); then
         # Keep the raw live version for comparison/debugging, then replace
         # the transcript's content in place (truncate-and-write keeps the
         # inode, so the app window and any tail keep streaming — same
@@ -112,8 +146,12 @@ cmd_refine() {
     mkdir -p "$MK_TRANSCRIPTS_DIR"
 
     print -P "${C[bright_yellow]}▸${C[reset]} Transcribing ${C[bold]}${input:t}${C[reset]} ${C[dim]}(parakeet)...${C[reset]}"
-    if ! "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" \
-            --input "$input" --out "$out" 2>/tmp/meetink-refine.log; then
+    _refine_lock
+    local rc=0
+    "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" \
+            --input "$input" --out "$out" 2>/tmp/meetink-refine.log || rc=$?
+    _refine_unlock
+    if (( rc != 0 )); then
         print -P "${C[red]}error:${C[reset]} transcription failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
         return 1
     fi
@@ -127,17 +165,21 @@ cmd_refine() {
     fi
 
     # Same post-processing a live meeting gets. Titling renames the file
-    # and retargets live.txt; summary lands next to it.
+    # and retargets live.txt; summary lands next to it. Capture the inode
+    # first — the rename preserves it (see TRANSCRIPT_PATH below).
+    local ino=$(stat -f %i "$out" 2>/dev/null)
     if typeset -f title_session_file >/dev/null 2>&1; then
         title_session_file "$out"
     fi
 
     # Machine-readable final location (titling may have renamed the file).
-    # The app's import window parses this line to know what to display.
+    # Tracked by INODE, not via live.txt: with two imports in flight the
+    # symlink points wherever the later one left it — mv preserves the
+    # inode, so this finds OUR file no matter what it was renamed to.
     local final="$out"
-    if [[ -L "$MK_TRANSCRIPT" ]]; then
-        local t=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
-        [[ -n "$t" && -f "$t" && "${t:t}" == *import* ]] && final="$t"
+    if [[ -n "$ino" ]]; then
+        local by_ino=$(find "$MK_TRANSCRIPTS_DIR" -maxdepth 1 -name '*.txt' -inum "$ino" 2>/dev/null | head -1)
+        [[ -n "$by_ino" && -f "$by_ino" ]] && final="$by_ino"
     fi
     [[ -f "$final" ]] || final="$out"
     print -- "TRANSCRIPT_PATH: $final"

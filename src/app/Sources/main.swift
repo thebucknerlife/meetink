@@ -517,6 +517,12 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         headerField.stringValue = "Importing \(filename)"
     }
 
+    /// Free-text status from the launcher ("queued behind another
+    /// transcription") — shown under the bar while waiting.
+    func updateImportStatus(_ text: String) {
+        progressLabel.stringValue = text
+    }
+
     func updateImportProgress(_ pct: Int) {
         if progressBar.isIndeterminate {
             progressBar.isIndeterminate = false
@@ -1153,7 +1159,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 allOutput += line + "\n"
                 if line.hasPrefix("refine: progress"),
                    let pct = Int(line.split(separator: " ").last ?? "") {
-                    DispatchQueue.main.async { wc?.updateImportProgress(pct) }
+                    DispatchQueue.main.async {
+                        // First progress event also clears any queued-status text.
+                        wc?.updateImportStatus("Transcribing \(url.lastPathComponent)…")
+                        wc?.updateImportProgress(pct)
+                    }
+                } else if line.hasPrefix("refine: status ") {
+                    let status = String(line.dropFirst("refine: status ".count))
+                    DispatchQueue.main.async {
+                        wc?.updateImportStatus("\(url.lastPathComponent): \(status)")
+                    }
                 } else if line.hasPrefix("TRANSCRIPT_PATH: ") {
                     finalPath = String(line.dropFirst("TRANSCRIPT_PATH: ".count))
                 }
