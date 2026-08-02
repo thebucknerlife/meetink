@@ -511,7 +511,7 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         progressBar.doubleValue = Double(pct)
     }
 
-    /// nil path = failure (window keeps its empty state; caller alerts).
+    /// nil path = failure (window keeps its prior content; caller alerts).
     func finishImport(path: String?) {
         progressBox.isHidden = true
         suspendWatching = false
@@ -519,6 +519,18 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
             fixedPath = p
             window?.title = (p as NSString).lastPathComponent
         }
+        refreshIfChanged(force: true)
+    }
+
+    var isImporting: Bool { suspendWatching }
+    var isShowingImport: Bool { fixedPath != nil }
+
+    /// Back to following the live symlink — used when the main window was
+    /// repurposed by a drop and the user asks for the live transcript.
+    func returnToLive() {
+        guard !isImporting else { return }
+        fixedPath = nil
+        window?.title = "Meetink — Live Transcript"
         refreshIfChanged(force: true)
     }
 
@@ -928,6 +940,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         show.target = self
         menu.addItem(show)
 
+        let upload = NSMenuItem(title: "Transcribe Audio…",
+                                action: #selector(transcribeAudio), keyEquivalent: "u")
+        upload.target = self
+        upload.isEnabled = launcherPath() != nil
+        menu.addItem(upload)
+
         let folder = NSMenuItem(title: "Open Transcripts Folder",
                                 action: #selector(openFolder), keyEquivalent: "")
         folder.target = self
@@ -973,7 +991,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showTranscript() {
         if transcriptWC == nil {
             transcriptWC = TranscriptWindowController()
-            transcriptWC?.importHandler = { [weak self] url in self?.startImport(url) }
+            transcriptWC?.importHandler = { [weak self] url in
+                guard let self else { return }
+                self.startImport(url, into: self.transcriptWC)
+            }
+        }
+        // "Show Transcript" means the LIVE transcript — if a drop
+        // repurposed the main window into an import view, put it back.
+        if transcriptWC?.isShowingImport == true {
+            transcriptWC?.returnToLive()
         }
         // Visible window → appear in ⌘Tab and the Dock so the app can't be
         // "lost" behind other windows. Back to .accessory on window close.
@@ -983,9 +1009,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // MARK: Audio-file import (drag-and-drop → dedicated window)
+    // MARK: Audio-file import
 
-    private func startImport(_ url: URL) {
+    /// Menubar "Transcribe Audio…" — pick an audio file, transcribe it in
+    /// a NEW window. (Drops, by contrast, process in the window they landed
+    /// on — see startImport's `into:`.)
+    @objc private func transcribeAudio() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose an audio or video file to transcribe"
+        panel.prompt = "Transcribe"
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard audioExtensions.contains(url.pathExtension.lowercased()) else {
+            let alert = NSAlert()
+            alert.messageText = "Not an audio file"
+            alert.informativeText = "Supported: \(audioExtensions.sorted().joined(separator: ", "))"
+            alert.runModal()
+            return
+        }
+        startImport(url, into: nil)
+    }
+
+    /// into == nil → open a fresh window (menubar upload).
+    /// into != nil → transcribe inside that window (drag-and-drop).
+    private func startImport(_ url: URL, into target: TranscriptWindowController?) {
         if recordingPID() != nil {
             let alert = NSAlert()
             alert.messageText = "Recording in progress"
@@ -994,14 +1043,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.runModal()
             return
         }
+        if let target, target.isImporting {
+            let alert = NSAlert()
+            alert.messageText = "Already transcribing"
+            alert.informativeText = "This window is busy — drop the file on another window, or use Transcribe Audio… in the menu bar."
+            alert.runModal()
+            return
+        }
         guard let launcher = launcherPath() else { return }
 
-        // Each import gets its own window: progress panel now, the
-        // finished transcript (click-to-name and all) when done.
-        let wc = TranscriptWindowController()
-        wc.importHandler = { [weak self] u in self?.startImport(u) }
+        let wc: TranscriptWindowController
+        if let target {
+            wc = target
+        } else {
+            wc = TranscriptWindowController()
+            wc.importHandler = { [weak self, weak wc] u in
+                self?.startImport(u, into: wc)
+            }
+            importWCs.append(wc)
+        }
         wc.window?.title = "Import — \(url.lastPathComponent)"
-        importWCs.append(wc)
         NSApp.setActivationPolicy(.regular)
         wc.showWindow(nil)
         wc.window?.makeKeyAndOrderFront(nil)
