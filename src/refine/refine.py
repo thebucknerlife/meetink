@@ -163,12 +163,25 @@ def main() -> int:
 
     entries: list[tuple[float, str, str]] = []  # (start_s, label, text)
 
-    if args.input:
-        raw = decode_to_raw(args.input)
-        for seg in transcribe_sentences(model, raw, "import"):
+    def diarize_all(raw: bytes, segs: list[dict]) -> None:
+        """Identify every segment, with progress — on long files this pass
+        takes real minutes (one embedding per sentence), and it runs AFTER
+        the transcription bar hits 100%, so it must narrate itself."""
+        n = len(segs)
+        if n:
+            print(f"refine: status identifying speakers ({n} segments)", flush=True)
+        step = max(1, n // 25)
+        for i, seg in enumerate(segs):
             label = identify_segment(raw, seg["start"], seg["end"],
                                      args.diarize_port) or "THEM"
             entries.append((seg["start"], label, seg["text"]))
+            if (i + 1) % step == 0 or i + 1 == n:
+                print(f"refine: progress diarize {int(100 * (i + 1) / n)}",
+                      flush=True)
+
+    if args.input:
+        raw = decode_to_raw(args.input)
+        diarize_all(raw, transcribe_sentences(model, raw, "import"))
     else:
         if args.mic and Path(args.mic).exists():
             mic_raw = Path(args.mic).read_bytes()
@@ -177,10 +190,7 @@ def main() -> int:
                 entries.append((seg["start"], me, seg["text"]))
         if args.sys_ and Path(args.sys_).exists():
             sys_raw = Path(args.sys_).read_bytes()
-            for seg in transcribe_sentences(model, sys_raw, "sys"):
-                label = identify_segment(sys_raw, seg["start"], seg["end"],
-                                         args.diarize_port) or "THEM"
-                entries.append((seg["start"], label, seg["text"]))
+            diarize_all(sys_raw, transcribe_sentences(model, sys_raw, "sys"))
 
     if not entries:
         log("no speech found — leaving original transcript untouched")

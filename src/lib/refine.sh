@@ -167,6 +167,9 @@ cmd_refine() {
     # Same post-processing a live meeting gets. Titling renames the file
     # and retargets live.txt; summary lands next to it. Capture the inode
     # first — the rename preserves it (see TRANSCRIPT_PATH below).
+    # The status line keeps the app's import window narrating through the
+    # LLM phase, which has no measurable progress.
+    print -- "refine: status generating title and summary"
     local ino=$(stat -f %i "$out" 2>/dev/null)
     if typeset -f title_session_file >/dev/null 2>&1; then
         title_session_file "$out"

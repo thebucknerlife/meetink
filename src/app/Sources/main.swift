@@ -517,10 +517,14 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         headerField.stringValue = "Importing \(filename)"
     }
 
-    /// Free-text status from the launcher ("queued behind another
-    /// transcription") — shown under the bar while waiting.
+    /// Free-text phase status from the pipeline ("queued behind another
+    /// transcription", "identifying speakers (312 segments)", "generating
+    /// title and summary"). Phases without measurable progress get an
+    /// animated indeterminate bar — visibly alive, never "stuck at 100%".
     func updateImportStatus(_ text: String) {
         progressLabel.stringValue = text
+        progressBar.isIndeterminate = true
+        progressBar.startAnimation(nil)
     }
 
     func updateImportProgress(_ pct: Int) {
@@ -1159,11 +1163,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 allOutput += line + "\n"
                 if line.hasPrefix("refine: progress"),
                    let pct = Int(line.split(separator: " ").last ?? "") {
-                    DispatchQueue.main.async {
-                        // First progress event also clears any queued-status text.
-                        wc?.updateImportStatus("Transcribing \(url.lastPathComponent)…")
-                        wc?.updateImportProgress(pct)
-                    }
+                    // Status lines own the label; progress events only move
+                    // the bar (and flip it back to determinate).
+                    DispatchQueue.main.async { wc?.updateImportProgress(pct) }
                 } else if line.hasPrefix("refine: status ") {
                     let status = String(line.dropFirst("refine: status ".count))
                     DispatchQueue.main.async {
