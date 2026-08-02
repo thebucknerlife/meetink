@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import struct
 import subprocess
@@ -38,6 +39,15 @@ import tempfile
 import urllib.request
 import wave
 from pathlib import Path
+
+# When Meetink.app (launched via `open`, i.e. the launchd environment)
+# invokes us, PATH is the bare system set — no Homebrew — and both our
+# decode step and parakeet-mlx's internal audio loader exec plain
+# "ffmpeg". Extend PATH before anything needs it.
+os.environ["PATH"] = (
+    os.environ.get("PATH", "/usr/bin:/bin")
+    + ":/opt/homebrew/bin:/usr/local/bin"
+)
 
 SAMPLE_RATE = 16000
 MODEL_ID = "mlx-community/parakeet-tdt-0.6b-v2"
