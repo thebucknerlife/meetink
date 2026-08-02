@@ -232,6 +232,44 @@ func unknownSpeakerNumber(_ speaker: String) -> String? {
     return ns.substring(with: m.range(at: 1))
 }
 
+// MARK: - Drag-and-drop import
+
+let audioExtensions: Set<String> = [
+    "wav", "m4a", "mp3", "aiff", "aif", "caf", "flac", "ogg", "opus",
+    "mp4", "mov", "webm", "aac", "mkv",
+]
+
+/// Content-view wrapper that accepts audio-file drops anywhere in the
+/// window. Decoding happens through ffmpeg in the refine pipeline, so the
+/// extension list can be generous.
+final class DropContainerView: NSView {
+    var onAudioDrop: ((URL) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func audioURL(from sender: NSDraggingInfo) -> URL? {
+        let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        guard let urls = sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self], options: opts) as? [URL] else { return nil }
+        return urls.first { audioExtensions.contains($0.pathExtension.lowercased()) }
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return audioURL(from: sender) != nil ? .copy : []
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let url = audioURL(from: sender) else { return false }
+        onAudioDrop?(url)
+        return true
+    }
+}
+
 // MARK: - Transcript window
 
 final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
@@ -247,6 +285,7 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     private var lastResolvedPath: String = ""
     private var rawText: String = ""
     private var snapshot = TranscriptSnapshot()
+    private var importStatus: String? = nil   // header override during imports
 
     convenience init() {
         let window = NSWindow(
@@ -257,6 +296,11 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         window.center()
         window.setFrameAutosaveName("MeetinkTranscriptWindow")
         self.init(window: window)
+        // Wrap the content view so audio files can be dropped anywhere in
+        // the window to transcribe them (routes through `meetink refine`).
+        let container = DropContainerView(frame: window.contentView?.bounds ?? .zero)
+        container.onAudioDrop = { [weak self] url in self?.importAudio(url) }
+        window.contentView = container
         buildUI()
         // 0.5s stat-poll: cheap (one lstat + one stat), and simpler + more
         // robust than DispatchSource for a file that gets renamed, truncated
@@ -458,6 +502,51 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         }
     }
 
+    // MARK: Drag-and-drop import
+
+    private func importAudio(_ url: URL) {
+        if recordingPID() != nil {
+            let alert = NSAlert()
+            alert.messageText = "Recording in progress"
+            alert.informativeText = "Stop the current recording before importing an audio file."
+            alert.runModal()
+            return
+        }
+        guard let launcher = launcherPath() else { return }
+
+        importStatus = "Transcribing \(url.lastPathComponent)… (parakeet — ~1 min per hour of audio)"
+        updateHeader()
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["refine", url.path]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        DispatchQueue.global().async { [weak self] in
+            do { try proc.run() } catch { return }
+            proc.waitUntilExit()
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                             encoding: .utf8) ?? ""
+            DispatchQueue.main.async {
+                self?.importStatus = nil
+                // Success retargets live.txt at the new transcript, so the
+                // 0.5 s poll shows the result on its own. Only surface
+                // failures.
+                if proc.terminationStatus != 0 {
+                    let alert = NSAlert()
+                    alert.messageText = "Couldn't transcribe \(url.lastPathComponent)"
+                    let plain = out.replacingOccurrences(
+                        of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
+                    alert.informativeText = String(plain.suffix(400))
+                    alert.runModal()
+                } else {
+                    self?.refreshIfChanged(force: true)
+                }
+            }
+        }
+    }
+
     // MARK: File watching + render
 
     func refreshIfChanged(force: Bool = false) {
@@ -551,6 +640,11 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     }
 
     private func updateHeader() {
+        if let status = importStatus {
+            statusDot.textColor = .systemOrange
+            headerField.stringValue = status
+            return
+        }
         let recording = recordingPID() != nil
         statusDot.textColor = recording ? .systemRed : .tertiaryLabelColor
 
