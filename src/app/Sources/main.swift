@@ -317,7 +317,12 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     private let progressBar = NSProgressIndicator()
     private let progressLabel = NSTextField(labelWithString: "")
 
-    convenience init(fixedPath: String? = nil) {
+    // IMPORTANT: no default value on fixedPath. With one, a bare
+    // TranscriptWindowController() resolves to NSWindowController's
+    // INHERITED init() (exact match beats defaulted-parameter synthesis)
+    // and yields a controller with a nil window — every window created
+    // that way is stillborn. Field-debugged; do not "simplify" this back.
+    convenience init(fixedPath: String?, autosave: Bool = false) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 780, height: 640),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -325,7 +330,9 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         window.title = fixedPath.map { ($0 as NSString).lastPathComponent }
             ?? "Meetink — Live Transcript"
         window.center()
-        if fixedPath == nil {
+        // Only the main live window persists its frame — a shared autosave
+        // name across windows is first-claim-wins and the rest silently lose.
+        if autosave {
             window.setFrameAutosaveName("MeetinkTranscriptWindow")
         }
         self.init(window: window)
@@ -1046,7 +1053,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showTranscript() {
         if transcriptWC == nil {
-            transcriptWC = TranscriptWindowController()
+            transcriptWC = TranscriptWindowController(fixedPath: nil, autosave: true)
             transcriptWC?.importHandler = { [weak self] url in
                 guard let self else { return }
                 self.startImport(url, into: self.transcriptWC)
@@ -1074,7 +1081,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// easy to lose, and the drop flow is the one every other window
     /// already teaches.
     @objc private func transcribeAudio() {
-        let wc = TranscriptWindowController()
+        let wc = TranscriptWindowController(fixedPath: nil)
         wc.importHandler = { [weak self, weak wc] u in
             self?.startImport(u, into: wc)
         }
@@ -1106,7 +1113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let target, target.isEmptyViewer {
             wc = target
         } else {
-            wc = TranscriptWindowController()
+            wc = TranscriptWindowController(fixedPath: nil)
             wc.importHandler = { [weak self, weak wc] u in
                 self?.startImport(u, into: wc)
             }
