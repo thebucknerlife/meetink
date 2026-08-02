@@ -250,6 +250,19 @@ cmd_app() {
     print -P "${C[green]}✓${C[reset]} Meetink.app launched ${C[dim]}(menu bar icon + transcript window)${C[reset]}"
 }
 
+# Open the app's Transcribe Audio picker (REPL /upload). `open` both
+# ensures the app is running and — on first use — registers the meetink://
+# URL scheme with LaunchServices.
+cmd_upload() {
+    local app="$MK_HOME/bin/Meetink.app"
+    [[ -d "$app" ]] || build_app
+    open "$app"
+    # A cold launch needs a beat before it can receive the URL event.
+    sleep 0.7
+    open "meetink://transcribe" 2>/dev/null
+    print -P "${C[green]}✓${C[reset]} Opening the Transcribe Audio picker in Meetink.app"
+}
+
 # --- Download whisper model ---
 download_model() {
     local model_name="${1:-small.en}"
@@ -923,6 +936,7 @@ case "${1:-}" in
     watch)             shift; cmd_watch "$@" ;;
     refine|import|transcribe)
                        shift 2>/dev/null; cmd_refine "$@" ;;
+    upload)            cmd_upload ;;
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
     _build_capture)    build_capture ;;

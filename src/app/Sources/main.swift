@@ -524,6 +524,10 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
 
     var isImporting: Bool { suspendWatching }
     var isShowingImport: Bool { fixedPath != nil }
+    /// "Empty" = safe to fill with a dropped import: nothing transcribing
+    /// here and no transcript on display. A window tied to content gets a
+    /// sibling window instead (see AppDelegate.startImport).
+    var isEmptyViewer: Bool { !isImporting && snapshot.lines.isEmpty }
 
     /// Back to following the live symlink — used when the main window was
     /// repurposed by a drop and the user asks for the live transcript.
@@ -822,6 +826,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showTranscript()
     }
 
+    /// meetink://transcribe — the REPL's /upload opens the same picker the
+    /// menubar action uses (URL scheme is the one IPC channel an already-
+    /// running app gets for free).
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls where url.scheme == "meetink" {
+            if url.host == "transcribe" {
+                transcribeAudio()
+            }
+        }
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication,
                                        hasVisibleWindows flag: Bool) -> Bool {
         showTranscript()
@@ -1032,8 +1047,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startImport(url, into: nil)
     }
 
-    /// into == nil → open a fresh window (menubar upload).
-    /// into != nil → transcribe inside that window (drag-and-drop).
+    /// Drops pass the window they landed on as `into`; it's reused only if
+    /// it's an empty viewer, otherwise a new window opens. Menubar/URL
+    /// invocations pass nil (always a new window).
     private func startImport(_ url: URL, into target: TranscriptWindowController?) {
         if recordingPID() != nil {
             let alert = NSAlert()
@@ -1043,17 +1059,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.runModal()
             return
         }
-        if let target, target.isImporting {
-            let alert = NSAlert()
-            alert.messageText = "Already transcribing"
-            alert.informativeText = "This window is busy — drop the file on another window, or use Transcribe Audio… in the menu bar."
-            alert.runModal()
-            return
-        }
         guard let launcher = launcherPath() else { return }
 
+        // Occupancy decides: an empty window (no transcript, not busy)
+        // gets filled; a window tied to content spawns a sibling.
         let wc: TranscriptWindowController
-        if let target {
+        if let target, target.isEmptyViewer {
             wc = target
         } else {
             wc = TranscriptWindowController()

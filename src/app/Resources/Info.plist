@@ -26,6 +26,19 @@
     <!-- Shown by macOS when the app's Start Recording spawns the capture
          binary: TCC attributes the mic to the responsible (spawning) app,
          which is this bundle when recording starts from the menu bar. -->
+    <!-- meetink://transcribe lets the launcher (REPL /upload) reach the
+         running app; see application(_:open:) in main.swift. -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.meetink.app.url</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>meetink</string>
+            </array>
+        </dict>
+    </array>
     <key>NSMicrophoneUsageDescription</key>
     <string>Meetink records your microphone to transcribe your meetings when you start a recording from the menu bar.</string>
 </dict>
