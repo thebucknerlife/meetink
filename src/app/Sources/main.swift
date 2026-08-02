@@ -304,6 +304,11 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     // True while an import is transcribing into this window — the poll
     // stays quiet so the progress UI isn't replaced by the empty state.
     var suspendWatching = false
+    // Transcription in flight (distinct from suspendWatching: a blank
+    // drop-target window pauses watching without importing anything yet).
+    private(set) var importing = false
+    // Window opened via "Transcribe Audio" — an invitation to drop a file.
+    private var isDropTarget = false
     // Routed to AppDelegate.startImport — drops open a NEW window there.
     var importHandler: ((URL) -> Void)?
 
@@ -494,7 +499,9 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     // MARK: Import progress (driven by AppDelegate.startImport)
 
     func beginImportProgress(filename: String) {
+        importing = true
         suspendWatching = true
+        textView.textStorage?.setAttributedString(NSAttributedString())
         progressLabel.stringValue = "Transcribing \(filename)…"
         progressBar.isIndeterminate = true
         progressBar.startAnimation(nil)
@@ -511,23 +518,57 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         progressBar.doubleValue = Double(pct)
     }
 
-    /// nil path = failure (window keeps its prior content; caller alerts).
+    /// nil path = failure (caller alerts; a drop-target window goes back
+    /// to inviting a drop, others resume showing what they had).
     func finishImport(path: String?) {
         progressBox.isHidden = true
-        suspendWatching = false
+        importing = false
         if let p = path {
+            isDropTarget = false
+            suspendWatching = false
             fixedPath = p
             window?.title = (p as NSString).lastPathComponent
+            refreshIfChanged(force: true)
+        } else if isDropTarget {
+            showDropPrompt()
+        } else {
+            suspendWatching = false
+            refreshIfChanged(force: true)
         }
-        refreshIfChanged(force: true)
     }
 
-    var isImporting: Bool { suspendWatching }
+    var isImporting: Bool { importing }
     var isShowingImport: Bool { fixedPath != nil }
     /// "Empty" = safe to fill with a dropped import: nothing transcribing
     /// here and no transcript on display. A window tied to content gets a
     /// sibling window instead (see AppDelegate.startImport).
-    var isEmptyViewer: Bool { !isImporting && snapshot.lines.isEmpty }
+    var isEmptyViewer: Bool { !importing && snapshot.lines.isEmpty }
+
+    /// Blank drop-target mode — what "Transcribe Audio" opens: a persistent
+    /// window inviting a drop, which then shows progress and the result.
+    func showDropPrompt() {
+        isDropTarget = true
+        suspendWatching = true
+        window?.title = "Transcribe Audio"
+        statusDot.textColor = .systemIndigo
+        headerField.stringValue = "waiting for a file"
+        let para = NSMutableParagraphStyle()
+        para.alignment = .center
+        para.paragraphSpacingBefore = 160
+        let out = NSMutableAttributedString(
+            string: "Drop an audio file here\n",
+            attributes: [.font: NSFont.boldSystemFont(ofSize: 20),
+                         .foregroundColor: NSColor.secondaryLabelColor,
+                         .paragraphStyle: para])
+        let subPara = NSMutableParagraphStyle()
+        subPara.alignment = .center
+        out.append(NSAttributedString(
+            string: "\nwav · m4a · mp3 · aiff · flac · mp4 · mov — anything with an audio track",
+            attributes: [.font: NSFont.systemFont(ofSize: 12),
+                         .foregroundColor: NSColor.tertiaryLabelColor,
+                         .paragraphStyle: subPara]))
+        textView.textStorage?.setAttributedString(out)
+    }
 
     /// Back to following the live symlink — used when the main window was
     /// repurposed by a drop and the user asks for the live transcript.
@@ -955,7 +996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         show.target = self
         menu.addItem(show)
 
-        let upload = NSMenuItem(title: "Transcribe Audio…",
+        let upload = NSMenuItem(title: "Transcribe Audio",
                                 action: #selector(transcribeAudio), keyEquivalent: "u")
         upload.target = self
         upload.isEnabled = launcherPath() != nil
@@ -1026,25 +1067,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Audio-file import
 
-    /// Menubar "Transcribe Audio…" — pick an audio file, transcribe it in
-    /// a NEW window. (Drops, by contrast, process in the window they landed
-    /// on — see startImport's `into:`.)
+    /// Menubar "Transcribe Audio" (and /upload via meetink://transcribe):
+    /// opens a persistent blank window inviting a drag-and-drop. The window
+    /// stays put — progress renders in it, then the finished transcript.
+    /// Deliberately NOT a file picker: modal panels from a menubar app are
+    /// easy to lose, and the drop flow is the one every other window
+    /// already teaches.
     @objc private func transcribeAudio() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.message = "Choose an audio or video file to transcribe"
-        panel.prompt = "Transcribe"
-        NSApp.activate(ignoringOtherApps: true)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard audioExtensions.contains(url.pathExtension.lowercased()) else {
-            let alert = NSAlert()
-            alert.messageText = "Not an audio file"
-            alert.informativeText = "Supported: \(audioExtensions.sorted().joined(separator: ", "))"
-            alert.runModal()
-            return
+        let wc = TranscriptWindowController()
+        wc.importHandler = { [weak self, weak wc] u in
+            self?.startImport(u, into: wc)
         }
-        startImport(url, into: nil)
+        importWCs.append(wc)
+        wc.showDropPrompt()
+        NSApp.setActivationPolicy(.regular)
+        wc.showWindow(nil)
+        wc.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     /// Drops pass the window they landed on as `into`; it's reused only if

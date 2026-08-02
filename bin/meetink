@@ -260,7 +260,7 @@ cmd_upload() {
     # A cold launch needs a beat before it can receive the URL event.
     sleep 0.7
     open "meetink://transcribe" 2>/dev/null
-    print -P "${C[green]}✓${C[reset]} Opening the Transcribe Audio picker in Meetink.app"
+    print -P "${C[green]}✓${C[reset]} Opening the Transcribe Audio window in Meetink.app"
 }
 
 # --- Download whisper model ---
