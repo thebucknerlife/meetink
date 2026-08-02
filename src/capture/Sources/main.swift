@@ -34,6 +34,45 @@ let meName: String = {
     return "ME"
 }()
 
+// MARK: - Audio spooling (post-meeting refine pass)
+
+// When MEETINK_SPOOL_DIR is set (launcher, keep_audio config), every
+// extracted chunk is ALSO appended to a per-stream raw file (headerless
+// s16le / 16 kHz / mono) — including chunks the RMS gate skips, so the
+// stream timeline stays linear and refine.py can compute wall-clock
+// timestamps from sample offsets alone. ~115 MB/hour/stream; the refine
+// step deletes the spools on success.
+let spoolDir = ProcessInfo.processInfo.environment["MEETINK_SPOOL_DIR"]
+
+func int16Data(_ samples: [Float]) -> Data {
+    var data = Data(capacity: samples.count * 2)
+    for sample in samples {
+        let clamped = max(-1.0, min(1.0, sample))
+        let int16 = Int16(clamped * 32767.0)
+        withUnsafeBytes(of: int16.littleEndian) { data.append(contentsOf: $0) }
+    }
+    return data
+}
+
+final class SpoolWriter: @unchecked Sendable {
+    private let handle: FileHandle?
+
+    init(path: String?) {
+        guard let path = path else { handle = nil; return }
+        FileManager.default.createFile(atPath: path, contents: nil)
+        handle = FileHandle(forWritingAtPath: path)
+    }
+
+    func append(_ samples: [Float]) {
+        guard let handle = handle else { return }
+        handle.write(int16Data(samples))
+    }
+
+    func close() {
+        try? handle?.close()
+    }
+}
+
 // MARK: - WAV Writer
 
 func writeWAV(samples: [Float], to url: URL) throws {
@@ -1191,6 +1230,17 @@ struct LocalSpeechCapture {
         }
         sigintSource.resume()
 
+        // --- Spool writers (no-ops when MEETINK_SPOOL_DIR is unset) ---
+        var spoolSys = SpoolWriter(path: nil)
+        var spoolMic = SpoolWriter(path: nil)
+        if let dir = spoolDir {
+            try? FileManager.default.createDirectory(
+                atPath: dir, withIntermediateDirectories: true)
+            spoolSys = SpoolWriter(path: "\(dir)/session-sys.raw")
+            spoolMic = SpoolWriter(path: "\(dir)/session-mic.raw")
+            fputs("Spooling session audio to \(dir) (for post-meeting refine)\n", stderr)
+        }
+
         // --- Chunk processing loop ---
         while running {
             try await Task.sleep(nanoseconds: 1_000_000_000)
@@ -1200,6 +1250,9 @@ struct LocalSpeechCapture {
 
             if let chunks = audioBuffer.tryExtractChunks() {
                 let idx = audioBuffer.chunkIndex
+
+                if let s = chunks.system { spoolSys.append(s) }
+                if let m = chunks.mic { spoolMic.append(m) }
 
                 if let sysSamples = chunks.system {
                     let sent = hasAudio(sysSamples)
@@ -1237,6 +1290,10 @@ struct LocalSpeechCapture {
         transcriptMerger.flushAll()
 
         let remaining = audioBuffer.flush()
+        if let s = remaining.system { spoolSys.append(s) }
+        if let m = remaining.mic { spoolMic.append(m) }
+        spoolSys.close()
+        spoolMic.close()
         let idx = audioBuffer.chunkIndex
         if let sysSamples = remaining.system, hasAudio(sysSamples) {
             let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_final_them.wav")

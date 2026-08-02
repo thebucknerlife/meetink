@@ -45,6 +45,7 @@ source "$MK_ROOT/src/lib/identity.sh"
 source "$MK_ROOT/src/lib/ask.sh"
 source "$MK_ROOT/src/lib/summary.sh"
 source "$MK_ROOT/src/lib/names.sh"
+source "$MK_ROOT/src/lib/refine.sh"
 source "$MK_ROOT/src/lib/context.sh"
 source "$MK_ROOT/src/lib/index.sh"
 source "$MK_ROOT/src/lib/watch.sh"
@@ -666,10 +667,21 @@ cmd_start() {
         [[ -n "$rms_cfg" ]] && export MEETINK_RMS_THRESHOLD="$rms_cfg"
     fi
 
+    # Spool the session audio for the post-meeting refine pass (parakeet
+    # re-transcription with full context). Only when the venv is installed
+    # and refine isn't disabled — no venv, no spool, no disk cost.
+    local spool_env=""
+    if refine_enabled 2>/dev/null; then
+        refine_clear_spool
+        mkdir -p "$MK_SPOOL_DIR"
+        spool_env="$MK_SPOOL_DIR"
+    fi
+
     MEETINK_MODEL="$MK_MODEL" \
     MEETINK_TRANSCRIPT="$session_file" \
     MEETINK_PROMPT="$MK_PROMPT" \
     MEETINK_ME_NAME="$(me_name_get)" \
+    MEETINK_SPOOL_DIR="$spool_env" \
         "$binary" 2>/tmp/meetink-capture.log &
     echo $! > "$PID_FILE"
     disown 2>/dev/null || true
@@ -740,6 +752,15 @@ cmd_stop() {
     # diarize_consolidate_transcript in src/lib/diarize.sh.
     if typeset -f diarize_consolidate_transcript >/dev/null 2>&1; then
         diarize_consolidate_transcript "$MK_TRANSCRIPT"
+    fi
+
+    # Re-transcribe the whole session with full acoustic context (parakeet)
+    # and replace the transcript content in place. Runs BEFORE name
+    # inference so names are inferred from the better text, and refine's
+    # sentence-level /identify calls have already populated the session
+    # clusters that inference checks.
+    if typeset -f refine_session >/dev/null 2>&1; then
+        refine_session "$MK_TRANSCRIPT"
     fi
 
     # Infer real names for the surviving Speaker-N labels from the
@@ -847,6 +868,7 @@ cmd_help() {
     bullet "status   " "show whether recording is active"
     bullet "tail     " "follow the live transcript"
     bullet "app      " "launch Meetink.app (menu bar + native transcript window)"
+    bullet "refine   " "transcribe an audio file (post-meeting refine runs on stop)"
     bullet "help     " "show this help"
     print -P ""
     print -P "${C[bright_yellow]}OUTPUT${C[reset]}"
@@ -899,6 +921,8 @@ case "${1:-}" in
     context)           shift; cmd_context "$@" ;;
     index)             shift; cmd_index "$@" ;;
     watch)             shift; cmd_watch "$@" ;;
+    refine|import|transcribe)
+                       shift 2>/dev/null; cmd_refine "$@" ;;
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
     _build_capture)    build_capture ;;
