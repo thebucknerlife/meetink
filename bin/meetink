@@ -68,6 +68,23 @@ if [[ -z "$MK_MODEL" ]]; then
     MK_MODEL=$(model_path "$(model_active)")
 fi
 
+# Code-signing identity for the app bundles. TCC (mic / screen recording)
+# keys grants to the SIGNATURE, and an ad-hoc signature is a content hash —
+# every rebuild mints a new identity and silently invalidates every grant
+# (Settings still shows the app "enabled", against the stale signature;
+# field symptom: endless re-prompting). A self-signed "Meetink Signing"
+# code-signing certificate (Keychain Access → Certificate Assistant →
+# Create a Certificate → type: Code Signing) gives a signature that
+# survives rebuilds, so permissions are granted exactly once. Falls back
+# to ad-hoc when absent.
+mk_codesign_identity() {
+    if security find-identity -v -p codesigning 2>/dev/null | grep -q "Meetink Signing"; then
+        print -n -- "Meetink Signing"
+    else
+        print -n -- "-"
+    fi
+}
+
 # --- Locate the Swift binary (preferred location: $MK_HOME/bin) ---
 find_capture_binary() {
     local candidates=(
@@ -179,12 +196,11 @@ build_agent() {
     # uses the NSCalendarsFullAccessUsageDescription string.
     cp "$MK_ROOT/src/agent/Resources/Info.plist" "$app/Contents/Info.plist"
 
-    # Ad-hoc sign so macOS gives the bundle a stable identity for TCC
-    # (the permission database) — without this, every rebuild looks
-    # like a different app and the user re-grants Calendar / Notification
-    # permission each time.
+    # Sign with the stable identity when available (see
+    # mk_codesign_identity — ad-hoc signatures change every rebuild and
+    # reset the TCC permission grants keyed to them).
     if command -v codesign >/dev/null 2>&1; then
-        codesign --force --sign - "$app" 2>/dev/null || true
+        codesign --force --sign "$(mk_codesign_identity)" "$app" 2>/dev/null || true
     fi
 
     print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$app${C[reset]}"
@@ -235,11 +251,17 @@ build_app() {
     # generic placeholder in the app switcher.
     cp "$MK_ROOT/src/app/Resources/Meetink.icns" "$resources_dir/Meetink.icns"
 
-    # Ad-hoc sign for a stable TCC identity — same reasoning as build_agent:
-    # without it every rebuild looks like a new app and permission grants
-    # (mic, screen recording when started from the app) reset each time.
+    # Sign with the stable identity when available. Ad-hoc fallback means
+    # mic/screen grants reset on EVERY rebuild (TCC keys on the signature)
+    # — the endless-permission-prompt failure. See mk_codesign_identity.
     if command -v codesign >/dev/null 2>&1; then
-        codesign --force --sign - "$app" 2>/dev/null || true
+        local ident=$(mk_codesign_identity)
+        codesign --force --sign "$ident" "$app" 2>/dev/null || true
+        if [[ "$ident" == "-" ]]; then
+            print -P "  ${C[yellow]}⚠${C[reset]} ${C[dim]}ad-hoc signed — mic/screen permissions will re-prompt after every rebuild.${C[reset]}"
+            print -P "    ${C[dim]}One-time fix: Keychain Access → Certificate Assistant → Create a Certificate →${C[reset]}"
+            print -P "    ${C[dim]}name: Meetink Signing, type: Code Signing — then rebuild.${C[reset]}"
+        fi
     fi
 
     print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$app${C[reset]}"
