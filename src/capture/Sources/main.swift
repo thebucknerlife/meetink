@@ -1089,20 +1089,23 @@ struct LocalSpeechCapture {
         // engine.stop() / installTap() calls.
         let engine = AVAudioEngine()
 
-        // Acoustic echo cancellation. Without headphones, the mic hears the
-        // system audio too — and since the mic stream is blanket-labeled as
-        // the user, every remote utterance lands in the transcript TWICE,
-        // once mislabeled (field case: an hour of "GREG:" lines the user
-        // never said). Apple's voice-processing mode cancels the machine's
-        // own output from the mic signal at the OS level — the same AEC
-        // Zoom/FaceTime use. It also adds mild noise suppression/AGC.
-        // Opt out with MEETINK_AEC=off if it ever degrades mic quality.
-        if (ProcessInfo.processInfo.environment["MEETINK_AEC"] ?? "on") != "off" {
+        // Acoustic echo cancellation — OPT-IN (MEETINK_AEC=on), default off.
+        // The idea: without headphones the mic hears the system audio and
+        // every remote utterance lands twice, once mislabeled as the user.
+        // Apple's voice-processing mode would cancel that at the OS level —
+        // but enabled on this input-only engine it delivered PURE ZEROS on
+        // real hardware (field case: permissions fine, "recording", mic
+        // rms=0.0000 while the user talked). VPIO wants a fully configured
+        // input/output pair; wiring that properly is future work. Until
+        // then: headphones give a clean live transcript, and the refine
+        // pass's echo suppression scrubs speaker-echo from the transcript
+        // that actually gets kept.
+        if (ProcessInfo.processInfo.environment["MEETINK_AEC"] ?? "off") == "on" {
             do {
                 try engine.inputNode.setVoiceProcessingEnabled(true)
-                fputs("Mic voice processing (echo cancellation) enabled\n", stderr)
+                fputs("Mic voice processing (AEC) enabled — EXPERIMENTAL, verify the mic gate shows non-zero rms\n", stderr)
             } catch {
-                fputs("Voice processing unavailable (\(error)) — speakers may echo into the mic\n", stderr)
+                fputs("Voice processing unavailable (\(error))\n", stderr)
             }
         }
 
