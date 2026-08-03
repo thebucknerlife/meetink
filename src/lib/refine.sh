@@ -109,7 +109,12 @@ refine_session() {
         cat "$tmp" > "$actual"
         rm -f "$tmp" "$mic" "$sys"
         local n=$(grep -cE '^\[[0-9:]{8}\]' "$actual" 2>/dev/null)
-        print -P "${C[green]}✓${C[reset]} Refined: ${n} lines ${C[dim]}(raw kept: ${${actual%.txt}.live-raw.txt:t}; spool deleted)${C[reset]}"
+        # NOTE: no nested ${${...}text:t} tricks here — that exact form is a
+        # runtime "bad substitution" in zsh, and under set -e it killed
+        # cmd_stop mid-pipeline (transcript replaced, but consolidation /
+        # names / titling never ran — field-debugged from the launcher log).
+        local raw_name="${actual%.txt}.live-raw.txt"
+        print -P "${C[green]}✓${C[reset]} Refined: ${n} lines ${C[dim]}(raw kept: ${raw_name:t}; spool deleted)${C[reset]}"
     else
         rm -f "$tmp"
         print -P "${C[yellow]}⚠${C[reset]} Refine failed — keeping the live transcript ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"

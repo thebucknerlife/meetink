@@ -783,9 +783,16 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
             }
         }
 
+        // Preserve the reading position: replacing the text storage can
+        // shift the scroll origin as layout re-runs, which yanked readers
+        // to the bottom whenever new lines arrived mid-scrollback. Pinned
+        // readers follow the live edge; everyone else stays exactly put.
+        let savedOrigin = textView.enclosingScrollView?.contentView.bounds.origin
         textView.textStorage?.setAttributedString(out)
         if wasPinned {
             textView.scrollToEndOfDocument(nil)
+        } else if let origin = savedOrigin {
+            textView.enclosingScrollView?.documentView?.scroll(origin)
         }
         updateJumpButton()
         updateHeader()
@@ -1002,17 +1009,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(status)
         menu.addItem(.separator())
 
-        let start = NSMenuItem(title: "Start Recording",
-                               action: #selector(startRecording), keyEquivalent: "")
-        start.target = self
-        start.isEnabled = !recording && launcherPath() != nil
-        menu.addItem(start)
-
-        let stop = NSMenuItem(title: "Stop Recording",
-                              action: #selector(stopRecording), keyEquivalent: "")
-        stop.target = self
-        stop.isEnabled = recording
-        menu.addItem(stop)
+        // One toggle, not a Start + Stop pair — recording is binary, and
+        // showing a disabled twin of the current state was just noise.
+        let toggle = NSMenuItem(
+            title: recording ? "Stop Recording" : "Start Recording",
+            action: recording ? #selector(stopRecording) : #selector(startRecording),
+            keyEquivalent: "")
+        toggle.target = self
+        toggle.isEnabled = launcherPath() != nil
+        menu.addItem(toggle)
 
         menu.addItem(.separator())
         let show = NSMenuItem(title: "Show Transcript",

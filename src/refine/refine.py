@@ -193,9 +193,32 @@ def _wav_bytes(raw: bytes, a: int, b: int) -> bytes:
     return bytes(wav)
 
 
-def offline_diarize(raw: bytes, segs: list[dict], port: int) -> list[dict] | None:
-    """Return segs relabeled (and possibly split), or None if the sidecar
-    is unreachable — caller falls back to plain THEM labels."""
+def offline_diarize_multi(streams: list[dict], port: int,
+                          me_label: str | None = None) -> list[dict] | None:
+    """Joint offline diarization over one or more streams.
+
+    streams: [{"raw": bytes, "segs": [...], "origin": "mic"|"sys"|"import"}]
+    Returns labeled entries [{start, end, text, label, origin}] or None when
+    the sidecar is unreachable (caller falls back).
+
+    All streams cluster in ONE embedding space — that's what makes hybrid
+    meetings work: the mic hears the room AND (without headphones) an echo
+    of the remote side, and joint clustering puts the echo windows in the
+    same cluster as the remote voice's system-audio windows, so they get
+    the remote speaker's label (and the text-level dedup then removes the
+    duplicates). Deliberately NO reliance on which streams are silent — a
+    hybrid meeting has a busy sys stream and a multi-voice mic stream.
+
+    Labeling policy (agreed in the field):
+      - cluster matches an enrolled profile        -> that name
+      - me_label given and no cluster matched it   -> the cluster with the
+        most MIC speech is assumed to be the user (logged; enrolling pins
+        it properly)
+      - small unnamed mic-only clusters fold into the user's cluster —
+        they're almost always the user's noisy windows, and this is what
+        keeps a normal headset call from growing phantom speakers
+      - everything else -> "Speaker N" (numbering shared across streams)
+    """
     import numpy as np
 
     prof = _http_json(f"http://127.0.0.1:{port}/profiles/centroids")
@@ -206,34 +229,35 @@ def offline_diarize(raw: bytes, segs: list[dict], port: int) -> list[dict] | Non
     single_floor = float(prof.get("settings", {}).get("single_profile_floor", 0.78))
     cluster_thr = float(prof.get("settings", {}).get("cluster_threshold", 0.72))
     # Pre-pass collapses only near-duplicates; "near" is relative to the
-    # active model's similarity scale (WeSpeaker cluster 0.72 -> pre 0.85ish,
-    # TitaNet cluster 0.50 -> pre 0.65), so derive it instead of hardcoding.
+    # active model's similarity scale, so derive it instead of hardcoding.
     pre_sim = min(0.85, cluster_thr + 0.15)
     profiles = {
         name: np.asarray(cents, dtype=np.float32)
         for name, cents in (prof.get("profiles") or {}).items()
     }
 
-    # 1. Window embeddings.
-    windows = []   # (seg_idx, t0, t1)
-    for i, seg in enumerate(segs):
-        t = seg["start"]
-        while t < seg["end"]:
-            t1 = min(t + WIN_S, seg["end"])
-            if t1 - t >= 1.0:
-                windows.append((i, t, t1))
-            if t1 >= seg["end"]:
-                break
-            t += HOP_S
+    # 1. Windows across every stream: (stream_idx, seg_idx, t0, t1).
+    windows: list[tuple[int, int, float, float]] = []
+    for si, stream in enumerate(streams):
+        for i, seg in enumerate(stream["segs"]):
+            t = seg["start"]
+            while t < seg["end"]:
+                t1 = min(t + WIN_S, seg["end"])
+                if t1 - t >= 1.0:
+                    windows.append((si, i, t, t1))
+                if t1 >= seg["end"]:
+                    break
+                t += HOP_S
     if not windows:
         return None
 
     n = len(windows)
     print(f"refine: status identifying speakers ({n} windows, global clustering)",
           flush=True)
-    embs: list[np.ndarray | None] = []
+    embs: list = []
     step = max(1, n // 25)
-    for k, (_, t0, t1) in enumerate(windows):
+    for k, (si, _, t0, t1) in enumerate(windows):
+        raw = streams[si]["raw"]
         a = int(t0 * SAMPLE_RATE) * 2
         b = min(len(raw), int(t1 * SAMPLE_RATE) * 2)
         resp = _http_json(f"http://127.0.0.1:{port}/embed", data=_wav_bytes(raw, a, b))
@@ -250,7 +274,7 @@ def offline_diarize(raw: bytes, segs: list[dict], port: int) -> list[dict] | Non
 
     # 2a. Sequential pre-pass: collapse near-duplicates into mini-clusters.
     minis: list[list[int]] = []
-    centroids: list[np.ndarray] = []
+    centroids: list = []
     for k in range(len(E)):
         if centroids:
             sims = np.stack(centroids) @ E[k]
@@ -263,12 +287,10 @@ def offline_diarize(raw: bytes, segs: list[dict], port: int) -> list[dict] | Non
         minis.append([k])
         centroids.append(E[k])
 
-    # 2b. Average-linkage agglomerative merge on mini-cluster centroids,
-    # size-weighted, until no pair clears the cluster threshold.
+    # 2b. Average-linkage agglomerative merge on mini-cluster centroids.
     groups = [list(m) for m in minis]
     cents = list(centroids)
     while len(groups) > 1:
-        M = len(cents)
         C = np.stack(cents)
         S = C @ C.T
         np.fill_diagonal(S, -1.0)
@@ -281,12 +303,22 @@ def offline_diarize(raw: bytes, segs: list[dict], port: int) -> list[dict] | Non
         cents = [c2 for k2, c2 in enumerate(cents) if k2 not in (i, j)] \
             + [c / (np.linalg.norm(c) + 1e-9)]
 
-    # 3. Cluster → name. Enrolled profile if its best centroid clears the
-    # live thresholds (same threshold+margin ladder /identify uses; the
-    # absolute floor stands in when only one profile exists); else Speaker N.
-    labels: list[str] = []
-    speaker_n = 0
-    for g, c in zip(groups, cents):
+    # Helpers: per-origin seconds in a cluster.
+    def origin_seconds(g: list[int], origin: str) -> float:
+        total = 0.0
+        for k in g:
+            si, _, t0, t1 = windows[k]
+            if streams[si]["origin"] == origin:
+                total += t1 - t0
+        return total
+
+    def mic_seconds(g: list[int]) -> float:
+        return origin_seconds(g, "mic")
+
+    # 3. Cluster -> name via enrolled profiles (same gate ladder /identify
+    # uses), then resolve the user's cluster, then Speaker N the rest.
+    names: list = [None] * len(groups)
+    for gi, c in enumerate(cents):
         best_name, best_sim, runner = None, -1.0, -1.0
         for name, cent_rows in profiles.items():
             sim = float(np.max(cent_rows @ c)) if len(cent_rows) else -1.0
@@ -300,7 +332,63 @@ def offline_diarize(raw: bytes, segs: list[dict], port: int) -> list[dict] | Non
         elif ok:
             ok = (best_sim - runner) >= margin
         if ok:
-            labels.append(best_name.upper())
+            names[gi] = best_name.upper()
+
+    me_name = (me_label or "").strip().upper() or None
+    me_gi: int | None = None
+    if me_name:
+        for gi, nm in enumerate(names):
+            if nm == me_name:
+                me_gi = gi
+                break
+        if me_gi is None and any(st["origin"] == "mic" for st in streams):
+            # No enrolled match — assume the dominant MIC-EXCLUSIVE voice is
+            # the user. Crucial subtlety: without headphones, a remote
+            # speaker's echo is also mic-origin audio, and a chatty remote
+            # participant can out-talk the user on the mic — but their
+            # cluster also contains system-audio windows, and the local
+            # user's never does. Clusters with meaningful sys audio are
+            # therefore ineligible to be "me".
+            best_gi, best_mic = None, 0.0
+            for gi, g in enumerate(groups):
+                total = sum(windows[k][3] - windows[k][2] for k in g)
+                if total <= 0 or origin_seconds(g, "sys") > 0.2 * total:
+                    continue
+                m = mic_seconds(g)
+                if m > best_mic:
+                    best_gi, best_mic = gi, m
+            if best_gi is not None and best_mic > 0.0:
+                me_gi = best_gi
+                names[me_gi] = me_name
+                log(f"no enrolled profile matched {me_name} — assuming the "
+                    f"dominant mic-only voice is them ({best_mic:.0f}s). "
+                    f"Enroll (/profile add) to pin this.")
+
+    # Headset-call guard: STRAY unnamed mic windows fold into the user —
+    # but only when they also SOUND like the user (centroid similarity at
+    # the sticky-tier floor). Without the similarity check this ate real
+    # guests: a room voice saying one short sentence is also a "small
+    # mostly-mic cluster". The user's noise-windows pass both tests; a
+    # distinct guest voice fails the similarity one.
+    if me_gi is not None:
+        me_cent = cents[me_gi]
+        for gi, g in enumerate(groups):
+            if gi == me_gi or names[gi] is not None:
+                continue
+            total = sum(windows[k][3] - windows[k][2] for k in g)
+            if len(g) <= 2 and mic_seconds(g) >= 0.7 * total and \
+                    float(cents[gi] @ me_cent) >= 0.35:
+                names[gi] = names[me_gi]
+            if os.environ.get("MEETINK_REFINE_DEBUG"):
+                log(f"debug cluster {gi}: windows={len(g)} total={total:.1f}s "
+                    f"mic={mic_seconds(g):.1f}s sim_to_me={float(cents[gi] @ me_cent):.3f} "
+                    f"name={names[gi]}")
+
+    speaker_n = 0
+    labels: list[str] = []
+    for nm in names:
+        if nm is not None:
+            labels.append(nm)
         else:
             speaker_n += 1
             labels.append(f"Speaker {speaker_n}")
@@ -310,44 +398,49 @@ def offline_diarize(raw: bytes, segs: list[dict], port: int) -> list[dict] | Non
         for k in g:
             win_label[k] = lab
 
-    # 4. Sentence labels by duration-weighted vote, splitting a sentence at
-    # the token boundary nearest a single clean label change.
+    # 4. Per-segment vote (duration-weighted) + single-change splits.
     out: list[dict] = []
-    by_seg: dict[int, list[tuple[float, float, str]]] = {}
-    for k, (si, t0, t1) in enumerate(windows):
+    by_seg: dict[tuple[int, int], list] = {}
+    for k, (si, i, t0, t1) in enumerate(windows):
         if k in win_label:
-            by_seg.setdefault(si, []).append((t0, t1, win_label[k]))
+            by_seg.setdefault((si, i), []).append((t0, t1, win_label[k]))
 
-    for i, seg in enumerate(segs):
-        wins = sorted(by_seg.get(i, []))
-        if not wins:
-            out.append({**seg, "label": "THEM"})
-            continue
-        runs: list[tuple[str, float, float]] = []   # (label, from_t, to_t)
-        for t0, t1, lab in wins:
-            if runs and runs[-1][0] == lab:
-                runs[-1] = (lab, runs[-1][1], t1)
-            else:
-                runs.append((lab, t0, t1))
-        tokens = seg.get("tokens") or []
-        if len(runs) == 2 and tokens and \
-                min(runs[0][2] - runs[0][1], runs[1][2] - runs[1][1]) >= WIN_S:
-            # One clean change mid-sentence: split at the nearest token edge.
-            cut_t = runs[1][1]
-            cut = min(range(len(tokens)),
-                      key=lambda t: abs(tokens[t]["start"] - cut_t))
-            first = "".join(t["text"] for t in tokens[:cut]).strip()
-            second = "".join(t["text"] for t in tokens[cut:]).strip()
-            if first and second:
-                out.append({"start": seg["start"], "end": cut_t,
-                            "text": first, "label": runs[0][0]})
-                out.append({"start": cut_t, "end": seg["end"],
-                            "text": second, "label": runs[1][0]})
+    for si, stream in enumerate(streams):
+        origin = stream["origin"]
+        default_label = names[me_gi] if (origin == "mic" and me_gi is not None) \
+            else "THEM"
+        for i, seg in enumerate(stream["segs"]):
+            wins = sorted(by_seg.get((si, i), []))
+            if not wins:
+                out.append({**seg, "label": default_label, "origin": origin})
                 continue
-        votes: dict[str, float] = {}
-        for lab, a, b in runs:
-            votes[lab] = votes.get(lab, 0.0) + (b - a)
-        out.append({**seg, "label": max(votes, key=votes.get)})
+            runs: list = []
+            for t0, t1, lab in wins:
+                if runs and runs[-1][0] == lab:
+                    runs[-1] = (lab, runs[-1][1], t1)
+                else:
+                    runs.append((lab, t0, t1))
+            tokens = seg.get("tokens") or []
+            if len(runs) == 2 and tokens and \
+                    min(runs[0][2] - runs[0][1], runs[1][2] - runs[1][1]) >= WIN_S:
+                cut_t = runs[1][1]
+                cut = min(range(len(tokens)),
+                          key=lambda t: abs(tokens[t]["start"] - cut_t))
+                first = "".join(t["text"] for t in tokens[:cut]).strip()
+                second = "".join(t["text"] for t in tokens[cut:]).strip()
+                if first and second:
+                    out.append({"start": seg["start"], "end": cut_t,
+                                "text": first, "label": runs[0][0],
+                                "origin": origin})
+                    out.append({"start": cut_t, "end": seg["end"],
+                                "text": second, "label": runs[1][0],
+                                "origin": origin})
+                    continue
+            votes: dict = {}
+            for lab, a, b in runs:
+                votes[lab] = votes.get(lab, 0.0) + (b - a)
+            out.append({**seg, "label": max(votes, key=votes.get),
+                        "origin": origin})
 
     log(f"offline diarize: {len(groups)} voices "
         f"({', '.join(sorted(set(labels)))}) across {len(out)} lines")
@@ -373,12 +466,11 @@ def main() -> int:
     from parakeet_mlx import from_pretrained
     model = from_pretrained(MODEL_ID)
 
-    entries: list[tuple[float, str, str]] = []  # (start_s, label, text)
+    # (start_s, label, text, origin) — origin drives echo suppression.
+    entries: list[tuple[float, str, str, str]] = []
 
-    def diarize_all(raw: bytes, segs: list[dict]) -> None:
-        """Identify every segment, with progress — on long files this pass
-        takes real minutes (one embedding per sentence), and it runs AFTER
-        the transcription bar hits 100%, so it must narrate itself."""
+    def diarize_all(raw: bytes, segs: list[dict], origin: str) -> None:
+        """Sidecar-down fallback: sequential per-segment identify."""
         n = len(segs)
         if n:
             print(f"refine: status identifying speakers ({n} segments)", flush=True)
@@ -386,7 +478,7 @@ def main() -> int:
         for i, seg in enumerate(segs):
             label = identify_segment(raw, seg["start"], seg["end"],
                                      args.diarize_port) or "THEM"
-            entries.append((seg["start"], label, seg["text"]))
+            entries.append((seg["start"], label, seg["text"], origin))
             if (i + 1) % step == 0 or i + 1 == n:
                 print(f"refine: progress diarize {int(100 * (i + 1) / n)}",
                       flush=True)
@@ -394,22 +486,44 @@ def main() -> int:
     if args.input:
         raw = decode_to_raw(args.input)
         segs = transcribe_sentences(model, raw, "import")
-        labeled = offline_diarize(raw, segs, args.diarize_port)
+        labeled = offline_diarize_multi(
+            [{"raw": raw, "segs": segs, "origin": "import"}],
+            args.diarize_port)
         if labeled is not None:
             for seg in labeled:
-                entries.append((seg["start"], seg["label"], seg["text"]))
+                entries.append((seg["start"], seg["label"], seg["text"],
+                                seg["origin"]))
         else:
-            # Sidecar unreachable — sequential per-segment fallback.
-            diarize_all(raw, segs)
+            diarize_all(raw, segs, "import")
     else:
+        streams: list[dict] = []
         if args.mic and Path(args.mic).exists():
             mic_raw = Path(args.mic).read_bytes()
-            me = args.me.strip().upper() or "ME"
-            for seg in transcribe_sentences(model, mic_raw, "mic"):
-                entries.append((seg["start"], me, seg["text"]))
+            streams.append({"raw": mic_raw, "origin": "mic",
+                            "segs": transcribe_sentences(model, mic_raw, "mic")})
         if args.sys_ and Path(args.sys_).exists():
             sys_raw = Path(args.sys_).read_bytes()
-            diarize_all(sys_raw, transcribe_sentences(model, sys_raw, "sys"))
+            streams.append({"raw": sys_raw, "origin": "sys",
+                            "segs": transcribe_sentences(model, sys_raw, "sys")})
+        # Joint diarization across BOTH streams: the mic is no longer
+        # assumed to be only the user — in-person guests, speakerphone
+        # calls and hybrid meetings all label correctly, anchored by the
+        # user's enrolled profile (or the dominant mic voice as fallback).
+        labeled = offline_diarize_multi(streams, args.diarize_port,
+                                        me_label=args.me)
+        if labeled is not None:
+            for seg in labeled:
+                entries.append((seg["start"], seg["label"], seg["text"],
+                                seg["origin"]))
+        else:
+            # Sidecar down: old behavior — mic blanket-labeled, sys THEM.
+            me = args.me.strip().upper() or "ME"
+            for st in streams:
+                if st["origin"] == "mic":
+                    for seg in st["segs"]:
+                        entries.append((seg["start"], me, seg["text"], "mic"))
+                else:
+                    diarize_all(st["raw"], st["segs"], "sys")
 
     if not entries:
         log("no speech found — leaving original transcript untouched")
@@ -418,23 +532,23 @@ def main() -> int:
     entries.sort(key=lambda e: e[0])
 
     # Echo suppression (session mode): with speakers instead of headphones,
-    # the mic hears the remote side too, and the mic stream is blanket-
-    # labeled --me — so every remote utterance lands TWICE, once mislabeled.
-    # Drop a mic entry when a nearby system-stream entry says (almost) the
-    # same thing: the sys copy is the correctly-attributed one. Field case:
-    # a full meeting where "GREG:" echoed every other speaker line.
+    # the mic hears the remote side too — every remote utterance lands
+    # TWICE, once via the mic. The joint diarizer usually gives the echo
+    # the remote speaker's label already (same voice, same cluster), so
+    # dedup is ORIGIN-based, not label-based: a mic-origin entry whose text
+    # near-matches a nearby sys-origin entry is the speaker bleed, and the
+    # sys copy is the authoritative one.
     if args.mic and args.sys_:
         import difflib
-        me_label = (args.me.strip().upper() or "ME")
 
         def norm(t: str) -> str:
             return re.sub(r"[^a-z0-9 ]", "", t.lower()).strip()
 
-        sys_entries = [(t, norm(x)) for t, lab, x in entries if lab != me_label]
+        sys_entries = [(t, norm(x)) for t, _, x, o in entries if o == "sys"]
         deduped = []
         dropped = 0
-        for t, lab, text in entries:
-            if lab == me_label:
+        for t, lab, text, origin in entries:
+            if origin == "mic":
                 nt = norm(text)
                 echo = False
                 for st, sx in sys_entries:
@@ -450,7 +564,7 @@ def main() -> int:
                 if echo:
                     dropped += 1
                     continue
-            deduped.append((t, lab, text))
+            deduped.append((t, lab, text, origin))
         if dropped:
             log(f"echo suppression: dropped {dropped} mic lines duplicated "
                 f"in system audio (speakers instead of headphones?)")
@@ -497,7 +611,7 @@ def main() -> int:
         lines.append("")
     lines.append(f"# refined: parakeet ({MODEL_ID.split('/')[-1]})")
 
-    for start_s, label, text in entries:
+    for start_s, label, text, _origin in entries:
         lines.append(f"[{stamp(start_s)}] {label}: {text}")
 
     if ended_line:
