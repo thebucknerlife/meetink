@@ -173,7 +173,6 @@ def identify_segment(raw: bytes, start: float, end: float, port: int) -> str | N
 
 WIN_S = 3.0
 HOP_S = 1.5
-PRE_CLUSTER_SIM = 0.80   # pre-pass: only near-duplicates collapse
 
 
 def _http_json(url: str, data: bytes | None = None, timeout: float = 15) -> dict | None:
@@ -206,6 +205,10 @@ def offline_diarize(raw: bytes, segs: list[dict], port: int) -> list[dict] | Non
     margin = float(prof.get("settings", {}).get("margin", 0.07))
     single_floor = float(prof.get("settings", {}).get("single_profile_floor", 0.78))
     cluster_thr = float(prof.get("settings", {}).get("cluster_threshold", 0.72))
+    # Pre-pass collapses only near-duplicates; "near" is relative to the
+    # active model's similarity scale (WeSpeaker cluster 0.72 -> pre 0.85ish,
+    # TitaNet cluster 0.50 -> pre 0.65), so derive it instead of hardcoding.
+    pre_sim = min(0.85, cluster_thr + 0.15)
     profiles = {
         name: np.asarray(cents, dtype=np.float32)
         for name, cents in (prof.get("profiles") or {}).items()
@@ -252,7 +255,7 @@ def offline_diarize(raw: bytes, segs: list[dict], port: int) -> list[dict] | Non
         if centroids:
             sims = np.stack(centroids) @ E[k]
             j = int(np.argmax(sims))
-            if sims[j] >= PRE_CLUSTER_SIM:
+            if sims[j] >= pre_sim:
                 minis[j].append(k)
                 c = E[list(minis[j])].mean(axis=0)
                 centroids[j] = c / (np.linalg.norm(c) + 1e-9)
@@ -413,6 +416,46 @@ def main() -> int:
         return 2
 
     entries.sort(key=lambda e: e[0])
+
+    # Echo suppression (session mode): with speakers instead of headphones,
+    # the mic hears the remote side too, and the mic stream is blanket-
+    # labeled --me — so every remote utterance lands TWICE, once mislabeled.
+    # Drop a mic entry when a nearby system-stream entry says (almost) the
+    # same thing: the sys copy is the correctly-attributed one. Field case:
+    # a full meeting where "GREG:" echoed every other speaker line.
+    if args.mic and args.sys_:
+        import difflib
+        me_label = (args.me.strip().upper() or "ME")
+
+        def norm(t: str) -> str:
+            return re.sub(r"[^a-z0-9 ]", "", t.lower()).strip()
+
+        sys_entries = [(t, norm(x)) for t, lab, x in entries if lab != me_label]
+        deduped = []
+        dropped = 0
+        for t, lab, text in entries:
+            if lab == me_label:
+                nt = norm(text)
+                echo = False
+                for st, sx in sys_entries:
+                    if abs(st - t) > 6.0:
+                        continue
+                    if len(nt) < 10:
+                        echo = nt == sx and abs(st - t) <= 3.0
+                    else:
+                        echo = difflib.SequenceMatcher(
+                            None, nt, sx).ratio() >= 0.75
+                    if echo:
+                        break
+                if echo:
+                    dropped += 1
+                    continue
+            deduped.append((t, lab, text))
+        if dropped:
+            log(f"echo suppression: dropped {dropped} mic lines duplicated "
+                f"in system audio (speakers instead of headphones?)")
+            print(f"refine: status removed {dropped} echoed lines", flush=True)
+        entries = deduped
 
     # Wall-clock line stamps when we know the session start (matches the
     # live format); otherwise relative from 0 (imports).

@@ -2088,6 +2088,58 @@ def _parent_death_watchdog(poll_s: float = 5.0) -> None:
             pass  # pid exists but isn't ours — still alive
 
 
+# --- Per-model threshold calibration -----------------------------------------
+#
+# Every threshold default above was calibrated on WeSpeaker ResNet34's cosine
+# distribution (same-voice ≳ 0.75, cross < 0.4). TitaNet-L (192-D) scores the
+# SAME voice systematically lower (real-world same-voice ≈ 0.55-0.75, cross
+# ≈ 0.05-0.35), so under WeSpeaker thresholds almost every chunk fails to
+# join its own cluster: a one-hour meeting splintered into "Speaker 203"-
+# style labels the day the model shipped. Recalibrate every default for the
+# active model family, detected by embedding dimensionality. Explicit env
+# vars always win — only unset knobs are rescaled. These TitaNet values are
+# literature-informed estimates pending field calibration; all remain
+# hot-tunable via /diarize sensitivity and env.
+if _extractor_dim == 192:   # TitaNet family
+    PRESETS.clear()
+    PRESETS.update({
+        "focused": {"threshold": 0.42, "margin": 0.10, "cluster_threshold": 0.40},
+        "default": {"threshold": 0.48, "margin": 0.06, "cluster_threshold": 0.50},
+        "strict":  {"threshold": 0.55, "margin": 0.08, "cluster_threshold": 0.58},
+    })
+    _preset = PRESETS.get(settings_preset, PRESETS["default"])
+    for _k, _env, _v in [
+        ("threshold", "MEETINK_DIARIZE_THRESHOLD", _preset["threshold"]),
+        ("margin", "MEETINK_DIARIZE_MARGIN", _preset["margin"]),
+        ("cluster_threshold", "MEETINK_DIARIZE_CLUSTER_THRESHOLD",
+         _preset["cluster_threshold"]),
+        ("single_profile_floor", "MEETINK_DIARIZE_SINGLE_FLOOR", 0.60),
+        ("close_pair_threshold", "MEETINK_DIARIZE_CLOSE_PAIR_THRESHOLD", 0.60),
+        ("close_pair_margin", "MEETINK_DIARIZE_CLOSE_PAIR_MARGIN", 0.03),
+    ]:
+        if _env not in os.environ:
+            settings[_k] = _v
+    if "MEETINK_AUTO_TRAIN_FLOOR" not in os.environ:
+        auto_train_settings["floor"] = 0.68
+    if "MEETINK_AUTO_TRAIN_TIGHTNESS_FLOOR" not in os.environ:
+        auto_train_settings["tightness_floor"] = 0.55
+    if "MEETINK_PROFILE_OUTLIER_FLOOR" not in os.environ:
+        PROFILE_OUTLIER_FLOOR = 0.25
+    if "MEETINK_CLUSTER_STICKY_THRESHOLD" not in os.environ:
+        STICKY_THRESHOLD = 0.38
+    if "MEETINK_CLUSTER_MERGE_THRESHOLD" not in os.environ:
+        CLUSTER_MERGE_THRESHOLD = 0.55
+    if "MEETINK_CLUSTER_MERGE_SMALL_THRESHOLD" not in os.environ:
+        CLUSTER_MERGE_SMALL_THRESHOLD = 0.42
+    print(
+        "threshold calibration: titanet (192-D) — "
+        f"threshold={settings['threshold']} "
+        f"cluster={settings['cluster_threshold']} "
+        f"merge={CLUSTER_MERGE_THRESHOLD} sticky={STICKY_THRESHOLD}",
+        file=sys.stderr,
+    )
+
+
 if __name__ == "__main__":
     print(
         f"diarize-server ready on 127.0.0.1:{PORT} "

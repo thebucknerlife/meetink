@@ -1088,6 +1088,24 @@ struct LocalSpeechCapture {
         // dedicated queue so a flurry of signals doesn't fire concurrent
         // engine.stop() / installTap() calls.
         let engine = AVAudioEngine()
+
+        // Acoustic echo cancellation. Without headphones, the mic hears the
+        // system audio too — and since the mic stream is blanket-labeled as
+        // the user, every remote utterance lands in the transcript TWICE,
+        // once mislabeled (field case: an hour of "GREG:" lines the user
+        // never said). Apple's voice-processing mode cancels the machine's
+        // own output from the mic signal at the OS level — the same AEC
+        // Zoom/FaceTime use. It also adds mild noise suppression/AGC.
+        // Opt out with MEETINK_AEC=off if it ever degrades mic quality.
+        if (ProcessInfo.processInfo.environment["MEETINK_AEC"] ?? "on") != "off" {
+            do {
+                try engine.inputNode.setVoiceProcessingEnabled(true)
+                fputs("Mic voice processing (echo cancellation) enabled\n", stderr)
+            } catch {
+                fputs("Voice processing unavailable (\(error)) — speakers may echo into the mic\n", stderr)
+            }
+        }
+
         let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
 
         // Shared heartbeat state. The tap closure updates the timestamp on
