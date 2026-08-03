@@ -1026,6 +1026,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         upload.isEnabled = launcherPath() != nil
         menu.addItem(upload)
 
+        let repl = NSMenuItem(title: "Open REPL",
+                              action: #selector(openREPL), keyEquivalent: "r")
+        repl.target = self
+        repl.isEnabled = launcherPath() != nil
+        menu.addItem(repl)
+
         let folder = NSMenuItem(title: "Open Transcripts Folder",
                                 action: #selector(openFolder), keyEquivalent: "")
         folder.target = self
@@ -1074,6 +1080,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func startRecording() { runLauncher("start"); showTranscript() }
     @objc private func stopRecording() { runLauncher("stop") }
     @objc private func showTranscriptAction() { showTranscript() }
+
+    /// Open the meetink REPL in the user's terminal — iTerm when installed
+    /// (matches where meetink users live), Terminal.app otherwise. First use
+    /// triggers a one-time Automation prompt (Meetink → iTerm/Terminal).
+    @objc private func openREPL() {
+        guard let launcher = launcherPath() else { return }
+        let hasITerm = FileManager.default.fileExists(atPath: "/Applications/iTerm.app")
+        let script: String
+        if hasITerm {
+            script = """
+            tell application "iTerm2"
+                activate
+                create window with default profile command "\(launcher)"
+            end tell
+            """
+        } else {
+            script = """
+            tell application "Terminal"
+                activate
+                do script "\(launcher)"
+            end tell
+            """
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", script]
+        try? proc.run()
+    }
 
     @objc private func openFolder() {
         let base = (liveSymlinkPath() as NSString).deletingLastPathComponent

@@ -920,6 +920,8 @@ cmd_help() {
     bullet "tail     " "follow the live transcript"
     bullet "app      " "launch Meetink.app (menu bar + native transcript window)"
     bullet "refine   " "transcribe an audio file (post-meeting refine runs on stop)"
+    bullet "upload   " "open the app's Transcribe Audio drop window"
+    bullet "prompt   " "edit the custom vocabulary (names/jargon whisper should know)"
     bullet "help     " "show this help"
     print -P ""
     print -P "${C[bright_yellow]}OUTPUT${C[reset]}"

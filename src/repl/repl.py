@@ -1088,13 +1088,16 @@ HELP_TEXT = """\033[93mCOMMANDS\033[0m
   \033[1m/context\033[0m       \033[2mattach docs to a project: /context add report.pdf | list | rm | show\033[0m
   \033[1m/index\033[0m         \033[2mRAG sidecar for /ask on long meetings: /index install | status | rm\033[0m
   \033[1m/watch\033[0m         \033[2mauto-record from calendar + impromptu calls: /watch on|off|status|skip|events|notify|detect\033[0m
+  \033[1m/upload\033[0m       \033[2mopen the Transcribe Audio window (drag/drop a file to transcribe it)\033[0m
+  \033[1m/app\033[0m          \033[2mlaunch Meetink.app (menu bar + native transcript window)\033[0m
   \033[1m/setup\033[0m        \033[2minstall dependencies + download whisper model\033[0m
   \033[1m/clear\033[0m        \033[2mclear scrollback\033[0m
   \033[1m/help\033[0m         \033[2mthis list\033[0m
   \033[1m/quit\033[0m         \033[2mexit (recording continues if active)\033[0m
 
 \033[2mTab to autocomplete commands. Trackpad / wheel / Cmd+F all work — the
-terminal owns the scrollback now.\033[0m"""
+terminal owns the scrollback now. Recordings are re-transcribed in full on
+/stop (parakeet refine); `meetink refine <audio-file>` imports any file.\033[0m"""
 
 
 def emit(text: str) -> None:
