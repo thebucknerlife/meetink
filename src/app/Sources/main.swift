@@ -1044,6 +1044,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var env = ProcessInfo.processInfo.environment
         env["MEETINK_NO_TAIL"] = "1"
         proc.environment = env
+        // Never discard launcher output: a start that dies pre-spawn (the
+        // whisper-server-not-on-PATH incident) must leave a trail.
+        let logPath = "/tmp/meetink-app-launcher.log"
+        if !FileManager.default.fileExists(atPath: logPath) {
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+        }
+        if let h = FileHandle(forWritingAtPath: logPath) {
+            h.seekToEndOfFile()
+            h.write("--- meetink \(subcommand) @ \(Date())\n".data(using: .utf8)!)
+            proc.standardOutput = h
+            proc.standardError = h
+        }
         try? proc.run()
         // Recording state flips within a couple of seconds; poll early so
         // the icon doesn't lag the click.

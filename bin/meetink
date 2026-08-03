@@ -4,6 +4,13 @@
 
 set -e
 
+# Meetink.app invokes this launcher with launchd's bare PATH (no Homebrew),
+# which silently breaks every brew-installed tool we exec — whisper-server
+# first among them: app-started recordings died at the `command -v` check
+# with the error going nowhere. Same class of bug as the ffmpeg/refine.py
+# incident; fixed at the root this time so every subcommand is covered.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+
 # --- Locate self ---
 SCRIPT_PATH="${0:A}"
 MK_BIN_DIR="${SCRIPT_PATH:h}"
