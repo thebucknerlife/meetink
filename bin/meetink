@@ -259,8 +259,17 @@ build_app() {
         codesign --force --sign "$ident" "$app" 2>/dev/null || true
         if [[ "$ident" == "-" ]]; then
             print -P "  ${C[yellow]}⚠${C[reset]} ${C[dim]}ad-hoc signed — mic/screen permissions will re-prompt after every rebuild.${C[reset]}"
-            print -P "    ${C[dim]}One-time fix: Keychain Access → Certificate Assistant → Create a Certificate →${C[reset]}"
-            print -P "    ${C[dim]}name: Meetink Signing, type: Code Signing — then rebuild.${C[reset]}"
+            # Two distinct fix paths: the identity may be missing entirely,
+            # or exist but be untrusted (CSSMERR_TP_NOT_TRUSTED — Certificate
+            # Assistant creates the cert without the code-signing trust bit).
+            if security find-identity -p codesigning 2>/dev/null | grep -q "Meetink Signing"; then
+                print -P "    ${C[dim]}\"Meetink Signing\" exists but is NOT TRUSTED for code signing.${C[reset]}"
+                print -P "    ${C[dim]}Fix: Keychain Access → double-click Meetink Signing → Trust →${C[reset]}"
+                print -P "    ${C[dim]}Code Signing: Always Trust — then rebuild.${C[reset]}"
+            else
+                print -P "    ${C[dim]}One-time fix: Keychain Access → Certificate Assistant → Create a Certificate →${C[reset]}"
+                print -P "    ${C[dim]}name: Meetink Signing, type: Code Signing — then rebuild.${C[reset]}"
+            fi
         fi
     fi
 
