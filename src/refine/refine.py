@@ -111,7 +111,15 @@ def transcribe_sentences(model, raw: bytes, label_for_log: str) -> list[dict]:
     for s in sentences:
         text = s.text.strip()
         if text:
-            out.append({"start": float(s.start), "end": float(s.end), "text": text})
+            out.append({
+                "start": float(s.start), "end": float(s.end), "text": text,
+                # token timing enables mid-sentence speaker splits in the
+                # offline diarizer (punctuation is not a turn boundary)
+                "tokens": [
+                    {"text": t.text, "start": float(t.start)}
+                    for t in (getattr(s, "tokens", None) or [])
+                ],
+            })
     log(f"{label_for_log}: {len(out)} segments, "
         f"{len(raw) // 2 // SAMPLE_RATE}s audio")
     return out
@@ -140,6 +148,207 @@ def identify_segment(raw: bytes, start: float, end: float, port: int) -> str | N
             return body.get("speaker")
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Offline diarization (imports)
+#
+# The live path labels 3 s chunks greedily as they arrive — it has no choice.
+# An import has ALL the audio up front, so it earns the batch treatment:
+#   1. slide 3 s windows (1.5 s hop) over every transcribed segment and
+#      fetch a stateless embedding per window (:8179/embed — no session
+#      mutation, so imports can't contaminate a live meeting's clusters);
+#   2. two-stage global clustering: a low-threshold sequential pre-pass
+#      collapses the N windows into ~tens of mini-clusters (pure numpy,
+#      O(N·M)), then average-linkage agglomerative merging on the
+#      mini-cluster centroids (M is small, O(M^3) is nothing) — the global
+#      view a one-pass greedy assigner fundamentally lacks;
+#   3. map each final cluster to an enrolled profile (centroids + live
+#      thresholds from /profiles/centroids) or a fresh "Speaker N";
+#   4. label each sentence by duration-weighted majority vote over its
+#      windows — and when the windows show one clean label change inside a
+#      sentence (speaker turns mid-"sentence" constantly; punctuation is
+#      not a turn boundary), split the sentence at the nearest token edge.
+# ---------------------------------------------------------------------------
+
+WIN_S = 3.0
+HOP_S = 1.5
+PRE_CLUSTER_SIM = 0.80   # pre-pass: only near-duplicates collapse
+
+
+def _http_json(url: str, data: bytes | None = None, timeout: float = 15) -> dict | None:
+    req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _wav_bytes(raw: bytes, a: int, b: int) -> bytes:
+    n = b - a
+    wav = bytearray()
+    wav += b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt "
+    wav += struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16)
+    wav += b"data" + struct.pack("<I", n) + raw[a:b]
+    return bytes(wav)
+
+
+def offline_diarize(raw: bytes, segs: list[dict], port: int) -> list[dict] | None:
+    """Return segs relabeled (and possibly split), or None if the sidecar
+    is unreachable — caller falls back to plain THEM labels."""
+    import numpy as np
+
+    prof = _http_json(f"http://127.0.0.1:{port}/profiles/centroids")
+    if prof is None:
+        return None
+    threshold = float(prof.get("settings", {}).get("threshold", 0.65))
+    margin = float(prof.get("settings", {}).get("margin", 0.07))
+    single_floor = float(prof.get("settings", {}).get("single_profile_floor", 0.78))
+    cluster_thr = float(prof.get("settings", {}).get("cluster_threshold", 0.72))
+    profiles = {
+        name: np.asarray(cents, dtype=np.float32)
+        for name, cents in (prof.get("profiles") or {}).items()
+    }
+
+    # 1. Window embeddings.
+    windows = []   # (seg_idx, t0, t1)
+    for i, seg in enumerate(segs):
+        t = seg["start"]
+        while t < seg["end"]:
+            t1 = min(t + WIN_S, seg["end"])
+            if t1 - t >= 1.0:
+                windows.append((i, t, t1))
+            if t1 >= seg["end"]:
+                break
+            t += HOP_S
+    if not windows:
+        return None
+
+    n = len(windows)
+    print(f"refine: status identifying speakers ({n} windows, global clustering)",
+          flush=True)
+    embs: list[np.ndarray | None] = []
+    step = max(1, n // 25)
+    for k, (_, t0, t1) in enumerate(windows):
+        a = int(t0 * SAMPLE_RATE) * 2
+        b = min(len(raw), int(t1 * SAMPLE_RATE) * 2)
+        resp = _http_json(f"http://127.0.0.1:{port}/embed", data=_wav_bytes(raw, a, b))
+        vec = (resp or {}).get("embedding")
+        embs.append(np.asarray(vec, dtype=np.float32) if vec else None)
+        if (k + 1) % step == 0 or k + 1 == n:
+            print(f"refine: progress diarize {int(100 * (k + 1) / n)}", flush=True)
+
+    keep = [k for k, e in enumerate(embs) if e is not None]
+    if not keep:
+        return None
+    E = np.stack([embs[k] / (np.linalg.norm(embs[k]) + 1e-9) for k in keep])
+    windows = [windows[k] for k in keep]
+
+    # 2a. Sequential pre-pass: collapse near-duplicates into mini-clusters.
+    minis: list[list[int]] = []
+    centroids: list[np.ndarray] = []
+    for k in range(len(E)):
+        if centroids:
+            sims = np.stack(centroids) @ E[k]
+            j = int(np.argmax(sims))
+            if sims[j] >= PRE_CLUSTER_SIM:
+                minis[j].append(k)
+                c = E[list(minis[j])].mean(axis=0)
+                centroids[j] = c / (np.linalg.norm(c) + 1e-9)
+                continue
+        minis.append([k])
+        centroids.append(E[k])
+
+    # 2b. Average-linkage agglomerative merge on mini-cluster centroids,
+    # size-weighted, until no pair clears the cluster threshold.
+    groups = [list(m) for m in minis]
+    cents = list(centroids)
+    while len(groups) > 1:
+        M = len(cents)
+        C = np.stack(cents)
+        S = C @ C.T
+        np.fill_diagonal(S, -1.0)
+        i, j = np.unravel_index(int(np.argmax(S)), S.shape)
+        if S[i, j] < cluster_thr:
+            break
+        merged = groups[i] + groups[j]
+        c = E[merged].mean(axis=0)
+        groups = [g for k2, g in enumerate(groups) if k2 not in (i, j)] + [merged]
+        cents = [c2 for k2, c2 in enumerate(cents) if k2 not in (i, j)] \
+            + [c / (np.linalg.norm(c) + 1e-9)]
+
+    # 3. Cluster → name. Enrolled profile if its best centroid clears the
+    # live thresholds (same threshold+margin ladder /identify uses; the
+    # absolute floor stands in when only one profile exists); else Speaker N.
+    labels: list[str] = []
+    speaker_n = 0
+    for g, c in zip(groups, cents):
+        best_name, best_sim, runner = None, -1.0, -1.0
+        for name, cent_rows in profiles.items():
+            sim = float(np.max(cent_rows @ c)) if len(cent_rows) else -1.0
+            if sim > best_sim:
+                best_name, runner, best_sim = name, best_sim, sim
+            elif sim > runner:
+                runner = sim
+        ok = best_name is not None and best_sim >= threshold
+        if ok and len(profiles) == 1:
+            ok = best_sim >= single_floor
+        elif ok:
+            ok = (best_sim - runner) >= margin
+        if ok:
+            labels.append(best_name.upper())
+        else:
+            speaker_n += 1
+            labels.append(f"Speaker {speaker_n}")
+
+    win_label: dict[int, str] = {}
+    for g, lab in zip(groups, labels):
+        for k in g:
+            win_label[k] = lab
+
+    # 4. Sentence labels by duration-weighted vote, splitting a sentence at
+    # the token boundary nearest a single clean label change.
+    out: list[dict] = []
+    by_seg: dict[int, list[tuple[float, float, str]]] = {}
+    for k, (si, t0, t1) in enumerate(windows):
+        if k in win_label:
+            by_seg.setdefault(si, []).append((t0, t1, win_label[k]))
+
+    for i, seg in enumerate(segs):
+        wins = sorted(by_seg.get(i, []))
+        if not wins:
+            out.append({**seg, "label": "THEM"})
+            continue
+        runs: list[tuple[str, float, float]] = []   # (label, from_t, to_t)
+        for t0, t1, lab in wins:
+            if runs and runs[-1][0] == lab:
+                runs[-1] = (lab, runs[-1][1], t1)
+            else:
+                runs.append((lab, t0, t1))
+        tokens = seg.get("tokens") or []
+        if len(runs) == 2 and tokens and \
+                min(runs[0][2] - runs[0][1], runs[1][2] - runs[1][1]) >= WIN_S:
+            # One clean change mid-sentence: split at the nearest token edge.
+            cut_t = runs[1][1]
+            cut = min(range(len(tokens)),
+                      key=lambda t: abs(tokens[t]["start"] - cut_t))
+            first = "".join(t["text"] for t in tokens[:cut]).strip()
+            second = "".join(t["text"] for t in tokens[cut:]).strip()
+            if first and second:
+                out.append({"start": seg["start"], "end": cut_t,
+                            "text": first, "label": runs[0][0]})
+                out.append({"start": cut_t, "end": seg["end"],
+                            "text": second, "label": runs[1][0]})
+                continue
+        votes: dict[str, float] = {}
+        for lab, a, b in runs:
+            votes[lab] = votes.get(lab, 0.0) + (b - a)
+        out.append({**seg, "label": max(votes, key=votes.get)})
+
+    log(f"offline diarize: {len(groups)} voices "
+        f"({', '.join(sorted(set(labels)))}) across {len(out)} lines")
+    return out
 
 
 def main() -> int:
@@ -181,7 +390,14 @@ def main() -> int:
 
     if args.input:
         raw = decode_to_raw(args.input)
-        diarize_all(raw, transcribe_sentences(model, raw, "import"))
+        segs = transcribe_sentences(model, raw, "import")
+        labeled = offline_diarize(raw, segs, args.diarize_port)
+        if labeled is not None:
+            for seg in labeled:
+                entries.append((seg["start"], seg["label"], seg["text"]))
+        else:
+            # Sidecar unreachable — sequential per-segment fallback.
+            diarize_all(raw, segs)
     else:
         if args.mic and Path(args.mic).exists():
             mic_raw = Path(args.mic).read_bytes()

@@ -13,7 +13,15 @@
 # Sourced by bin/meetink.
 
 MK_DIARIZE_VENV="$MK_HOME/diarize-venv"
-MK_DIARIZE_MODEL="$MK_HOME/models/speaker-embedding.onnx"
+# Embedding model precedence: env → config key diarize_model → default.
+# Switching models INVALIDATES enrolled profiles (different embedding
+# space and possibly dimensionality) — the server skips mismatched
+# profiles with a re-enroll hint rather than crashing.
+MK_DIARIZE_MODEL="${MEETINK_DIARIZE_MODEL:-}"
+if [[ -z "$MK_DIARIZE_MODEL" ]]; then
+    MK_DIARIZE_MODEL=$(grep '^diarize_model=' "$MK_HOME/config" 2>/dev/null | head -1 | cut -d= -f2-)
+fi
+[[ -z "$MK_DIARIZE_MODEL" ]] && MK_DIARIZE_MODEL="$MK_HOME/models/speaker-embedding.onnx"
 MK_DIARIZE_PROFILES="$MK_HOME/profiles"
 MK_DIARIZE_PORT=8179
 

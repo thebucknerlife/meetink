@@ -424,6 +424,12 @@ extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
     )
 )
 
+# Embedding dimensionality of the ACTIVE model — used by the profile
+# loader's dimension guard (see _load_all) so profiles enrolled under a
+# different embedding model are skipped instead of crashing every cosine.
+_extractor_dim = int(getattr(extractor, "dim", 0) or 0)
+
+
 
 # ---------------------------------------------------------------------------
 # Profile storage
@@ -588,6 +594,19 @@ def _load_all() -> None:
             data = np.load(path)
             keys = set(data.files)
             samples = data["samples"].astype(np.float32)
+            # Dimension guard: profiles are tied to the embedding model that
+            # made them (256-D WeSpeaker vs 192-D TitaNet, etc.). A stale
+            # profile after a model switch would crash every cosine with a
+            # shape mismatch — skip it loudly instead; the user re-enrolls.
+            if _extractor_dim and samples.shape[1] != _extractor_dim:
+                print(
+                    f"profile skipped (embedding-dim mismatch after model "
+                    f"switch): {path.stem} has {samples.shape[1]}-D samples, "
+                    f"model produces {_extractor_dim}-D — re-enroll with "
+                    f"/profile add {path.stem}",
+                    file=sys.stderr,
+                )
+                continue
             n = samples.shape[0]
             if "centroids" in keys:
                 # New format with k centroids + per-sample metadata.
@@ -1376,6 +1395,21 @@ class Handler(BaseHTTPRequestHandler):
                 ]
             })
             return
+        if path == "/profiles/centroids":
+            # Raw centroid vectors for every enrolled profile, plus the
+            # active matching thresholds. Lets an OFFLINE diarizer (the
+            # import/refine pass) do global clustering + profile matching
+            # itself — statelessly, without touching this server's live
+            # session clusters. Payload: ~3 centroids x 256 floats per
+            # profile — trivial.
+            self._json(200, {
+                "profiles": {
+                    name: p["centroids"].tolist()
+                    for name, p in profiles.items()
+                },
+                "settings": dict(settings),
+            })
+            return
         if path == "/session/aliases":
             # Retroactive merges this session: loser letter -> surviving
             # letter (transitively flattened). The launcher reads this on
@@ -1389,6 +1423,17 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         url = urlparse(self.path)
         try:
+            if url.path == "/embed":
+                # Stateless embedding: WAV in, 256-D vector out. No session
+                # mutation, no clustering, no auto-train — the offline
+                # diarizer (imports) builds its own global view from these.
+                samples = parse_wav(body)
+                if len(samples) < 16000:  # < 1 s is unreliable
+                    self._json(200, {"embedding": None, "reason": "too_short"})
+                    return
+                vec = embed(samples)
+                self._json(200, {"embedding": vec.tolist()})
+                return
             if url.path == "/identify":
                 samples = parse_wav(body)
                 if len(samples) < 16000:  # < 1 second is unreliable
