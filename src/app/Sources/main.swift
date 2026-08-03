@@ -185,23 +185,26 @@ func parseTranscript(_ text: String) -> TranscriptSnapshot {
                 speaker: ns.substring(with: m.range(at: 2)),
                 text: ns.substring(with: m.range(at: 3))
             )
-        } else if var c = current, !rawLine.isEmpty, !rawLine.hasPrefix("---") {
+        } else if rawLine.hasPrefix("Started:") {
+            snap.startedAt = isoParser.date(
+                from: rawLine.replacingOccurrences(of: "Started: ", with: "")
+                    .trimmingCharacters(in: .whitespaces))
+        } else if rawLine.hasPrefix("Ended:") {
+            // Metadata checks MUST come before the continuation branch:
+            // the Ended footer sits after the last utterance, and the old
+            // order glued it onto that utterance's text — so endedAt was
+            // never parsed and the header timer never stopped.
+            snap.endedAt = isoParser.date(
+                from: rawLine.replacingOccurrences(of: "Ended: ", with: "")
+                    .trimmingCharacters(in: .whitespaces))
+        } else if rawLine.hasPrefix("---") || rawLine.hasPrefix("#") {
+            // Structural/comment lines are never utterance text.
+        } else if var c = current, !rawLine.isEmpty {
             // Continuation of a wrapped utterance (whisper text can contain
             // embedded newlines) — belongs to the previous speaker line.
             c = TranscriptLine(timestamp: c.timestamp, speaker: c.speaker,
                                text: c.text + " " + rawLine)
             current = c
-        } else {
-            if rawLine.hasPrefix("Started:") {
-                snap.startedAt = isoParser.date(
-                    from: rawLine.replacingOccurrences(of: "Started: ", with: "")
-                        .trimmingCharacters(in: .whitespaces))
-            }
-            if rawLine.hasPrefix("Ended:") {
-                snap.endedAt = isoParser.date(
-                    from: rawLine.replacingOccurrences(of: "Ended: ", with: "")
-                        .trimmingCharacters(in: .whitespaces))
-            }
         }
     }
     if let c = current { snap.lines.append(c) }
@@ -795,9 +798,13 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
 
         var parts: [String] = []
         if let started = snapshot.startedAt {
-            let end = snapshot.endedAt ?? Date()
-            let secs = max(0, Int(end.timeIntervalSince(started)))
-            parts.append(String(format: "%02d:%02d", secs / 60, secs % 60))
+            // A ticking clock is only honest while actually recording; a
+            // stopped session shows its FIXED duration (endedAt) or none.
+            let end: Date? = snapshot.endedAt ?? (recording ? Date() : nil)
+            if let end {
+                let secs = max(0, Int(end.timeIntervalSince(started)))
+                parts.append(String(format: "%02d:%02d", secs / 60, secs % 60))
+            }
         }
         parts.append("\(snapshot.lines.count) lines")
         if !recording && snapshot.endedAt != nil { parts.append("ended") }

@@ -474,11 +474,19 @@ def main() -> int:
 
     lines: list[str] = []
     header_done = False
+    ended_line: str | None = None
     if args.header_from and Path(args.header_from).exists():
-        for hl in Path(args.header_from).read_text(errors="replace").splitlines():
+        src_lines = Path(args.header_from).read_text(errors="replace").splitlines()
+        for hl in src_lines:
             if re.match(r"^\[\d{2}:\d{2}:\d{2}\] ", hl) or hl.startswith("---"):
                 break
             lines.append(hl)
+        # The Ended footer lives at the BOTTOM — preserve it or the app's
+        # header timer has no stop time and ticks forever.
+        for hl in reversed(src_lines):
+            if hl.startswith("Ended:"):
+                ended_line = hl
+                break
         header_done = True
     if not header_done:
         lines.append("# Meeting Transcript (imported audio)")
@@ -491,6 +499,10 @@ def main() -> int:
 
     for start_s, label, text in entries:
         lines.append(f"[{stamp(start_s)}] {label}: {text}")
+
+    if ended_line:
+        lines.append("---")
+        lines.append(ended_line)
 
     Path(args.out).write_text("\n".join(lines) + "\n")
     log(f"wrote {len(entries)} lines -> {args.out}")
