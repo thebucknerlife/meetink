@@ -441,18 +441,27 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate {
     // MARK: Click-to-name
 
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
-        guard let url = link as? URL, url.scheme == "meetink-assign",
-              let number = url.host else { return false }
-        promptForName(speakerNumber: number)
+        guard let url = link as? URL, url.scheme == "meetink-assign" else { return false }
+        // Label travels percent-encoded in ?label= (it can be anything:
+        // "Speaker 3", "GREG", "ADRIANA 2"). The old host-only form
+        // (meetink-assign://3) is still accepted.
+        var label: String? = nil
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            label = comps.queryItems?.first(where: { $0.name == "label" })?.value
+        }
+        if label == nil, let num = url.host { label = "Speaker \(num)" }
+        guard let label, !label.isEmpty else { return false }
+        promptForName(label: label)
         return true
     }
 
-    private func promptForName(speakerNumber: String) {
+    private func promptForName(label: String) {
         let alert = NSAlert()
-        alert.messageText = "Who is Speaker \(speakerNumber)?"
+        let isUnnamed = label.hasPrefix("Speaker ") || label == "THEM"
+        alert.messageText = isUnnamed ? "Who is \(label)?" : "Reassign \(label)?"
         alert.informativeText = "Names the speaker, rewrites the transcript, and "
             + "enrolls their voice when the session's voice data is still available."
-        alert.addButton(withTitle: "Assign")
+        alert.addButton(withTitle: isUnnamed ? "Assign" : "Reassign")
         alert.addButton(withTitle: "Cancel")
         let combo = NSComboBox(frame: NSRect(x: 0, y: 0, width: 220, height: 25))
         combo.addItems(withObjectValues: enrolledProfiles())
@@ -463,14 +472,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let name = combo.stringValue.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty, !name.contains("."), !name.contains("/") else { return }
-        runAssign(number: speakerNumber, name: name)
+        runAssign(label: label, name: name)
     }
 
-    private func runAssign(number: String, name: String) {
+    private func runAssign(label: String, name: String) {
         guard let launcher = launcherPath() else { return }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launcher)
-        proc.arguments = ["profile", "assign", number, name]
+        proc.arguments = ["profile", "assign", label, name]
         // Rewrite THIS page's transcript (plain files supported).
         var env = ProcessInfo.processInfo.environment
         env["MEETINK_TRANSCRIPT"] = fixedPath ?? liveSymlinkPath()
@@ -486,7 +495,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate {
             if proc.terminationStatus != 0 || out.lowercased().contains("error") {
                 DispatchQueue.main.async {
                     let alert = NSAlert()
-                    alert.messageText = "Couldn't assign Speaker \(number)"
+                    alert.messageText = "Couldn't assign \(label)"
                     let plain = out.replacingOccurrences(
                         of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
                     alert.informativeText = plain.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -553,10 +562,17 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate {
                     .foregroundColor: speakerColor(block.speaker),
                     .paragraphStyle: headerPara,
                 ]
-                if let num = unknownSpeakerNumber(block.speaker),
-                   let url = URL(string: "meetink-assign://\(num)") {
+                // Every label is clickable — unnamed speakers get named,
+                // named ones can be REassigned (wrong guess, wrong person).
+                var comps = URLComponents()
+                comps.scheme = "meetink-assign"
+                comps.host = "x"
+                comps.queryItems = [URLQueryItem(name: "label", value: block.speaker)]
+                if let url = comps.url {
                     speakerAttrs[.link] = url
-                    speakerAttrs[.toolTip] = "Click to name this speaker"
+                    speakerAttrs[.toolTip] = unknownSpeakerNumber(block.speaker) != nil
+                        ? "Click to name this speaker"
+                        : "Click to reassign this speaker"
                     speakerAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
                     speakerAttrs[.underlineColor] = speakerColor(block.speaker)
                         .withAlphaComponent(0.35)

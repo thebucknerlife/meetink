@@ -1149,9 +1149,10 @@ except Exception:
 
 # Promote a cluster to a real profile and rewrite the live transcript.
 profile_assign() {
-    local letter="$1" name="$2"
-    if [[ -z "$letter" || -z "$name" ]]; then
-        print -P "${C[red]}usage:${C[reset]} /profile assign <number> <name>"
+    local ref="$1" name="$2"
+    if [[ -z "$ref" || -z "$name" ]]; then
+        print -P "${C[red]}usage:${C[reset]} /profile assign <speaker> <name>"
+        print -P "  ${C[dim]}<speaker> is a number (3), a label (\"Speaker 3\"), or an assigned name (\"GREG\") — reassignment works.${C[reset]}"
         return 1
     fi
     if [[ "$name" == *.* || "$name" == */* ]]; then
@@ -1163,28 +1164,50 @@ profile_assign() {
         return 1
     fi
 
-    local up_letter=$(print -n -- "$letter" | tr '[:lower:]' '[:upper:]')
+    local up_ref=$(print -n -- "$ref" | tr '[:lower:]' '[:upper:]')
+    local up_name=$(print -n -- "$name" | tr '[:lower:]' '[:upper:]')
+    # The label to rewrite in the transcript: bare number → "Speaker N",
+    # anything else is already the literal label on the lines.
+    local old_label="$up_ref"
+    if [[ "$up_ref" == <-> ]]; then
+        old_label="Speaker ${up_ref}"
+    elif [[ "$up_ref" == SPEAKER\ * ]]; then
+        # Transcript lines spell it "Speaker 3" — restore the case the
+        # rewrite has to match.
+        old_label="Speaker ${up_ref#SPEAKER }"
+    fi
+    if [[ "$old_label" == "$up_name" ]]; then
+        print -P "${C[dim]}(that speaker is already ${up_name})${C[reset]}"
+        return 0
+    fi
+
     local resp=$(curl -s -X POST \
-        "http://127.0.0.1:$MK_DIARIZE_PORT/session/assign?cluster=$(_mk_urlq "$up_letter")&name=$(_mk_urlq "$name")")
-    if ! _resp_ok "$resp"; then
+        "http://127.0.0.1:$MK_DIARIZE_PORT/session/assign?cluster=$(_mk_urlq "$up_ref")&name=$(_mk_urlq "$name")")
+    if _resp_ok "$resp"; then
+        local samples=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
+        local added=$(print -- "$resp" | sed -nE 's/.*"added":[[:space:]]*([0-9]+).*/\1/p')
+        local rejected=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*([0-9]+).*/\1/p')
+        print -P "${C[green]}✓${C[reset]} Saved profile ${C[bold]}$name${C[reset]} ${C[dim]}(from ${old_label}, $samples samples total)${C[reset]}"
+        if [[ -n "$rejected" && "$rejected" != "0" ]]; then
+            print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}${rejected} of $(( ${added:-0} + ${rejected:-0} )) cluster samples dropped as outliers (didn't match the profile's voice)${C[reset]}"
+        fi
+    elif print -- "$resp" | grep -q '"no_cluster"'; then
+        # No voice data under that label (older session, or the sidecar
+        # restarted since). Still fix the transcript — renaming the lines
+        # is usually what the user is after; enrollment just can't happen.
+        print -P "${C[yellow]}⚠${C[reset]} No voice data for ${C[bold]}${old_label}${C[reset]} in this session ${C[dim]}— renaming transcript lines only (no profile update)${C[reset]}"
+    else
         print -P "${C[red]}error:${C[reset]} $resp"
         return 1
     fi
-    local samples=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
-    local added=$(print -- "$resp" | sed -nE 's/.*"added":[[:space:]]*([0-9]+).*/\1/p')
-    local rejected=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*([0-9]+).*/\1/p')
-    print -P "${C[green]}✓${C[reset]} Saved profile ${C[bold]}$name${C[reset]} ${C[dim]}(from cluster $up_letter, $samples samples total)${C[reset]}"
-    if [[ -n "$rejected" && "$rejected" != "0" ]]; then
-        print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}${rejected} of $(( ${added:-0} + ${rejected:-0} )) cluster samples dropped as outliers (didn't match the profile's voice)${C[reset]}"
-    fi
 
-    local up_name=$(print -n -- "$name" | tr '[:lower:]' '[:upper:]')
     # -e not -L: imported transcripts are plain files (the app's import
     # window passes MEETINK_TRANSCRIPT pointing straight at one), and
     # _rewrite_transcript_label handles both.
-    if [[ -e "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "Speaker ${up_letter}" "$up_name"; then
+    if [[ -e "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "$old_label" "$up_name"; then
         local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
-        print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}Speaker ${up_letter}${C[reset]} → ${C[bold]}${up_name}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
+        [[ -z "$actual" ]] && actual="$MK_TRANSCRIPT"
+        print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}${old_label}${C[reset]} → ${C[bold]}${up_name}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
     fi
 
     # If the meeting was auto-recorded by /watch, the whitelist may have

@@ -422,6 +422,7 @@ func hasRepetitionLoop(_ text: String) -> Bool {
 final class TranscriptMerger: @unchecked Sendable {
     private let lock = NSLock()
     private var currentSpeaker: String = ""
+    private var currentOrigin: String = ""
     private var currentTimestamp: String = ""
     private var currentText: String = ""
     private var lastAddTime: Date = Date()
@@ -437,11 +438,16 @@ final class TranscriptMerger: @unchecked Sendable {
     private let maxBufferAgeSeconds: TimeInterval =
         TimeInterval(ProcessInfo.processInfo.environment["MEETINK_MERGE_MAX_BUFFER_S"] ?? "") ?? 8.0
 
-    func add(timestamp: String, speaker: String, text: String) {
+    func add(timestamp: String, speaker: String, text: String, origin: String) {
         lock.lock()
 
-        // Flush aged-out same-speaker buffer before appending (for live teleprompter)
-        if speaker == currentSpeaker && !currentText.isEmpty {
+        // Never merge across origins, even under the same label: a mic
+        // chunk and a sys chunk both labeled GREG are the user's voice AND
+        // its remote echo — coalescing them interleaves near-identical
+        // sentences INSIDE one line (field case: every sentence doubled).
+        // Kept as separate lines, the refine pass's echo dedup can kill
+        // the sys copy cleanly.
+        if speaker == currentSpeaker && origin == currentOrigin && !currentText.isEmpty {
             let age = Date().timeIntervalSince(bufferStartTime)
             if age > maxBufferAgeSeconds {
                 let flushSpeaker = currentSpeaker
@@ -469,6 +475,7 @@ final class TranscriptMerger: @unchecked Sendable {
             let flushText = currentText
 
             currentSpeaker = speaker
+            currentOrigin = origin
             currentTimestamp = timestamp
             currentText = text
             bufferStartTime = Date()
@@ -804,7 +811,8 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
             let idx = (i == 0) ? speakerIndex.current() : speakerIndex.increment()
             let label = "THEM-\(speakerLetter(idx))"
             transcriptContext.set(label, text: segment)
-            transcriptMerger.add(timestamp: timestamp, speaker: label, text: segment)
+            transcriptMerger.add(timestamp: timestamp, speaker: label, text: segment,
+                                 origin: "sys")
             fputs("  chunk \(chunkIndex) [\(label)]: \(segment.prefix(70))... (\(elapsed))\n", stderr)
         }
         return
@@ -828,8 +836,20 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
         finalSpeaker = speaker
     }
 
+    // Live echo-kill: a SYSTEM-audio voice identified as the user is, by
+    // definition, an echo — you are never remote in your own meeting. This
+    // happens when another participant's client (speakers + mic, room
+    // system) sends the user's voice back. Requires an enrolled profile;
+    // the refine pass catches what this misses.
+    let origin = (speaker == "THEM") ? "sys" : "mic"
+    if origin == "sys" && finalSpeaker == meName {
+        fputs("  chunk \(chunkIndex) [echo]: sys voice identified as \(meName) — dropped\n", stderr)
+        return
+    }
+
     transcriptContext.set(speaker, text: text)
-    transcriptMerger.add(timestamp: timestamp, speaker: finalSpeaker, text: text)
+    transcriptMerger.add(timestamp: timestamp, speaker: finalSpeaker, text: text,
+                         origin: origin)
     fputs("  chunk \(chunkIndex) [\(finalSpeaker)]: \(text.prefix(70))... (\(elapsed))\n", stderr)
 }
 

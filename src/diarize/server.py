@@ -46,7 +46,12 @@ POST   /profiles/<name>/pop?count=N   drop last N samples, recompute centroid
 
 GET    /session/clusters              list current clusters (letter, count)
 POST   /session/clear                 reset clusters (called by /start)
+POST   /session/load                  replace session clusters with the refine
+                                      pass's final analysis (JSON body); makes
+                                      post-call assignment enroll real voice data
 POST   /session/assign?cluster=A&name=Alice
+                                      cluster accepts an id, "Speaker 3", or an
+                                      assigned label ("GREG") — reassign works
                                       promote cluster A to a real profile
 POST   /session/merge?from=A&into=B   merge cluster A's samples into cluster B
 POST   /session/rename?from=bob&to=flavio
@@ -88,6 +93,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -1235,6 +1241,29 @@ def _find_cluster(letter: str) -> dict | None:
     return None
 
 
+def _find_cluster_by_ref(ref: str) -> dict | None:
+    """Resolve a cluster from any spelling the user has in front of them:
+    a bare id ("3"), the transcript label ("Speaker 3"), or — for clusters
+    loaded from the refine pass — the assigned label itself ("GREG",
+    "ADRIANA 2"). Makes RE-assignment of an already-named speaker work."""
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    up = ref.upper()
+    m = re.match(r"^SPEAKER\s+(\S+)$", up)
+    ids = [up]
+    if m:
+        ids.append(m.group(1))
+    for cand in ids:
+        c = _find_cluster(_resolve_alias(cand))
+        if c is not None:
+            return c
+    for c in clusters:
+        if (c.get("label") or "").upper() == up:
+            return c
+    return None
+
+
 def session_clear() -> None:
     """Reset clusters and the lettering counter. Called on /start."""
     global _next_cluster_idx, _last_cluster_letter, _last_cluster_ts
@@ -1647,6 +1676,41 @@ class Handler(BaseHTTPRequestHandler):
                 print("session: clusters cleared", file=sys.stderr)
                 self._json(200, {"ok": True})
                 return
+            if url.path == "/session/load":
+                # Replace the session's cluster state with the refine pass's
+                # final analysis: {"clusters": [{"label": str,
+                # "embeddings": [[...], ...]}, ...]}. After this, post-call
+                # assignment (app click-to-name, /profile assign) folds
+                # THESE embeddings into profiles — the offline analysis is
+                # no longer discarded at the end of the refine.
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    self._json(400, {"error": "invalid JSON body"})
+                    return
+                incoming = payload.get("clusters") or []
+                session_clear()
+                loaded = 0
+                for item in incoming:
+                    embs = item.get("embeddings") or []
+                    rows = []
+                    for e in embs:
+                        v = np.asarray(e, dtype=np.float32)
+                        if _extractor_dim and v.shape[-1] != _extractor_dim:
+                            continue
+                        rows.append(_l2(v))
+                    if not rows:
+                        continue
+                    M = np.stack(rows)[:CLUSTER_MAX_SAMPLES]
+                    c = _new_cluster(M[0])
+                    c["samples"] = M
+                    c["centroid"] = _l2(M.mean(axis=0))
+                    c["label"] = str(item.get("label") or "").strip() or None
+                    loaded += 1
+                print(f"session: loaded {loaded} refine clusters "
+                      f"(replaces live session state)", file=sys.stderr)
+                self._json(200, {"ok": True, "clusters": loaded})
+                return
             if url.path == "/session/assign":
                 qs = parse_qs(url.query)
                 letter = (qs.get("cluster", [""])[0]).strip().upper()
@@ -1657,13 +1721,15 @@ class Handler(BaseHTTPRequestHandler):
                 if any(c in name for c in "/\\.."):
                     self._json(400, {"error": "invalid name (no slashes or dots)"})
                     return
-                # The letter may have been merged away since the user saw it
-                # in /profile clusters — follow the alias to the survivor.
-                letter = _resolve_alias(letter)
-                cluster = _find_cluster(letter)
+                # Accept a bare id, "Speaker 3", or a refine-assigned
+                # label ("GREG") — and follow merge aliases. This is what
+                # lets an already-named speaker be re-assigned.
+                cluster = _find_cluster_by_ref(letter)
                 if cluster is None:
-                    self._json(404, {"error": f"no cluster named {letter}"})
+                    self._json(404, {"error": f"no cluster named {letter}",
+                                     "no_cluster": True})
                     return
+                letter = cluster["letter"]
                 # Promote the cluster's samples to the profile via
                 # _add_samples_bulk so outlier rejection + k-means kick
                 # in. Re-assigning into an existing profile accumulates

@@ -384,14 +384,44 @@ def offline_diarize_multi(streams: list[dict], port: int,
                     f"mic={mic_seconds(g):.1f}s sim_to_me={float(cents[gi] @ me_cent):.3f} "
                     f"name={names[gi]}")
 
+    # Tiny unnamed clusters are almost never a real extra person — they're
+    # one short interjection whose embedding didn't match anyone. Fold each
+    # into the acoustically nearest substantial cluster when plausibly the
+    # same voice; otherwise label THEM. Never mint "Speaker 23" for a
+    # one-liner (field case: 5 people became 19 labels).
+    fold_into: dict[int, int] = {}
+    substantial = [gi for gi, g in enumerate(groups)
+                   if names[gi] is not None or
+                   (len(g) >= 3 and sum(windows[k][3] - windows[k][2] for k in g) >= 6.0)]
+    for gi, g in enumerate(groups):
+        if names[gi] is not None or gi in substantial:
+            continue
+        best_t, best_sim = None, -1.0
+        for tj in substantial:
+            if tj == gi:
+                continue
+            sim = float(cents[gi] @ cents[tj])
+            if sim > best_sim:
+                best_t, best_sim = tj, sim
+        if best_t is not None and best_sim >= 0.35:
+            fold_into[gi] = best_t
+        else:
+            names[gi] = "THEM"
+
     speaker_n = 0
     labels: list[str] = []
-    for nm in names:
-        if nm is not None:
+    for gi, nm in enumerate(names):
+        if gi in fold_into:
+            labels.append("")  # resolved below, target may not be labeled yet
+        elif nm is not None:
             labels.append(nm)
         else:
             speaker_n += 1
             labels.append(f"Speaker {speaker_n}")
+    for gi, tj in fold_into.items():
+        labels[gi] = labels[tj]
+    if fold_into:
+        log(f"folded {len(fold_into)} tiny cluster(s) into their nearest voice")
 
     win_label: dict[int, str] = {}
     for g, lab in zip(groups, labels):
@@ -444,6 +474,25 @@ def offline_diarize_multi(streams: list[dict], port: int,
 
     log(f"offline diarize: {len(groups)} voices "
         f"({', '.join(sorted(set(labels)))}) across {len(out)} lines")
+
+    # Hand the final clusters (label + sample embeddings) to the sidecar so
+    # the session survives the refine: assigning a speaker AFTER the call —
+    # app click-to-name or /profile assign "Speaker 3" Diogo — folds these
+    # exact embeddings into a voice profile. Without this the offline
+    # analysis was discarded and post-call assignment had nothing to enroll
+    # from. Best-effort: an old sidecar without /session/load just 404s.
+    payload = {"clusters": []}
+    for g, lab in zip(groups, labels):
+        sample_idx = g if len(g) <= 40 else             [g[int(k * (len(g) - 1) / 39)] for k in range(40)]
+        payload["clusters"].append({
+            "label": lab,
+            "embeddings": [E[k].tolist() for k in sample_idx],
+        })
+    resp = _http_json(f"http://127.0.0.1:{port}/session/load",
+                      data=json.dumps(payload).encode())
+    if resp and resp.get("ok"):
+        log(f"session clusters handed to sidecar ({len(groups)} clusters) — "
+            f"post-call /profile assign works from these")
     return out
 
 
@@ -541,14 +590,57 @@ def main() -> int:
     if args.mic and args.sys_:
         import difflib
 
+        me_lab = (args.me or "").strip().upper()
+
         def norm(t: str) -> str:
             return re.sub(r"[^a-z0-9 ]", "", t.lower()).strip()
 
+        def echo_match(a: str, b: str) -> bool:
+            # Containment first: a sys echo often arrives as FRAGMENTS of
+            # one long mic sentence, which line-vs-line similarity misses.
+            # Length floor keeps a stray "yeah" from matching everything.
+            if not a or not b:
+                return False
+            if len(a) < 10 or len(b) < 10:
+                return a == b
+            if min(len(a), len(b)) >= 12 and (a in b or b in a):
+                return True
+            return difflib.SequenceMatcher(None, a, b).ratio() >= 0.75
+
+        # Pass 1 — remote echo of the USER. You cannot legitimately be on
+        # your own meeting's system audio: any sys entry that (a) got the
+        # user's label from the joint clusterer, or (b) textually echoes a
+        # nearby mic line spoken by the user, is someone's echoey client
+        # sending your voice back (field case: headphones on, every
+        # sentence doubled, phantom 'Speaker 6' speaking only fragments of
+        # the user's sentences).
+        dropped_self = 0
+        if me_lab:
+            mic_me = [(t, norm(x)) for t, lab, x, o in entries
+                      if o == "mic" and lab == me_lab]
+            kept = []
+            for t, lab, text, origin in entries:
+                if origin == "sys":
+                    if lab == me_lab:
+                        dropped_self += 1
+                        continue
+                    nt = norm(text)
+                    if any(abs(mt - t) <= 6.0 and echo_match(nt, mx)
+                           for mt, mx in mic_me):
+                        dropped_self += 1
+                        continue
+                kept.append((t, lab, text, origin))
+            entries = kept
+
+        # Pass 2 — speaker bleed INTO the mic (no headphones): a mic entry
+        # that echoes nearby system audio is the room speakers, and the sys
+        # copy is authoritative. Never drop the user's own mic lines here —
+        # their sys echoes were already removed in pass 1.
         sys_entries = [(t, norm(x)) for t, _, x, o in entries if o == "sys"]
         deduped = []
         dropped = 0
         for t, lab, text, origin in entries:
-            if origin == "mic":
+            if origin == "mic" and lab != me_lab:
                 nt = norm(text)
                 echo = False
                 for st, sx in sys_entries:
@@ -557,18 +649,19 @@ def main() -> int:
                     if len(nt) < 10:
                         echo = nt == sx and abs(st - t) <= 3.0
                     else:
-                        echo = difflib.SequenceMatcher(
-                            None, nt, sx).ratio() >= 0.75
+                        echo = echo_match(nt, sx)
                     if echo:
                         break
                 if echo:
                     dropped += 1
                     continue
             deduped.append((t, lab, text, origin))
-        if dropped:
-            log(f"echo suppression: dropped {dropped} mic lines duplicated "
-                f"in system audio (speakers instead of headphones?)")
-            print(f"refine: status removed {dropped} echoed lines", flush=True)
+        total_dropped = dropped + dropped_self
+        if total_dropped:
+            log(f"echo suppression: dropped {dropped_self} sys echoes of the "
+                f"user + {dropped} mic lines duplicated from system audio")
+            print(f"refine: status removed {total_dropped} echoed lines",
+                  flush=True)
         entries = deduped
 
     # Wall-clock line stamps when we know the session start (matches the
