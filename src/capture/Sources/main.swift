@@ -1080,7 +1080,14 @@ struct LocalSpeechCapture {
         }
 
         // --- System audio via ScreenCaptureKit ---
+        // BOTH references must outlive this block. SCStream does NOT
+        // strongly retain its delegate/stream-output — when the sim-mode
+        // refactor moved `let delegate` to block scope, the delegate
+        // deallocated at the closing brace and SCK kept "capturing" into a
+        // dead object: startCapture() succeeds, zero errors, zero samples,
+        // 0-byte sys spool (field-debugged mid-Zoom-call 2026-08-04).
         var scStream: SCStream? = nil
+        var scDelegate: CaptureDelegate? = nil
         if !simMode {
         fputs("Requesting screen capture permission...\n", stderr)
 
@@ -1122,6 +1129,7 @@ struct LocalSpeechCapture {
         }
 
         scStream = stream
+        scDelegate = delegate
         fputs("System audio capture started\n", stderr)
         }
 
@@ -1382,6 +1390,10 @@ struct LocalSpeechCapture {
         if let scStream {
             try await scStream.stopCapture()
         }
+        // Keep the SCK delegate alive until AFTER capture stops. ARC frees
+        // a local at its last USE, not at scope end — without this read the
+        // delegate dies right after setup and sys audio silently flatlines.
+        withExtendedLifetime(scDelegate) {}
 
         // Flush any buffered merged transcript lines
         transcriptMerger.flushAll()
