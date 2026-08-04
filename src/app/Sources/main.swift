@@ -43,6 +43,29 @@ func configValue(_ key: String) -> String? {
     return nil
 }
 
+/// Truthy spelling matches the launcher's mk_config_bool: true/on/1.
+func configBool(_ key: String) -> Bool {
+    guard let v = configValue(key) else { return false }
+    return v == "true" || v == "on" || v == "1"
+}
+
+/// Rewrite one key=value line in ~/.meetink/config, preserving every other
+/// line. Same file the launcher and REPL read — the Settings page is just
+/// another writer of the shared config surface.
+func configSetValue(_ key: String, _ value: String) {
+    let path = "\(mkHome)/config"
+    var lines = ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map(String.init)
+    while let last = lines.last, last.isEmpty { lines.removeLast() }
+    lines.removeAll { $0.hasPrefix("\(key)=") }
+    lines.append("\(key)=\(value)")
+    try? FileManager.default.createDirectory(
+        atPath: mkHome, withIntermediateDirectories: true)
+    try? (lines.joined(separator: "\n") + "\n")
+        .write(toFile: path, atomically: true, encoding: .utf8)
+}
+
 /// The live-transcript symlink path, honoring the active project the same
 /// way the launcher resolves it.
 func liveSymlinkPath() -> String {
@@ -638,17 +661,32 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         let items = (try? fm.contentsOfDirectory(atPath: dir)) ?? []
         var out: [(String, String, Date)] = []
         for item in items {
-            guard item.hasSuffix(".txt"),
-                  item != "live.txt",
-                  !item.hasSuffix(".live-raw.txt") else { continue }
-            let path = dir + "/" + item
-            // Skip the symlink target duplicate view: list real files only.
+            var path = dir + "/" + item
             var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else { continue }
+            guard fm.fileExists(atPath: path, isDirectory: &isDir) else { continue }
+            let base: String
+            if isDir.boolValue {
+                // Per-session folder: the transcript inside is named after
+                // the folder. Anything else (project dirs, _context, .idx)
+                // won't have that file and is skipped.
+                guard !item.hasPrefix("."), !item.hasPrefix("_"),
+                      !item.hasSuffix(".idx") else { continue }
+                let candidate = path + "/" + item + ".txt"
+                guard fm.fileExists(atPath: candidate) else { continue }
+                path = candidate
+                base = item
+            } else {
+                // Legacy flat transcript. `live.txt` is a symlink and its
+                // lstat says "file" only when we follow it — skip by name.
+                guard item.hasSuffix(".txt"),
+                      item != "live.txt",
+                      !item.hasSuffix(".live-raw.txt") else { continue }
+                base = String(item.dropLast(4))
+            }
             let attrs = (try? fm.attributesOfItem(atPath: path)) ?? [:]
             let date = (attrs[.modificationDate] as? Date) ?? .distantPast
             // Display name: strip the timestamp prefix, prettify the slug.
-            var name = String(item.dropLast(4))
+            var name = base
             if let r = name.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
                                   options: .regularExpression) {
                 name.removeSubrange(r)
@@ -1067,6 +1105,83 @@ final class UploadViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 }
 
+// MARK: - Settings page
+
+/// Checkbox settings, persisted as key=value lines in ~/.meetink/config —
+/// the same file the launcher reads (mk_config_bool), so a toggle here
+/// changes behavior on the very next recording with no restart of anything.
+final class SettingsViewController: NSViewController {
+    private let keepSpoolsBox = NSButton(
+        checkboxWithTitle: "Keep audio spools", target: nil, action: nil)
+    private let keepAudioBox = NSButton(
+        checkboxWithTitle: "Keep audio recording", target: nil, action: nil)
+
+    override func loadView() {
+        let root = NSView()
+
+        let title = NSTextField(labelWithString: "Settings")
+        title.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+
+        keepAudioBox.target = self
+        keepAudioBox.action = #selector(toggled(_:))
+        keepSpoolsBox.target = self
+        keepSpoolsBox.action = #selector(toggled(_:))
+
+        func caption(_ text: String) -> NSTextField {
+            let f = NSTextField(wrappingLabelWithString: text)
+            f.font = NSFont.systemFont(ofSize: 11)
+            f.textColor = .secondaryLabelColor
+            return f
+        }
+
+        let audioCaption = caption(
+            "After each meeting (or file import), save the audio as a single "
+            + "listenable .m4a in the meeting's folder.")
+        let spoolsCaption = caption(
+            "Keep the raw microphone and system-audio streams as two separate "
+            + "wav files — replayable end-to-end with `meetink simulate`.")
+        let footnote = caption(
+            "Applies from the next recording. Stored in ~/.meetink/config "
+            + "(keep_audio, keep_spools).")
+
+        let stack = NSStackView(views: [
+            title,
+            keepAudioBox, audioCaption,
+            keepSpoolsBox, spoolsCaption,
+            footnote,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.setCustomSpacing(20, after: title)
+        stack.setCustomSpacing(2, after: keepAudioBox)
+        stack.setCustomSpacing(18, after: audioCaption)
+        stack.setCustomSpacing(2, after: keepSpoolsBox)
+        stack.setCustomSpacing(28, after: spoolsCaption)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 24),
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -24),
+            stack.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
+        ])
+        self.view = root
+    }
+
+    override func viewWillAppear() {
+        super.viewWillAppear()
+        keepAudioBox.state = configBool("keep_audio") ? .on : .off
+        keepSpoolsBox.state = configBool("keep_spools") ? .on : .off
+    }
+
+    @objc private func toggled(_ sender: NSButton) {
+        let key = sender == keepAudioBox ? "keep_audio" : "keep_spools"
+        configSetValue(key, sender.state == .on ? "true" : "false")
+    }
+}
+
 // MARK: - Main window (status strip + sidebar + detail)
 
 final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
@@ -1084,6 +1199,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     let vocabVC = VocabViewController()
     let uploadVC = UploadViewController()
     let readerVC = TranscriptViewController()
+    let settingsVC = SettingsViewController()
+    private let settingsButton = NSButton()
 
     private var pollTimer: Timer?
 
@@ -1153,6 +1270,22 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         sidebar.style = .sourceList
         sideScroll.documentView = sidebar
 
+        // Settings, pinned at the bottom of the sidebar (below the nav
+        // table, above nothing — it never scrolls away).
+        settingsButton.title = "Settings"
+        if let gear = NSImage(systemSymbolName: "gearshape",
+                              accessibilityDescription: "Settings") {
+            settingsButton.image = gear
+            settingsButton.imagePosition = .imageLeading
+        }
+        settingsButton.isBordered = false
+        settingsButton.alignment = .left
+        settingsButton.font = NSFont.systemFont(ofSize: 13)
+        settingsButton.contentTintColor = .secondaryLabelColor
+        settingsButton.target = self
+        settingsButton.action = #selector(openSettings)
+        settingsButton.translatesAutoresizingMaskIntoConstraints = false
+
         let sideDivider = NSBox()
         sideDivider.boxType = .separator
         sideDivider.translatesAutoresizingMaskIntoConstraints = false
@@ -1162,6 +1295,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         content.addSubview(strip)
         content.addSubview(stripDivider)
         content.addSubview(sideScroll)
+        content.addSubview(settingsButton)
         content.addSubview(sideDivider)
         content.addSubview(detailContainer)
         NSLayoutConstraint.activate([
@@ -1175,7 +1309,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             sideScroll.topAnchor.constraint(equalTo: stripDivider.bottomAnchor),
             sideScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             sideScroll.widthAnchor.constraint(equalToConstant: 150),
-            sideScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            sideScroll.bottomAnchor.constraint(equalTo: settingsButton.topAnchor, constant: -4),
+            settingsButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            settingsButton.widthAnchor.constraint(equalToConstant: 130),
+            settingsButton.heightAnchor.constraint(equalToConstant: 26),
+            settingsButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
             sideDivider.topAnchor.constraint(equalTo: stripDivider.bottomAnchor),
             sideDivider.leadingAnchor.constraint(equalTo: sideScroll.trailingAnchor),
             sideDivider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
@@ -1222,8 +1360,14 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         switch index {
         case 0: setDetail(meetingsVC)
         case 1: setDetail(vocabVC)
+        case 3: setDetail(settingsVC)
         default: setDetail(uploadVC)
         }
+    }
+
+    @objc private func openSettings() {
+        sidebar.deselectAll(nil)
+        showPage(3)
     }
 
     func openTranscript(_ path: String?) {
