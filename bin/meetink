@@ -68,6 +68,15 @@ if [[ -z "$MK_MODEL" ]]; then
     MK_MODEL=$(model_path "$(model_active)")
 fi
 
+# Read a boolean key from $MK_HOME/config (key=value lines). Truthy:
+# true/on/1; anything else (or absent) is false. The Settings page in
+# Meetink.app reads and writes these same keys (keep_audio, keep_spools).
+mk_config_bool() {
+    [[ -f "$MK_CONFIG_FILE" ]] || return 1
+    local v=$(grep "^$1=" "$MK_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+    [[ "$v" == "true" || "$v" == "on" || "$v" == "1" ]]
+}
+
 # Code-signing identity for the app bundles. TCC (mic / screen recording)
 # keys grants to the SIGNATURE, and an ad-hoc signature is a content hash —
 # every rebuild mints a new identity and silently invalidates every grant
@@ -753,7 +762,14 @@ cmd_start() {
     # which keeps `/tail` and any external "tail -f live.txt" working.
     # Pre-create (touch) so window_open_tail's `tail -f` doesn't race the
     # Swift binary's first write — its header.write() will overwrite anyway.
-    local session_file="$MK_TRANSCRIPTS_DIR/$(date '+%Y-%m-%d_%H-%M-%S').txt"
+    # Each session gets its own FOLDER, named like the transcript inside it
+    # (titling renames both in lockstep). Everything the session produces —
+    # transcript, .live-raw, summary, .idx, kept audio — lives inside, so
+    # one meeting is one self-contained directory.
+    local session_stamp=$(date '+%Y-%m-%d_%H-%M-%S')
+    local session_dir="$MK_TRANSCRIPTS_DIR/$session_stamp"
+    mkdir -p "$session_dir"
+    local session_file="$session_dir/$session_stamp.txt"
     touch "$session_file"
     ln -sfn "$session_file" "$MK_TRANSCRIPT"
 
@@ -793,8 +809,11 @@ cmd_start() {
     # Spool the session audio for the post-meeting refine pass (parakeet
     # re-transcription with full context). Only when the venv is installed
     # and refine isn't disabled — no venv, no spool, no disk cost.
+    # Spool when refine needs it OR when the user wants the audio kept
+    # (Settings → keep audio / keep audio spools) — archiving at /stop
+    # reads the same spool files.
     local spool_env=""
-    if refine_enabled 2>/dev/null; then
+    if refine_enabled 2>/dev/null || mk_config_bool keep_audio || mk_config_bool keep_spools; then
         refine_clear_spool
         mkdir -p "$MK_SPOOL_DIR"
         spool_env="$MK_SPOOL_DIR"
@@ -875,6 +894,14 @@ cmd_stop() {
     # diarize_consolidate_transcript in src/lib/diarize.sh.
     if typeset -f diarize_consolidate_transcript >/dev/null 2>&1; then
         diarize_consolidate_transcript "$MK_TRANSCRIPT"
+    fi
+
+    # Archive the session audio into the meeting folder when the user asked
+    # for it (Settings: keep_audio mixes a listenable .m4a; keep_spools keeps
+    # the two raw streams as wavs, replayable via `meetink simulate`). Must
+    # run BEFORE refine_session — refine deletes the spools on success.
+    if typeset -f audio_archive_session >/dev/null 2>&1; then
+        audio_archive_session "$MK_TRANSCRIPT"
     fi
 
     # Re-transcribe the whole session with full acoustic context (parakeet)

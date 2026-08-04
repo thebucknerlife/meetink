@@ -27,7 +27,10 @@ _ask_transcript_path() {
     [[ -f "$MK_TRANSCRIPT" ]] && { print -- "$MK_TRANSCRIPT"; return; }
     # Latest by mtime in the project's transcripts dir (excluding the symlink).
     setopt local_options null_glob
-    local -a files=("$MK_TRANSCRIPTS_DIR"/*.txt(N.om))
+    # Transcripts live flat (legacy) or inside per-session folders; two
+    # globs are each mtime-sorted, so re-merge with a global `ls -t`.
+    local -a files=("$MK_TRANSCRIPTS_DIR"/*.txt(N.om) "$MK_TRANSCRIPTS_DIR"/*/*.txt(N.om))
+    (( ${#files[@]} > 1 )) && files=(${(f)"$(command ls -t -- "${files[@]}" 2>/dev/null)"})
     local f
     for f in "${files[@]}"; do
         [[ -L "$f" ]] && continue

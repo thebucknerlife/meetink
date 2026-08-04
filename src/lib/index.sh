@@ -93,7 +93,7 @@ index_status() {
 
     # Per-transcript index report for the active project.
     setopt local_options null_glob
-    local -a idx_dirs=("$MK_TRANSCRIPTS_DIR"/*.idx(N/))
+    local -a idx_dirs=("$MK_TRANSCRIPTS_DIR"/*.idx(N/) "$MK_TRANSCRIPTS_DIR"/*/*.idx(N/))
     if (( ${#idx_dirs[@]} == 0 )); then
         print -P "  ${C[dim]}No indexed transcripts in this project yet.${C[reset]}"
         return 0
@@ -144,7 +144,7 @@ index_remove() {
     fi
     # Default: remove sidecar dirs in the active project.
     setopt local_options null_glob
-    local -a idx_dirs=("$MK_TRANSCRIPTS_DIR"/*.idx(N/))
+    local -a idx_dirs=("$MK_TRANSCRIPTS_DIR"/*.idx(N/) "$MK_TRANSCRIPTS_DIR"/*/*.idx(N/))
     if (( ${#idx_dirs[@]} == 0 )); then
         print -P "${C[dim]}No .idx sidecars to remove.${C[reset]}"
         return 0

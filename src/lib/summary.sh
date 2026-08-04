@@ -185,7 +185,11 @@ meetings_log_rebuild() {
     # Sort summaries newest-first by lexical filename order. The transcript
     # filenames start with YYYY-MM-DD_HH-MM, which sorts correctly as text
     # (no need to stat-mtime each one). `(On)` reverses the default order.
-    local -a all=("$proj_dir"/*.summary.md(.On))
+    # Summaries live flat (legacy) or inside per-session folders. Each glob
+    # sorts independently, so merge and re-sort by BASENAME descending (the
+    # basename starts with the session date either way).
+    local -a all=("$proj_dir"/*.summary.md(.N) "$proj_dir"/*/*.summary.md(.N))
+    (( ${#all[@]} )) && all=(${(f)"$(print -rl -- "${all[@]}" | awk -F/ '{print $NF "\t" $0}' | sort -r | cut -f2-)"})
     if (( ${#all[@]} == 0 )); then
         # No summaries exist yet — remove a stale meetings.md if any.
         rm -f "$out"

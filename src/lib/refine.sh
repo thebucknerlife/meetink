@@ -121,6 +121,67 @@ refine_session() {
     fi
 }
 
+# Archive the just-stopped session's audio next to its transcript (i.e.
+# into the per-session folder). Two independent knobs from $MK_HOME/config:
+#   keep_audio  → <base>.m4a  — mic+sys mixed into one listenable file
+#   keep_spools → <base>.mic.wav / <base>.sys.wav — the two raw streams,
+#                 replayable through `meetink simulate --mic/--sys`
+# Called from cmd_stop BEFORE refine_session (refine deletes the raw spools
+# on success). Best-effort — never blocks the stop pipeline. Titling later
+# renames these in lockstep with the transcript (same-basename rule).
+audio_archive_session() {
+    local keep_audio=0 keep_spools=0
+    mk_config_bool keep_audio && keep_audio=1
+    mk_config_bool keep_spools && keep_spools=1
+    (( keep_audio || keep_spools )) || return 0
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        print -P "${C[yellow]}⚠${C[reset]} keep audio: ffmpeg not found — skipping"
+        return 0
+    fi
+
+    local actual="$1"
+    [[ -L "$actual" ]] && actual=$(readlink "$actual" 2>/dev/null)
+    [[ -f "$actual" ]] || return 0
+    local mic="$MK_SPOOL_DIR/session-mic.raw"
+    local sys="$MK_SPOOL_DIR/session-sys.raw"
+    [[ -s "$mic" || -s "$sys" ]] || return 0
+
+    local base="${actual%.txt}"
+    local -a raw=(-f s16le -ar 16000 -ac 1)
+    if (( keep_audio )); then
+        local rc=0
+        if [[ -s "$mic" && -s "$sys" ]]; then
+            ffmpeg -v error -y "${raw[@]}" -i "$mic" "${raw[@]}" -i "$sys" \
+                -filter_complex "amix=inputs=2:duration=longest:normalize=0" \
+                -c:a aac -b:a 96k "${base}.m4a" 2>>/tmp/meetink-refine.log || rc=$?
+        else
+            local only="$mic"
+            [[ -s "$sys" ]] && only="$sys"
+            ffmpeg -v error -y "${raw[@]}" -i "$only" \
+                -c:a aac -b:a 96k "${base}.m4a" 2>>/tmp/meetink-refine.log || rc=$?
+        fi
+        if (( rc == 0 )); then
+            print -P "${C[green]}✓${C[reset]} Audio kept: ${C[dim]}${base:t}.m4a${C[reset]}"
+        else
+            print -P "${C[yellow]}⚠${C[reset]} keep audio: mixdown failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
+        fi
+    fi
+    if (( keep_spools )); then
+        local kept=""
+        if [[ -s "$mic" ]] && ffmpeg -v error -y "${raw[@]}" -i "$mic" "${base}.mic.wav" 2>>/tmp/meetink-refine.log; then
+            kept="${base:t}.mic.wav"
+        fi
+        if [[ -s "$sys" ]] && ffmpeg -v error -y "${raw[@]}" -i "$sys" "${base}.sys.wav" 2>>/tmp/meetink-refine.log; then
+            kept="${kept:+$kept / }${base:t}.sys.wav"
+        fi
+        [[ -n "$kept" ]] && print -P "${C[green]}✓${C[reset]} Spools kept: ${C[dim]}${kept}${C[reset]}"
+    fi
+    # When refine won't run (it normally deletes the spools itself), tidy
+    # now so stale audio can't bleed into the next session.
+    refine_enabled 2>/dev/null || rm -f "$mic" "$sys"
+    return 0
+}
+
 # Import an audio file as a transcript: decode → parakeet → diarize →
 # title → summary. The transcript lands in the active project's folder and
 # live.txt points at it (unless a recording is in flight), so the app
@@ -147,8 +208,11 @@ cmd_refine() {
     local base="${${input:t}:r}"
     # Sanitize for a filename: keep alnum/dash/underscore.
     base=$(print -rn -- "$base" | tr -c 'A-Za-z0-9_-' '-' | sed 's/--*/-/g')
-    local out="$MK_TRANSCRIPTS_DIR/$(date +%Y-%m-%d_%H-%M)_import-${base}.txt"
-    mkdir -p "$MK_TRANSCRIPTS_DIR"
+    # Imports get a per-session folder too (same layout as recordings).
+    local sess="$(date +%Y-%m-%d_%H-%M)_import-${base}"
+    local sess_dir="$MK_TRANSCRIPTS_DIR/$sess"
+    mkdir -p "$sess_dir"
+    local out="$sess_dir/$sess.txt"
 
     print -P "${C[bright_yellow]}▸${C[reset]} Transcribing ${C[bold]}${input:t}${C[reset]} ${C[dim]}(parakeet)...${C[reset]}"
     _refine_lock
@@ -162,6 +226,13 @@ cmd_refine() {
     fi
     local n=$(grep -cE '^\[[0-9:]{8}\]' "$out" 2>/dev/null)
     print -P "${C[green]}✓${C[reset]} Transcribed: ${C[bright_cyan]}${out/$HOME/~}${C[reset]} ${C[dim]}(${n} lines)${C[reset]}"
+
+    # Settings: keep audio → the source file moves in next to the transcript
+    # (a copy — the user's original stays where it was).
+    local ext="${input:e}"
+    if mk_config_bool keep_audio && [[ -n "$ext" ]]; then
+        cp "$input" "$sess_dir/$sess.$ext" 2>/dev/null || true
+    fi
 
     # Point live.txt at the import so the app window shows it — but never
     # steal the symlink from an in-flight recording.
@@ -186,7 +257,7 @@ cmd_refine() {
     # inode, so this finds OUR file no matter what it was renamed to.
     local final="$out"
     if [[ -n "$ino" ]]; then
-        local by_ino=$(find "$MK_TRANSCRIPTS_DIR" -maxdepth 1 -name '*.txt' -inum "$ino" 2>/dev/null | head -1)
+        local by_ino=$(find "$MK_TRANSCRIPTS_DIR" -maxdepth 2 -name '*.txt' -inum "$ino" 2>/dev/null | head -1)
         [[ -n "$by_ino" && -f "$by_ino" ]] && final="$by_ino"
     fi
     [[ -f "$final" ]] || final="$out"

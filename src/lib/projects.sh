@@ -70,6 +70,10 @@ project_list_names() {
     for d in "$MK_TRANSCRIPTS_BASE"/*(/N); do
         local name="${d:t}"
         [[ "$name" == .* || "$name" == _* ]] && continue
+        # Per-session meeting folders (YYYY-MM-DD_… — see cmd_start) and
+        # .idx sidecars also live here; they are not projects.
+        [[ "$name" == [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]* ]] && continue
+        [[ "$name" == *.idx ]] && continue
         print -- "$name"
     done
 }
