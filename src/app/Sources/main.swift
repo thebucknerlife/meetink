@@ -1303,7 +1303,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     private let stripDot = NSTextField(labelWithString: "●")
     private let stripLabel = NSTextField(labelWithString: "")
+    private let recordButton = NSButton(title: "Start Recording", target: nil, action: nil)
     private let liveButton = NSButton(title: "Open Live Transcript", target: nil, action: nil)
+    /// Wired by AppDelegate to the same start/stop paths the menubar uses.
+    var onStartRecording: (() -> Void)?
+    var onStopRecording: (() -> Void)?
 
     private let detailContainer = NSView()
     private var currentDetail: NSViewController?
@@ -1357,6 +1361,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         strip.translatesAutoresizingMaskIntoConstraints = false
         stripDot.font = NSFont.systemFont(ofSize: 12)
         stripLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        recordButton.bezelStyle = .rounded
+        recordButton.controlSize = .small
+        recordButton.target = self
+        recordButton.action = #selector(toggleRecording)
         liveButton.bezelStyle = .rounded
         liveButton.controlSize = .small
         liveButton.target = self
@@ -1364,6 +1372,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         strip.addArrangedSubview(stripDot)
         strip.addArrangedSubview(stripLabel)
         strip.addArrangedSubview(NSView())
+        strip.addArrangedSubview(recordButton)
         strip.addArrangedSubview(liveButton)
 
         let stripDivider = NSBox()
@@ -1496,10 +1505,24 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         openTranscript(nil)
     }
 
+    @objc private func toggleRecording() {
+        // Disable until the next strip poll confirms the state flip — a
+        // double-click must not fire start twice (or stop a just-started
+        // recording).
+        recordButton.isEnabled = false
+        if recordingPID() != nil {
+            onStopRecording?()
+        } else {
+            onStartRecording?()
+        }
+    }
+
     private func updateStrip() {
         let recording = recordingPID() != nil
         stripDot.textColor = recording ? .systemRed : .tertiaryLabelColor
         stripLabel.stringValue = recording ? "Recording" : "Not recording"
+        recordButton.title = recording ? "Stop Recording" : "Start Recording"
+        recordButton.isEnabled = true
         liveButton.title = recording ? "Open Live Transcript" : "Open Latest Transcript"
     }
 
@@ -1789,6 +1812,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showApp(page: Int? = nil) {
         if mainWC == nil {
             mainWC = MainWindowController(forRealUse: true)
+            mainWC?.onStartRecording = { [weak self] in self?.startRecording() }
+            mainWC?.onStopRecording = { [weak self] in self?.stopRecording() }
         }
         NSApp.setActivationPolicy(.regular)
         mainWC?.showWindow(nil)
