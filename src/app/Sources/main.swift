@@ -1184,6 +1184,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             detailContainer.leadingAnchor.constraint(equalTo: sideDivider.trailingAnchor),
             detailContainer.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             detailContainer.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            // Without a floor here the whole lower region has no minimum,
+            // Auto Layout collapses the window to its 36 pt fitting size,
+            // and the frame autosave then faithfully preserves the collapse
+            // forever (field case: "I only see the status bar").
+            detailContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 360),
         ])
 
         meetingsVC.onOpen = { [weak self] path in
@@ -1530,6 +1535,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.setActivationPolicy(.regular)
         mainWC?.showWindow(nil)
+        // Recover from any collapsed autosaved frame (see the constraint
+        // floor in MainWindowController.buildUI).
+        if let w = mainWC?.window, w.frame.height < 450 {
+            w.setContentSize(NSSize(width: max(w.frame.width, 960), height: 680))
+            w.center()
+        }
         mainWC?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         if let page {
