@@ -292,9 +292,12 @@ final class DropContainerView: NSView {
 
 // MARK: - Transcript page (live or archived)
 
-final class TranscriptViewController: NSViewController, NSTextViewDelegate {
+final class TranscriptViewController: NSViewController, NSTextViewDelegate,
+                                      NSTableViewDataSource, NSTableViewDelegate {
     private let textView = NSTextView()
     private let headerField = NSTextField(labelWithString: "")
+    private let speakersTable = NSTableView()
+    private var speakers: [(name: String, fraction: Double)] = []
     private let statusDot = NSTextField(labelWithString: "●")
     private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
     private let jumpButton = NSButton(title: "", target: nil, action: nil)
@@ -338,6 +341,32 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate {
         divider.boxType = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
 
+        // Speakers panel — left of the transcript, under the status bar.
+        // Live talk-share per speaker, same colors as the transcript;
+        // clicking a row opens the same name/reassign dialog as clicking
+        // a label inline.
+        let speakersScroll = NSScrollView()
+        speakersScroll.translatesAutoresizingMaskIntoConstraints = false
+        speakersScroll.hasVerticalScroller = true
+        speakersScroll.autohidesScrollers = true
+        speakersScroll.drawsBackground = false
+        let speakerCol = NSTableColumn(identifier: .init("speaker"))
+        speakersTable.addTableColumn(speakerCol)
+        speakersTable.headerView = nil
+        speakersTable.rowHeight = 26
+        speakersTable.backgroundColor = .clear
+        speakersTable.selectionHighlightStyle = .none
+        speakersTable.intercellSpacing = NSSize(width: 0, height: 2)
+        speakersTable.dataSource = self
+        speakersTable.delegate = self
+        speakersTable.target = self
+        speakersTable.action = #selector(speakerRowClicked)
+        speakersScroll.documentView = speakersTable
+
+        let panelDivider = NSBox()
+        panelDivider.boxType = .separator
+        panelDivider.translatesAutoresizingMaskIntoConstraints = false
+
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.hasVerticalScroller = true
@@ -372,6 +401,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate {
 
         content.addSubview(header)
         content.addSubview(divider)
+        content.addSubview(speakersScroll)
+        content.addSubview(panelDivider)
         content.addSubview(scroll)
         content.addSubview(jumpButton)
         NSLayoutConstraint.activate([
@@ -382,11 +413,19 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate {
             divider.topAnchor.constraint(equalTo: header.bottomAnchor),
             divider.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            speakersScroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            speakersScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            speakersScroll.widthAnchor.constraint(equalToConstant: 170),
+            speakersScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            panelDivider.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            panelDivider.leadingAnchor.constraint(equalTo: speakersScroll.trailingAnchor),
+            panelDivider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            panelDivider.widthAnchor.constraint(equalToConstant: 1),
             scroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.leadingAnchor.constraint(equalTo: panelDivider.trailingAnchor),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            jumpButton.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            jumpButton.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
             jumpButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
 
@@ -539,6 +578,68 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate {
         }
     }
 
+    private func updateSpeakersPanel() {
+        let fresh = snapshot.talkShare.map { (name: $0.speaker, fraction: $0.fraction) }
+        // Reload only on change — a reload mid-click would eat the click.
+        if fresh.map(\.name) != speakers.map(\.name)
+            || fresh.map({ Int($0.fraction * 100) }) != speakers.map({ Int($0.fraction * 100) }) {
+            speakers = fresh
+            speakersTable.reloadData()
+        }
+    }
+
+    @objc private func speakerRowClicked() {
+        let row = speakersTable.clickedRow
+        guard row >= 0, row < speakers.count else { return }
+        promptForName(label: speakers[row].name)
+    }
+
+    // Speakers panel table.
+    func numberOfRows(in tableView: NSTableView) -> Int { speakers.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?,
+                   row: Int) -> NSView? {
+        let cellID = NSUserInterfaceItemIdentifier("speaker-cell")
+        let cell: NSTableCellView
+        let nameField: NSTextField
+        let pctField: NSTextField
+        if let reused = tableView.makeView(withIdentifier: cellID, owner: self) as? NSTableCellView,
+           reused.subviews.count >= 2,
+           let n = reused.subviews[0] as? NSTextField,
+           let p = reused.subviews[1] as? NSTextField {
+            cell = reused; nameField = n; pctField = p
+        } else {
+            cell = NSTableCellView()
+            cell.identifier = cellID
+            nameField = NSTextField(labelWithString: "")
+            nameField.font = NSFont.boldSystemFont(ofSize: 12)
+            nameField.lineBreakMode = .byTruncatingTail
+            nameField.translatesAutoresizingMaskIntoConstraints = false
+            pctField = NSTextField(labelWithString: "")
+            pctField.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            pctField.textColor = .secondaryLabelColor
+            pctField.alignment = .right
+            pctField.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(nameField)
+            cell.addSubview(pctField)
+            NSLayoutConstraint.activate([
+                nameField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 12),
+                nameField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                pctField.leadingAnchor.constraint(greaterThanOrEqualTo: nameField.trailingAnchor, constant: 6),
+                pctField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -12),
+                pctField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                pctField.widthAnchor.constraint(equalToConstant: 38),
+            ])
+        }
+        let sp = speakers[row]
+        nameField.stringValue = sp.name
+        nameField.textColor = speakerColor(sp.name)
+        nameField.toolTip = unknownSpeakerNumber(sp.name) != nil
+            ? "Click to name this speaker" : "Click to reassign this speaker"
+        pctField.stringValue = "\(Int((sp.fraction * 100).rounded()))%"
+        return cell
+    }
+
     private func render(empty: Bool) {
         let wasPinned = pinnedToBottom
         let out = NSMutableAttributedString()
@@ -620,12 +721,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate {
         if fixedPath == nil && !recording && snapshot.lines.isEmpty {
             parts = ["not recording"]
         }
-        let shares = snapshot.talkShare.prefix(5)
-            .map { "\($0.speaker) \(Int(($0.fraction * 100).rounded()))%" }
-        if !shares.isEmpty {
-            parts.append(shares.joined(separator: " · "))
-        }
         headerField.stringValue = parts.joined(separator: "   ")
+        updateSpeakersPanel()
     }
 }
 
