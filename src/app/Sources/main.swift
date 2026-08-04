@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 
 // meetink-app — the native companion, now a full (if small) app:
@@ -158,6 +159,9 @@ struct SpeakerBlock {
     let timestamp: String
     let speaker: String
     var text: String
+    // Constituent transcript lines (index into snapshot.lines + text) so the
+    // player can highlight and seek at line granularity inside merged blocks.
+    var parts: [(line: Int, text: String)]
 }
 
 struct TranscriptSnapshot {
@@ -167,13 +171,15 @@ struct TranscriptSnapshot {
 
     var blocks: [SpeakerBlock] {
         var out: [SpeakerBlock] = []
-        for l in lines {
+        for (i, l) in lines.enumerated() {
             if var last = out.last, last.speaker == l.speaker {
                 last.text += " " + l.text
+                last.parts.append((line: i, text: l.text))
                 out[out.count - 1] = last
             } else {
                 out.append(SpeakerBlock(timestamp: l.timestamp,
-                                        speaker: l.speaker, text: l.text))
+                                        speaker: l.speaker, text: l.text,
+                                        parts: [(line: i, text: l.text)]))
             }
         }
         return out
@@ -336,6 +342,19 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var rawText: String = ""
     private var snapshot = TranscriptSnapshot()
     private var colorMap: [String: NSColor] = [:]
+
+    // --- Playback (archived transcripts with a kept .m4a only) ---
+    private var player: AVAudioPlayer? = nil
+    private var audioPath: String? = nil
+    private let playerBar = NSStackView()
+    private let playButton = NSButton(title: "", target: nil, action: nil)
+    private let timeLabel = NSTextField(labelWithString: "")
+    private let scrubber = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private var playerBarHeight: NSLayoutConstraint? = nil
+    private var playTimer: Timer? = nil
+    private var lineRanges: [Int: NSRange] = [:]     // line index -> text range
+    private var lineOffsets: [Double] = []           // line index -> seconds into audio
+    private var highlightedRange: NSRange? = nil
     private func color(for speaker: String) -> NSColor {
         colorMap[speaker] ?? speakerColor(speaker)
     }
@@ -430,8 +449,40 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         jumpButton.action = #selector(jumpToEnd)
         jumpButton.isHidden = true
 
+        // Player bar (hidden until an archived transcript with audio loads).
+        func barButton(_ symbol: String, _ action: Selector) -> NSButton {
+            let b = NSButton(title: "", target: self, action: action)
+            b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol)
+            b.bezelStyle = .texturedRounded
+            b.isBordered = false
+            return b
+        }
+        playButton.target = self
+        playButton.action = #selector(togglePlay)
+        playButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Play")
+        playButton.bezelStyle = .texturedRounded
+        playButton.isBordered = false
+        timeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        timeLabel.textColor = .secondaryLabelColor
+        scrubber.target = self
+        scrubber.action = #selector(scrubbed)
+        scrubber.controlSize = .small
+        playerBar.orientation = .horizontal
+        playerBar.spacing = 10
+        playerBar.edgeInsets = NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12)
+        playerBar.translatesAutoresizingMaskIntoConstraints = false
+        playerBar.addArrangedSubview(barButton("gobackward.10", #selector(back10)))
+        playerBar.addArrangedSubview(playButton)
+        playerBar.addArrangedSubview(barButton("goforward.10", #selector(fwd10)))
+        playerBar.addArrangedSubview(scrubber)
+        playerBar.addArrangedSubview(timeLabel)
+        playerBar.isHidden = true
+        playerBarHeight = playerBar.heightAnchor.constraint(equalToConstant: 0)
+        playerBarHeight?.isActive = true
+
         content.addSubview(header)
         content.addSubview(divider)
+        content.addSubview(playerBar)
         content.addSubview(speakersScroll)
         content.addSubview(panelDivider)
         content.addSubview(scroll)
@@ -444,18 +495,21 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             divider.topAnchor.constraint(equalTo: header.bottomAnchor),
             divider.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            speakersScroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            speakersScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            speakersScroll.widthAnchor.constraint(equalToConstant: 170),
-            speakersScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            scroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: panelDivider.leadingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: playerBar.topAnchor),
             panelDivider.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            panelDivider.leadingAnchor.constraint(equalTo: speakersScroll.trailingAnchor),
             panelDivider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             panelDivider.widthAnchor.constraint(equalToConstant: 1),
-            scroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: panelDivider.trailingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            speakersScroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            speakersScroll.leadingAnchor.constraint(equalTo: panelDivider.trailingAnchor),
+            speakersScroll.widthAnchor.constraint(equalToConstant: 170),
+            speakersScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            speakersScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            playerBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            playerBar.trailingAnchor.constraint(equalTo: panelDivider.leadingAnchor),
+            playerBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             jumpButton.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
             jumpButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
@@ -511,6 +565,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     // MARK: Click-to-name
 
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        if let url = link as? URL, url.scheme == "meetink-play",
+           let idx = Int(url.host ?? ""), idx < lineOffsets.count {
+            seek(to: lineOffsets[idx], andPlay: true)
+            return true
+        }
         guard let url = link as? URL, url.scheme == "meetink-assign" else { return false }
         // Label travels percent-encoded in ?label= (it can be anything:
         // "Speaker 3", "GREG", "ADRIANA 2"). The old host-only form
@@ -609,6 +668,142 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
     }
 
+    // MARK: Playback
+
+    /// Audio exists next to archived transcripts when "keep audio" was on.
+    /// Never for the in-flight live recording.
+    private func updatePlayerAvailability() {
+        let base = (lastResolvedPath as NSString).deletingPathExtension
+        let candidate = base + ".m4a"
+        let liveRecording = fixedPath == nil && recordingPID() != nil
+        let available = !liveRecording && !lastResolvedPath.isEmpty
+            && FileManager.default.fileExists(atPath: candidate)
+        if available && audioPath != candidate {
+            audioPath = candidate
+            player?.stop()
+            player = try? AVAudioPlayer(contentsOf: URL(fileURLWithPath: candidate))
+            player?.prepareToPlay()
+            buildLineOffsets(base: base)
+            refreshIfChanged(force: true)   // re-render so links become play-links
+        } else if !available && audioPath != nil {
+            audioPath = nil
+            stopPlayback()
+        }
+        playerBar.isHidden = audioPath == nil
+        playerBarHeight?.constant = audioPath == nil ? 0 : 34
+        updatePlayerUI()
+    }
+
+    /// Per-line seconds into the audio. Primary source: the refine pass's
+    /// timing sidecar (exact spool-timeline offsets). Fallback: wall-clock
+    /// line stamps minus the Started header.
+    private func buildLineOffsets(base: String) {
+        lineOffsets = []
+        if let data = FileManager.default.contents(atPath: base + ".timing.json"),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let arr = obj["lines"] as? [[String: Any]],
+           arr.count == snapshot.lines.count {
+            lineOffsets = arr.map { ($0["t"] as? Double) ?? 0 }
+            return
+        }
+        func daySeconds(_ hms: String) -> Double? {
+            let p = hms.split(separator: ":").compactMap { Double($0) }
+            return p.count == 3 ? p[0] * 3600 + p[1] * 60 + p[2] : nil
+        }
+        var startSec: Double? = nil
+        if let started = snapshot.startedAt {
+            let c = Calendar.current.dateComponents([.hour, .minute, .second], from: started)
+            startSec = Double(c.hour! * 3600 + c.minute! * 60 + c.second!)
+        }
+        lineOffsets = snapshot.lines.map { l in
+            guard let t = daySeconds(l.timestamp) else { return 0 }
+            guard let s0 = startSec else { return t }   // imports: stamps are relative
+            var d = t - s0
+            if d < -3600 { d += 86400 }                 // crossed midnight
+            return max(0, d)
+        }
+    }
+
+    private func seek(to offset: Double, andPlay: Bool) {
+        guard let player else { return }
+        player.currentTime = max(0, min(offset, player.duration - 0.1))
+        if andPlay && !player.isPlaying {
+            player.play()
+            startPlayTimer()
+        }
+        updatePlayerUI()
+        highlightCurrentLine(scrollTo: true)
+    }
+
+    @objc private func togglePlay() {
+        guard let player else { return }
+        if player.isPlaying { player.pause(); playTimer?.invalidate() }
+        else { player.play(); startPlayTimer() }
+        updatePlayerUI()
+    }
+    @objc private func back10() { seek(to: (player?.currentTime ?? 0) - 10, andPlay: false) }
+    @objc private func fwd10() { seek(to: (player?.currentTime ?? 0) + 10, andPlay: false) }
+    @objc private func scrubbed() {
+        guard let player else { return }
+        seek(to: scrubber.doubleValue * player.duration, andPlay: false)
+    }
+
+    private func stopPlayback() {
+        player?.stop()
+        player = nil
+        playTimer?.invalidate()
+        if let r = highlightedRange {
+            textView.layoutManager?.removeTemporaryAttribute(.backgroundColor, forCharacterRange: r)
+            highlightedRange = nil
+        }
+    }
+
+    private func startPlayTimer() {
+        playTimer?.invalidate()
+        playTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self, let p = self.player else { return }
+            self.updatePlayerUI()
+            self.highlightCurrentLine(scrollTo: false)
+            if !p.isPlaying { self.playTimer?.invalidate(); self.updatePlayerUI() }
+        }
+    }
+
+    private func updatePlayerUI() {
+        let playing = player?.isPlaying == true
+        playButton.image = NSImage(systemSymbolName: playing ? "pause.fill" : "play.fill",
+                                   accessibilityDescription: playing ? "Pause" : "Play")
+        guard let p = player else { timeLabel.stringValue = ""; return }
+        func fmt(_ t: Double) -> String {
+            let s = Int(t)
+            return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
+                             : String(format: "%02d:%02d", s / 60, s % 60)
+        }
+        timeLabel.stringValue = "\(fmt(p.currentTime)) / \(fmt(p.duration))"
+        if !scrubber.isHighlighted, p.duration > 0 {
+            scrubber.doubleValue = p.currentTime / p.duration
+        }
+    }
+
+    /// Highlight the line ("segment") currently being spoken.
+    private func highlightCurrentLine(scrollTo: Bool) {
+        guard let p = player, !lineOffsets.isEmpty else { return }
+        let t = p.currentTime
+        // Last line whose offset <= t.
+        var idx = -1
+        for (i, off) in lineOffsets.enumerated() { if off <= t { idx = i } else { break } }
+        guard idx >= 0, let range = lineRanges[idx] else { return }
+        if let old = highlightedRange, old == range { return }
+        if let old = highlightedRange {
+            textView.layoutManager?.removeTemporaryAttribute(.backgroundColor, forCharacterRange: old)
+        }
+        textView.layoutManager?.addTemporaryAttribute(
+            .backgroundColor,
+            value: NSColor.systemYellow.withAlphaComponent(0.28),
+            forCharacterRange: range)
+        highlightedRange = range
+        if scrollTo { textView.scrollRangeToVisible(range) }
+    }
+
     private func updateSpeakersPanel() {
         let fresh = snapshot.talkShare.map { (name: $0.speaker, fraction: $0.fraction) }
         // Reload only on change — a reload mid-click would eat the click.
@@ -674,6 +869,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private func render(empty: Bool) {
         colorMap = speakerColorMap(snapshot)
         speakersTable.reloadData()
+        lineRanges.removeAll()
+        highlightedRange = nil
+        updatePlayerAvailability()
         let wasPinned = pinnedToBottom
         let out = NSMutableAttributedString()
         let bodyFont = NSFont.systemFont(ofSize: 13)
@@ -711,17 +909,35 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     speakerAttrs[.underlineColor] = color(for: block.speaker)
                         .withAlphaComponent(0.35)
                 }
+                var stampAttrs: [NSAttributedString.Key: Any] = [
+                    .font: monoFont,
+                    .foregroundColor: NSColor.tertiaryLabelColor,
+                    .paragraphStyle: headerPara,
+                ]
+                // With audio available, the NAME and TIMESTAMP both mean
+                // "play from here" — renaming lives in the speakers panel.
+                if audioPath != nil, let first = block.parts.first,
+                   let purl = URL(string: "meetink-play://\(first.line)") {
+                    speakerAttrs[.link] = purl
+                    speakerAttrs[.toolTip] = "Play from here"
+                    speakerAttrs[.underlineStyle] = 0
+                    stampAttrs[.link] = purl
+                    stampAttrs[.toolTip] = "Play from here"
+                }
                 out.append(NSAttributedString(string: block.speaker, attributes: speakerAttrs))
                 out.append(NSAttributedString(
-                    string: "  \(block.timestamp)\n",
-                    attributes: [.font: monoFont,
-                                 .foregroundColor: NSColor.tertiaryLabelColor,
-                                 .paragraphStyle: headerPara]))
-                out.append(NSAttributedString(
-                    string: block.text + "\n",
-                    attributes: [.font: bodyFont,
-                                 .foregroundColor: NSColor.labelColor,
-                                 .paragraphStyle: bodyPara]))
+                    string: "  \(block.timestamp)\n", attributes: stampAttrs))
+                for (pi, part) in block.parts.enumerated() {
+                    let runStart = out.length
+                    let sep = pi == block.parts.count - 1 ? "\n" : " "
+                    out.append(NSAttributedString(
+                        string: part.text + sep,
+                        attributes: [.font: bodyFont,
+                                     .foregroundColor: NSColor.labelColor,
+                                     .paragraphStyle: bodyPara]))
+                    lineRanges[part.line] = NSRange(location: runStart,
+                                                    length: (part.text as NSString).length)
+                }
             }
         }
 

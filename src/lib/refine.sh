@@ -124,6 +124,9 @@ refine_session() {
         # rationale as _rewrite_transcript_label).
         cp "$actual" "${actual%.txt}.live-raw.txt" 2>/dev/null
         cat "$tmp" > "$actual"
+        # Playback timing sidecar — lands as <base>.timing.json so titling
+        # renames it with the transcript (same-basename rule).
+        [[ -f "$tmp.timing.json" ]] && mv "$tmp.timing.json" "${actual%.txt}.timing.json"
         rm -f "$tmp" "$mic" "$sys"
         local n=$(grep -cE '^\[[0-9:]{8}\]' "$actual" 2>/dev/null)
         # NOTE: no nested ${${...}text:t} tricks here — that exact form is a
@@ -242,6 +245,7 @@ cmd_refine() {
         return 1
     fi
     local n=$(grep -cE '^\[[0-9:]{8}\]' "$out" 2>/dev/null)
+    [[ -f "$out.timing.json" ]] && mv "$out.timing.json" "${out%.txt}.timing.json"
     print -P "${C[green]}✓${C[reset]} Transcribed: ${C[bright_cyan]}${out/$HOME/~}${C[reset]} ${C[dim]}(${n} lines)${C[reset]}"
 
     # Settings: keep audio → the source file moves in next to the transcript

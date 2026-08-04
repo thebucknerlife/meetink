@@ -515,8 +515,10 @@ def main() -> int:
     from parakeet_mlx import from_pretrained
     model = from_pretrained(MODEL_ID)
 
-    # (start_s, label, text, origin) — origin drives echo suppression.
-    entries: list[tuple[float, str, str, str]] = []
+    # (start_s, label, text, origin, tokens) — origin drives echo
+    # suppression; tokens (parakeet word timestamps, may be None) feed the
+    # timing sidecar that powers the app's playback highlight.
+    entries: list[tuple[float, str, str, str, list | None]] = []
 
     def diarize_all(raw: bytes, segs: list[dict], origin: str) -> None:
         """Sidecar-down fallback: sequential per-segment identify."""
@@ -527,7 +529,8 @@ def main() -> int:
         for i, seg in enumerate(segs):
             label = identify_segment(raw, seg["start"], seg["end"],
                                      args.diarize_port) or "THEM"
-            entries.append((seg["start"], label, seg["text"], origin))
+            entries.append((seg["start"], label, seg["text"], origin,
+                            seg.get("tokens")))
             if (i + 1) % step == 0 or i + 1 == n:
                 print(f"refine: progress diarize {int(100 * (i + 1) / n)}",
                       flush=True)
@@ -541,7 +544,7 @@ def main() -> int:
         if labeled is not None:
             for seg in labeled:
                 entries.append((seg["start"], seg["label"], seg["text"],
-                                seg["origin"]))
+                                seg["origin"], seg.get("tokens")))
         else:
             diarize_all(raw, segs, "import")
     else:
@@ -563,14 +566,15 @@ def main() -> int:
         if labeled is not None:
             for seg in labeled:
                 entries.append((seg["start"], seg["label"], seg["text"],
-                                seg["origin"]))
+                                seg["origin"], seg.get("tokens")))
         else:
             # Sidecar down: old behavior — mic blanket-labeled, sys THEM.
             me = args.me.strip().upper() or "ME"
             for st in streams:
                 if st["origin"] == "mic":
                     for seg in st["segs"]:
-                        entries.append((seg["start"], me, seg["text"], "mic"))
+                        entries.append((seg["start"], me, seg["text"], "mic",
+                                        seg.get("tokens")))
                 else:
                     diarize_all(st["raw"], st["segs"], "sys")
 
@@ -616,10 +620,10 @@ def main() -> int:
         # the user's sentences).
         dropped_self = 0
         if me_lab:
-            mic_me = [(t, norm(x)) for t, lab, x, o in entries
+            mic_me = [(t, norm(x)) for t, lab, x, o, _tk in entries
                       if o == "mic" and lab == me_lab]
             kept = []
-            for t, lab, text, origin in entries:
+            for t, lab, text, origin, toks in entries:
                 if origin == "sys":
                     if lab == me_lab:
                         dropped_self += 1
@@ -629,17 +633,17 @@ def main() -> int:
                            for mt, mx in mic_me):
                         dropped_self += 1
                         continue
-                kept.append((t, lab, text, origin))
+                kept.append((t, lab, text, origin, toks))
             entries = kept
 
         # Pass 2 — speaker bleed INTO the mic (no headphones): a mic entry
         # that echoes nearby system audio is the room speakers, and the sys
         # copy is authoritative. Never drop the user's own mic lines here —
         # their sys echoes were already removed in pass 1.
-        sys_entries = [(t, norm(x)) for t, _, x, o in entries if o == "sys"]
+        sys_entries = [(t, norm(x)) for t, _, x, o, _tk in entries if o == "sys"]
         deduped = []
         dropped = 0
-        for t, lab, text, origin in entries:
+        for t, lab, text, origin, toks in entries:
             if origin == "mic" and lab != me_lab:
                 nt = norm(text)
                 echo = False
@@ -655,7 +659,7 @@ def main() -> int:
                 if echo:
                     dropped += 1
                     continue
-            deduped.append((t, lab, text, origin))
+            deduped.append((t, lab, text, origin, toks))
         total_dropped = dropped + dropped_self
         if total_dropped:
             log(f"echo suppression: dropped {dropped_self} sys echoes of the "
@@ -704,14 +708,27 @@ def main() -> int:
         lines.append("")
     lines.append(f"# refined: parakeet ({MODEL_ID.split('/')[-1]})")
 
-    for start_s, label, text, _origin in entries:
+    timing_lines: list[dict] = []
+    for start_s, label, text, _origin, toks in entries:
         lines.append(f"[{stamp(start_s)}] {label}: {text}")
+        words = []
+        for tk in toks or []:
+            w = (tk.get("text") or "").strip()
+            if w:
+                words.append({"w": w, "s": round(float(tk.get("start", start_s)), 2),
+                              "e": round(float(tk.get("end", tk.get("start", start_s))), 2)})
+        timing_lines.append({"t": round(start_s, 2), "label": label, "words": words})
 
     if ended_line:
         lines.append("---")
         lines.append(ended_line)
 
     Path(args.out).write_text("\n".join(lines) + "\n")
+    # Timing sidecar: one entry per transcript line, in file order — the
+    # app's playback highlight and seek map key on this. Written next to
+    # --out; refine_session/titling move+rename it with the transcript.
+    Path(args.out + ".timing.json").write_text(
+        json.dumps({"lines": timing_lines}))
     log(f"wrote {len(entries)} lines -> {args.out}")
     return 0
 
