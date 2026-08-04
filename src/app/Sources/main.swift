@@ -1,32 +1,30 @@
 import AppKit
 import Foundation
 
-// meetink-app — the native companion: a menubar status item plus a live
-// transcript window. The graduated form of the terminal tail window.
+// meetink-app — the native companion, now a full (if small) app:
 //
-// Design constraints this file honors (learned the hard way in the terminal
-// implementation — see src/lib/window.sh):
-//   - The transcript is rewritten IN PLACE (inode-preserving truncate+write)
-//     by /profile assign and the /stop consolidation pass, so the watcher
-//     re-reads the whole file when it shrinks or changes inode — it never
-//     just tails appended bytes.
-//   - Titling on /stop RENAMES the file and retargets the live.txt symlink,
-//     so the symlink is re-resolved on every poll.
-//   - Scroll, selection, copy and ⌘F must all be native. NSTextView gives us
-//     every one of them — but ONLY if the app has a real main menu: key
-//     equivalents (⌘F/⌘C/⌘A/⌘W) resolve through NSApp.mainMenu, which apps
-//     launched via bare NSApplication.run() don't get for free.
+//   ┌───────────────────────────────────────────────────────────┐
+//   │ ● Recording 12:34                     [Open Live Transcript] │  status strip
+//   ├──────────┬────────────────────────────────────────────────┤
+//   │ Meetings │                                                │
+//   │ Vocab    │        detail area (list / transcript /        │
+//   │ Upload   │         vocab editor / upload queue)           │
+//   └──────────┴────────────────────────────────────────────────┘
 //
-// Activation policy is dynamic: .regular while the transcript window is
-// open (so the app appears in ⌘Tab and the Dock and can't be "lost"),
-// .accessory when the window closes (menubar-only, no Dock clutter).
+// plus the menubar status item. One window, swappable detail pages: the
+// live transcript is a PAGE you can always return to (status-strip button),
+// so browsing old meetings or the vocab while recording costs nothing.
 //
-// The app only READS (live.txt + the localhost status ports). The write
-// paths are Start/Stop and speaker assignment, which shell out to the
-// launcher. NOTE: when recording is started from here, macOS attributes the
-// mic/screen permissions to THIS app (the responsible process) — first
-// Start triggers fresh permission prompts; the ad-hoc codesign in build_app
-// keeps the bundle identity (and therefore the grants) stable.
+// Hard-won constraints this file preserves (see git history):
+//   - Transcripts are rewritten IN PLACE (inode-preserving truncate+write)
+//     and RENAMED by titling; the watcher re-resolves symlinks every poll
+//     and re-reads on any inode/size change.
+//   - ⌘F/⌘C/⌘A/⌘W need a real NSApp.mainMenu — bare NSApplication.run()
+//     apps have none.
+//   - TranscriptViewController's fixedPath-style state must never regain
+//     an initializer default that lets an inherited init shadow ours.
+//   - Recording started from this app runs under THIS app's TCC grants;
+//     the stable "Meetink Signing" identity keeps them across rebuilds.
 
 // MARK: - Paths & config
 
@@ -46,7 +44,7 @@ func configValue(_ key: String) -> String? {
 }
 
 /// The live-transcript symlink path, honoring the active project the same
-/// way the launcher resolves it (project subdir of the transcripts base).
+/// way the launcher resolves it.
 func liveSymlinkPath() -> String {
     if let explicit = ProcessInfo.processInfo.environment["MEETINK_TRANSCRIPT"] {
         return explicit
@@ -57,6 +55,15 @@ func liveSymlinkPath() -> String {
         base += "/\(project)"
     }
     return base + "/live.txt"
+}
+
+func transcriptsDir() -> String {
+    (liveSymlinkPath() as NSString).deletingLastPathComponent
+}
+
+func vocabPath() -> String {
+    ProcessInfo.processInfo.environment["MEETINK_PROMPT"]
+        ?? "\(mkHome)/prompts/default.txt"
 }
 
 func launcherPath() -> String? {
@@ -88,10 +95,6 @@ func enrolledProfiles() -> [String] {
 
 // MARK: - The M-waveform mark
 
-/// Draws the meetink mark: a five-bar waveform whose silhouette reads as an
-/// "M" — outer bars tall, valleys between, a mid-height center. Used at
-/// 18 pt (template) in the menu bar and at 512 pt (tinted tile) as the
-/// Dock/⌘Tab icon, so there's no .icns asset to keep in sync.
 func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> NSImage {
     let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
         if let tile = tile {
@@ -101,7 +104,6 @@ func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> N
             tile.setFill()
             bg.fill()
         }
-        // Heights as fractions of the drawable height: M silhouette.
         let heights: [CGFloat] = [0.95, 0.42, 0.70, 0.42, 0.95]
         let drawable = rect.insetBy(dx: size * 0.18, dy: size * 0.22)
         let barWidth = drawable.width * 0.12
@@ -112,10 +114,9 @@ func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> N
             let barHeight = drawable.height * h
             let x = drawable.minX + CGFloat(i) * (barWidth + gap)
             let y = drawable.midY - barHeight / 2
-            let bar = NSBezierPath(
+            NSBezierPath(
                 roundedRect: NSRect(x: x, y: y, width: barWidth, height: barHeight),
-                xRadius: barWidth / 2, yRadius: barWidth / 2)
-            bar.fill()
+                xRadius: barWidth / 2, yRadius: barWidth / 2).fill()
         }
         return true
     }
@@ -130,11 +131,8 @@ struct TranscriptLine {
     let text: String
 }
 
-/// Consecutive lines from the same speaker, rendered as one block —
-/// the 3 s chunk cadence produces runs of short lines from one voice, and
-/// reading them as a paragraph beats reading them as a transcript of hiccups.
 struct SpeakerBlock {
-    let timestamp: String   // first line's timestamp
+    let timestamp: String
     let speaker: String
     var text: String
 }
@@ -158,9 +156,6 @@ struct TranscriptSnapshot {
         return out
     }
 
-    /// Char-count share per speaker — a cheap, surprisingly good proxy for
-    /// talk time (characters don't under-weight long monologues the way
-    /// line counts do).
     var talkShare: [(speaker: String, fraction: Double)] {
         var counts: [String: Int] = [:]
         for l in lines { counts[l.speaker, default: 0] += l.text.count }
@@ -190,18 +185,14 @@ func parseTranscript(_ text: String) -> TranscriptSnapshot {
                 from: rawLine.replacingOccurrences(of: "Started: ", with: "")
                     .trimmingCharacters(in: .whitespaces))
         } else if rawLine.hasPrefix("Ended:") {
-            // Metadata checks MUST come before the continuation branch:
-            // the Ended footer sits after the last utterance, and the old
-            // order glued it onto that utterance's text — so endedAt was
-            // never parsed and the header timer never stopped.
+            // Metadata before continuation — the footer sits after the last
+            // utterance and the old order glued it onto that utterance.
             snap.endedAt = isoParser.date(
                 from: rawLine.replacingOccurrences(of: "Ended: ", with: "")
                     .trimmingCharacters(in: .whitespaces))
         } else if rawLine.hasPrefix("---") || rawLine.hasPrefix("#") {
             // Structural/comment lines are never utterance text.
         } else if var c = current, !rawLine.isEmpty {
-            // Continuation of a wrapped utterance (whisper text can contain
-            // embedded newlines) — belongs to the previous speaker line.
             c = TranscriptLine(timestamp: c.timestamp, speaker: c.speaker,
                                text: c.text + " " + rawLine)
             current = c
@@ -218,8 +209,6 @@ let speakerPalette: [NSColor] = [
     .systemTeal, .systemPink, .systemIndigo, .systemBrown,
 ]
 
-/// Deterministic across launches (String.hashValue is seeded per-process,
-/// which would reshuffle everyone's colors on every app restart).
 func speakerColor(_ speaker: String) -> NSColor {
     var h = 0
     for u in speaker.unicodeScalars { h = (h &* 31 &+ Int(u.value)) & 0x7fffffff }
@@ -235,19 +224,16 @@ func unknownSpeakerNumber(_ speaker: String) -> String? {
     return ns.substring(with: m.range(at: 1))
 }
 
-// MARK: - Drag-and-drop import
+// MARK: - Drag-and-drop container
 
 let audioExtensions: Set<String> = [
     "wav", "m4a", "mp3", "aiff", "aif", "caf", "flac", "ogg", "opus",
     "mp4", "mov", "webm", "aac", "mkv",
 ]
 
-/// Content-view wrapper that accepts audio-file drops anywhere in the
-/// window. Decoding happens through ffmpeg in the refine pipeline, so the
-/// extension list can be generous.
 final class DropContainerView: NSView {
-    var onAudioDrop: ((URL) -> Void)?
-    var onDragState: ((Bool) -> Void)?   // drives the "drop to transcribe" overlay
+    var onAudioDrop: (([URL]) -> Void)?
+    var onDragState: ((Bool) -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -256,38 +242,34 @@ final class DropContainerView: NSView {
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    private func audioURL(from sender: NSDraggingInfo) -> URL? {
+    private func audioURLs(from sender: NSDraggingInfo) -> [URL] {
         let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
         guard let urls = sender.draggingPasteboard.readObjects(
-            forClasses: [NSURL.self], options: opts) as? [URL] else { return nil }
-        return urls.first { audioExtensions.contains($0.pathExtension.lowercased()) }
+            forClasses: [NSURL.self], options: opts) as? [URL] else { return [] }
+        return urls.filter { audioExtensions.contains($0.pathExtension.lowercased()) }
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        let ok = audioURL(from: sender) != nil
+        let ok = !audioURLs(from: sender).isEmpty
         onDragState?(ok)
         return ok ? .copy : []
     }
 
-    override func draggingExited(_ sender: NSDraggingInfo?) {
-        onDragState?(false)
-    }
-
-    override func draggingEnded(_ sender: NSDraggingInfo) {
-        onDragState?(false)
-    }
+    override func draggingExited(_ sender: NSDraggingInfo?) { onDragState?(false) }
+    override func draggingEnded(_ sender: NSDraggingInfo) { onDragState?(false) }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         onDragState?(false)
-        guard let url = audioURL(from: sender) else { return false }
-        onAudioDrop?(url)
+        let urls = audioURLs(from: sender)
+        guard !urls.isEmpty else { return false }
+        onAudioDrop?(urls)
         return true
     }
 }
 
-// MARK: - Transcript window
+// MARK: - Transcript page (live or archived)
 
-final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
+final class TranscriptViewController: NSViewController, NSTextViewDelegate {
     private let textView = NSTextView()
     private let headerField = NSTextField(labelWithString: "")
     private let statusDot = NSTextField(labelWithString: "●")
@@ -301,68 +283,12 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     private var rawText: String = ""
     private var snapshot = TranscriptSnapshot()
 
-    // Import windows watch ONE specific transcript file; the main window
-    // (fixedPath == nil) follows the live.txt symlink.
-    private var fixedPath: String? = nil
-    // True while an import is transcribing into this window — the poll
-    // stays quiet so the progress UI isn't replaced by the empty state.
-    var suspendWatching = false
-    // Transcription in flight (distinct from suspendWatching: a blank
-    // drop-target window pauses watching without importing anything yet).
-    private(set) var importing = false
-    // Window opened via "Transcribe Audio" — an invitation to drop a file.
-    private var isDropTarget = false
-    // Routed to AppDelegate.startImport — drops open a NEW window there.
-    var importHandler: ((URL) -> Void)?
+    /// nil = follow the live symlink; a path = show that transcript.
+    private(set) var fixedPath: String? = nil
 
-    private let dropOverlay = NSBox()
-    private let progressBox = NSStackView()
-    private let progressBar = NSProgressIndicator()
-    private let progressLabel = NSTextField(labelWithString: "")
+    override func loadView() {
+        let content = NSView()
 
-    // IMPORTANT: no default value on fixedPath. With one, a bare
-    // TranscriptWindowController() resolves to NSWindowController's
-    // INHERITED init() (exact match beats defaulted-parameter synthesis)
-    // and yields a controller with a nil window — every window created
-    // that way is stillborn. Field-debugged; do not "simplify" this back.
-    convenience init(fixedPath: String?, autosave: Bool = false) {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 780, height: 640),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered, defer: false)
-        window.title = fixedPath.map { ($0 as NSString).lastPathComponent }
-            ?? "Meetink — Live Transcript"
-        window.center()
-        // Only the main live window persists its frame — a shared autosave
-        // name across windows is first-claim-wins and the rest silently lose.
-        if autosave {
-            window.setFrameAutosaveName("MeetinkTranscriptWindow")
-        }
-        self.init(window: window)
-        self.fixedPath = fixedPath
-        // Wrap the content view so audio files can be dropped anywhere in
-        // the window to transcribe them (routes through `meetink refine`).
-        let container = DropContainerView(frame: window.contentView?.bounds ?? .zero)
-        container.onAudioDrop = { [weak self] url in self?.importHandler?(url) }
-        container.onDragState = { [weak self] active in
-            self?.dropOverlay.isHidden = !active
-        }
-        window.contentView = container
-        buildUI()
-        // 0.5s stat-poll: cheap (one lstat + one stat), and simpler + more
-        // robust than DispatchSource for a file that gets renamed, truncated
-        // and symlink-retargeted underneath us.
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.refreshIfChanged()
-        }
-        refreshIfChanged(force: true)
-    }
-
-    private func buildUI() {
-        guard let content = window?.contentView else { return }
-
-        // Header bar: recording dot + elapsed + talk-share + copy button,
-        // pinned above the text view.
         let header = NSStackView()
         header.orientation = .horizontal
         header.spacing = 8
@@ -382,7 +308,7 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
 
         header.addArrangedSubview(statusDot)
         header.addArrangedSubview(headerField)
-        header.addArrangedSubview(NSView())   // spacer
+        header.addArrangedSubview(NSView())
         header.addArrangedSubview(copyButton)
 
         let divider = NSBox()
@@ -397,7 +323,7 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         textView.isEditable = false
         textView.isSelectable = true
         textView.isRichText = true
-        textView.usesFindBar = true                    // ⌘F, native find bar
+        textView.usesFindBar = true
         textView.isIncrementalSearchingEnabled = true
         textView.autoresizingMask = [.width]
         textView.textContainerInset = NSSize(width: 12, height: 10)
@@ -407,24 +333,18 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                                   height: CGFloat.greatestFiniteMagnitude)
-        // Speaker labels carry .link attributes for click-to-name; empty
-        // linkTextAttributes stops AppKit repainting them blue-underlined
-        // over our per-speaker colors.
         textView.linkTextAttributes = [.cursor: NSCursor.pointingHand]
         textView.delegate = self
         scroll.documentView = textView
 
-        // Floating "jump to live" button — appears only when the user has
-        // scrolled away from the bottom, so catching up is one click.
         jumpButton.translatesAutoresizingMaskIntoConstraints = false
         jumpButton.bezelStyle = .rounded
-        jumpButton.controlSize = .regular
         jumpButton.title = " Jump to live"
         jumpButton.image = NSImage(systemSymbolName: "arrow.down.to.line",
-                                   accessibilityDescription: "Jump to live")
+                                   accessibilityDescription: "Jump to end")
         jumpButton.imagePosition = .imageLeading
         jumpButton.target = self
-        jumpButton.action = #selector(jumpToLive)
+        jumpButton.action = #selector(jumpToEnd)
         jumpButton.isHidden = true
 
         content.addSubview(header)
@@ -447,173 +367,40 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
             jumpButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
 
-        // Drag-over affordance: indigo dashed panel with a prompt, shown by
-        // DropContainerView's drag-state callback.
-        dropOverlay.boxType = .custom
-        dropOverlay.cornerRadius = 14
-        dropOverlay.borderWidth = 2
-        dropOverlay.borderColor = NSColor.systemIndigo.withAlphaComponent(0.8)
-        dropOverlay.fillColor = NSColor.systemIndigo.withAlphaComponent(0.10)
-        dropOverlay.translatesAutoresizingMaskIntoConstraints = false
-        dropOverlay.isHidden = true
-        let dropLabel = NSTextField(labelWithString: "Drop audio file to transcribe")
-        dropLabel.font = NSFont.boldSystemFont(ofSize: 18)
-        dropLabel.textColor = .systemIndigo
-        dropLabel.translatesAutoresizingMaskIntoConstraints = false
-        dropOverlay.contentView?.addSubview(dropLabel)
-        content.addSubview(dropOverlay)
-
-        // Import-progress panel: filename + bar + status, centered over the
-        // text area while `meetink refine` chews on a dropped file.
-        progressBox.orientation = .vertical
-        progressBox.alignment = .centerX
-        progressBox.spacing = 10
-        progressBox.translatesAutoresizingMaskIntoConstraints = false
-        progressBox.isHidden = true
-        progressLabel.font = NSFont.boldSystemFont(ofSize: 14)
-        progressLabel.alignment = .center
-        progressBar.style = .bar
-        progressBar.minValue = 0
-        progressBar.maxValue = 100
-        progressBar.translatesAutoresizingMaskIntoConstraints = false
-        let progressHint = NSTextField(
-            labelWithString: "Parakeet · roughly a minute per hour of audio")
-        progressHint.font = NSFont.systemFont(ofSize: 11)
-        progressHint.textColor = .secondaryLabelColor
-        progressBox.addArrangedSubview(progressLabel)
-        progressBox.addArrangedSubview(progressBar)
-        progressBox.addArrangedSubview(progressHint)
-        content.addSubview(progressBox)
-
-        NSLayoutConstraint.activate([
-            dropOverlay.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 14),
-            dropOverlay.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
-            dropOverlay.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
-            dropOverlay.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14),
-            dropLabel.centerXAnchor.constraint(equalTo: dropOverlay.centerXAnchor),
-            dropLabel.centerYAnchor.constraint(equalTo: dropOverlay.centerYAnchor),
-            progressBox.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            progressBox.centerYAnchor.constraint(equalTo: content.centerYAnchor),
-            progressBar.widthAnchor.constraint(equalToConstant: 320),
-        ])
-
-        // Track scrolling so the jump button can show/hide live.
         scroll.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
             object: scroll.contentView, queue: .main) { [weak self] _ in
                 self?.updateJumpButton()
             }
+
+        self.view = content
     }
 
-    // MARK: Import progress (driven by AppDelegate.startImport)
-
-    func beginImportProgress(filename: String) {
-        importing = true
-        suspendWatching = true
-        textView.textStorage?.setAttributedString(NSAttributedString())
-        progressLabel.stringValue = "Transcribing \(filename)…"
-        progressBar.isIndeterminate = true
-        progressBar.startAnimation(nil)
-        progressBox.isHidden = false
-        statusDot.textColor = .systemOrange
-        headerField.stringValue = "Importing \(filename)"
-    }
-
-    /// Free-text phase status from the pipeline ("queued behind another
-    /// transcription", "identifying speakers (312 segments)", "generating
-    /// title and summary"). Phases without measurable progress get an
-    /// animated indeterminate bar — visibly alive, never "stuck at 100%".
-    func updateImportStatus(_ text: String) {
-        progressLabel.stringValue = text
-        progressBar.isIndeterminate = true
-        progressBar.startAnimation(nil)
-    }
-
-    func updateImportProgress(_ pct: Int) {
-        if progressBar.isIndeterminate {
-            progressBar.isIndeterminate = false
-            progressBar.stopAnimation(nil)
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.refreshIfChanged()
         }
-        progressBar.doubleValue = Double(pct)
-    }
-
-    /// nil path = failure (caller alerts; a drop-target window goes back
-    /// to inviting a drop, others resume showing what they had).
-    func finishImport(path: String?) {
-        progressBox.isHidden = true
-        importing = false
-        if let p = path {
-            isDropTarget = false
-            suspendWatching = false
-            fixedPath = p
-            window?.title = (p as NSString).lastPathComponent
-            refreshIfChanged(force: true)
-        } else if isDropTarget {
-            showDropPrompt()
-        } else {
-            suspendWatching = false
-            refreshIfChanged(force: true)
-        }
-    }
-
-    var isImporting: Bool { importing }
-    var isShowingImport: Bool { fixedPath != nil }
-    /// "Empty" = safe to fill with a dropped import: nothing transcribing
-    /// here and no transcript on display. A window tied to content gets a
-    /// sibling window instead (see AppDelegate.startImport).
-    var isEmptyViewer: Bool { !importing && snapshot.lines.isEmpty }
-
-    /// Blank drop-target mode — what "Transcribe Audio" opens: a persistent
-    /// window inviting a drop, which then shows progress and the result.
-    func showDropPrompt() {
-        isDropTarget = true
-        suspendWatching = true
-        window?.title = "Transcribe Audio"
-        statusDot.textColor = .systemIndigo
-        headerField.stringValue = "waiting for a file"
-        let para = NSMutableParagraphStyle()
-        para.alignment = .center
-        para.paragraphSpacingBefore = 160
-        let out = NSMutableAttributedString(
-            string: "Drop an audio file here\n",
-            attributes: [.font: NSFont.boldSystemFont(ofSize: 20),
-                         .foregroundColor: NSColor.secondaryLabelColor,
-                         .paragraphStyle: para])
-        let subPara = NSMutableParagraphStyle()
-        subPara.alignment = .center
-        out.append(NSAttributedString(
-            string: "\nwav · m4a · mp3 · aiff · flac · mp4 · mov — anything with an audio track",
-            attributes: [.font: NSFont.systemFont(ofSize: 12),
-                         .foregroundColor: NSColor.tertiaryLabelColor,
-                         .paragraphStyle: subPara]))
-        textView.textStorage?.setAttributedString(out)
-    }
-
-    /// Back to following the live symlink — used when the main window was
-    /// repurposed by a drop and the user asks for the live transcript.
-    func returnToLive() {
-        guard !isImporting else { return }
-        fixedPath = nil
-        window?.title = "Meetink — Live Transcript"
         refreshIfChanged(force: true)
     }
 
-    /// Pinned-to-bottom detection: only auto-scroll after content changes if
-    /// the user was already at (or near) the bottom — scrolling up to read
-    /// history must never be yanked away.
+    func show(path: String?) {
+        fixedPath = path
+        refreshIfChanged(force: true)
+    }
+
     private var pinnedToBottom: Bool {
         guard let scroll = textView.enclosingScrollView else { return true }
         let visible = scroll.contentView.bounds
-        let docHeight = textView.frame.height
-        return visible.maxY >= docHeight - 40
+        return visible.maxY >= textView.frame.height - 40
     }
 
     private func updateJumpButton() {
         jumpButton.isHidden = pinnedToBottom
     }
 
-    @objc private func jumpToLive() {
+    @objc private func jumpToEnd() {
         textView.scrollToEndOfDocument(nil)
         jumpButton.isHidden = true
     }
@@ -622,14 +409,13 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(rawText.isEmpty ? textView.string : rawText, forType: .string)
-        // Momentary feedback without a popover's ceremony.
         copyButton.title = "Copied ✓"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
             self?.copyButton.title = "Copy All"
         }
     }
 
-    // MARK: Click-to-name (NSTextViewDelegate)
+    // MARK: Click-to-name
 
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
         guard let url = link as? URL, url.scheme == "meetink-assign",
@@ -642,22 +428,18 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         let alert = NSAlert()
         alert.messageText = "Who is Speaker \(speakerNumber)?"
         alert.informativeText = "Names the speaker, rewrites the transcript, and "
-            + "enrolls their voice so future meetings recognize them automatically. "
-            + "Works while the diarize server still holds this session's voices."
+            + "enrolls their voice when the session's voice data is still available."
         alert.addButton(withTitle: "Assign")
         alert.addButton(withTitle: "Cancel")
-
         let combo = NSComboBox(frame: NSRect(x: 0, y: 0, width: 220, height: 25))
         combo.addItems(withObjectValues: enrolledProfiles())
         combo.placeholderString = "Name"
         combo.completes = true
         alert.accessoryView = combo
         alert.window.initialFirstResponder = combo
-
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let name = combo.stringValue.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty, !name.contains("."), !name.contains("/") else { return }
-
         runAssign(number: speakerNumber, name: name)
     }
 
@@ -666,47 +448,39 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launcher)
         proc.arguments = ["profile", "assign", number, name]
-        // Rewrite THIS window's transcript: import windows watch a plain
-        // file that isn't the live symlink, and profile_assign rewrites
-        // whatever MEETINK_TRANSCRIPT names.
+        // Rewrite THIS page's transcript (plain files supported).
         var env = ProcessInfo.processInfo.environment
         env["MEETINK_TRANSCRIPT"] = fixedPath ?? liveSymlinkPath()
         proc.environment = env
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
-        DispatchQueue.global().async { [weak self] in
+        DispatchQueue.global().async {
             do { try proc.run() } catch { return }
             proc.waitUntilExit()
             let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
                              encoding: .utf8) ?? ""
-            // Success rewrites the transcript on disk — the poll picks the
-            // change up within 0.5 s, no manual refresh needed. Only surface
-            // failures (e.g. cluster no longer in the server's memory).
             if proc.terminationStatus != 0 || out.lowercased().contains("error") {
                 DispatchQueue.main.async {
                     let alert = NSAlert()
                     alert.messageText = "Couldn't assign Speaker \(number)"
-                    // Strip ANSI colors from launcher output for display.
                     let plain = out.replacingOccurrences(
                         of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
                     alert.informativeText = plain.trimmingCharacters(in: .whitespacesAndNewlines)
                     alert.runModal()
                 }
             }
-            _ = self  // keep controller alive through the callback
         }
     }
 
-    // MARK: File watching + render
+    // MARK: Watch + render
 
     func refreshIfChanged(force: Bool = false) {
-        if suspendWatching { return }
-        let symlink = fixedPath ?? liveSymlinkPath()
-        let resolved = (try? FileManager.default.destinationOfSymbolicLink(atPath: symlink))
+        let target = fixedPath ?? liveSymlinkPath()
+        let resolved = (try? FileManager.default.destinationOfSymbolicLink(atPath: target))
             .map { dest -> String in
-                dest.hasPrefix("/") ? dest : (symlink as NSString).deletingLastPathComponent + "/" + dest
-            } ?? symlink
+                dest.hasPrefix("/") ? dest : (target as NSString).deletingLastPathComponent + "/" + dest
+            } ?? target
 
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: resolved) else {
             if force || !snapshot.lines.isEmpty || !lastResolvedPath.isEmpty {
@@ -721,9 +495,6 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
         let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
 
-        // Any change — growth, in-place rewrite (same inode, size shrinks or
-        // matches), rename (inode flip), retarget (path flip) — triggers a
-        // full re-read. Transcripts are small; correctness beats cleverness.
         if force || inode != lastInode || size != lastSize || resolved != lastResolvedPath {
             lastInode = inode; lastSize = size; lastResolvedPath = resolved
             if let text = try? String(contentsOfFile: resolved, encoding: .utf8) {
@@ -732,7 +503,7 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
                 render(empty: false)
             }
         } else {
-            updateHeader()   // elapsed ticks even when the file is quiet
+            updateHeader()
         }
     }
 
@@ -744,7 +515,7 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
 
         if empty {
             out.append(NSAttributedString(
-                string: "No transcript yet.\n\nStart a recording from the menu bar icon, or run `meetink start`.",
+                string: "No transcript yet.\n\nStart a recording, or open one from Meetings.",
                 attributes: [.font: bodyFont, .foregroundColor: NSColor.secondaryLabelColor]))
         } else {
             let headerPara = NSMutableParagraphStyle()
@@ -759,8 +530,6 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
                     .foregroundColor: speakerColor(block.speaker),
                     .paragraphStyle: headerPara,
                 ]
-                // Unknown speakers are clickable → click-to-name dialog.
-                // The tooltip advertises it; enrolled names aren't links.
                 if let num = unknownSpeakerNumber(block.speaker),
                    let url = URL(string: "meetink-assign://\(num)") {
                     speakerAttrs[.link] = url
@@ -783,10 +552,7 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
             }
         }
 
-        // Preserve the reading position: replacing the text storage can
-        // shift the scroll origin as layout re-runs, which yanked readers
-        // to the bottom whenever new lines arrived mid-scrollback. Pinned
-        // readers follow the live edge; everyone else stays exactly put.
+        // Preserve the reading position; only pinned readers follow the edge.
         let savedOrigin = textView.enclosingScrollView?.contentView.bounds.origin
         textView.textStorage?.setAttributedString(out)
         if wasPinned {
@@ -799,14 +565,11 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     }
 
     private func updateHeader() {
-        if suspendWatching { return }   // progress panel owns the header
-        let recording = recordingPID() != nil
+        let recording = recordingPID() != nil && fixedPath == nil
         statusDot.textColor = recording ? .systemRed : .tertiaryLabelColor
 
         var parts: [String] = []
         if let started = snapshot.startedAt {
-            // A ticking clock is only honest while actually recording; a
-            // stopped session shows its FIXED duration (endedAt) or none.
             let end: Date? = snapshot.endedAt ?? (recording ? Date() : nil)
             if let end {
                 let secs = max(0, Int(end.timeIntervalSince(started)))
@@ -815,10 +578,9 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
         }
         parts.append("\(snapshot.lines.count) lines")
         if !recording && snapshot.endedAt != nil { parts.append("ended") }
-        if !recording && snapshot.startedAt == nil && snapshot.lines.isEmpty {
+        if fixedPath == nil && !recording && snapshot.lines.isEmpty {
             parts = ["not recording"]
         }
-
         let shares = snapshot.talkShare.prefix(5)
             .map { "\($0.speaker) \(Int(($0.fraction * 100).rounded()))%" }
         if !shares.isEmpty {
@@ -828,28 +590,705 @@ final class TranscriptWindowController: NSWindowController, NSTextViewDelegate {
     }
 }
 
-// MARK: - Menubar + app lifecycle
+// MARK: - Meetings list page
+
+final class MeetingsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+    private let table = NSTableView()
+    private var files: [(path: String, name: String, date: Date)] = []
+    private var refreshTimer: Timer?
+    var onOpen: ((String) -> Void)?
+
+    override func loadView() {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+
+        let nameCol = NSTableColumn(identifier: .init("name"))
+        nameCol.title = "Meeting"
+        nameCol.width = 420
+        let dateCol = NSTableColumn(identifier: .init("date"))
+        dateCol.title = "Date"
+        dateCol.width = 150
+        table.addTableColumn(nameCol)
+        table.addTableColumn(dateCol)
+        table.dataSource = self
+        table.delegate = self
+        table.target = self
+        table.doubleAction = #selector(openSelected)
+        table.usesAlternatingRowBackgroundColors = true
+        scroll.documentView = table
+        self.view = scroll
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        refresh()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        refresh()
+    }
+
+    func refresh() {
+        let dir = transcriptsDir()
+        let fm = FileManager.default
+        let items = (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+        var out: [(String, String, Date)] = []
+        for item in items {
+            guard item.hasSuffix(".txt"),
+                  item != "live.txt",
+                  !item.hasSuffix(".live-raw.txt") else { continue }
+            let path = dir + "/" + item
+            // Skip the symlink target duplicate view: list real files only.
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else { continue }
+            let attrs = (try? fm.attributesOfItem(atPath: path)) ?? [:]
+            let date = (attrs[.modificationDate] as? Date) ?? .distantPast
+            // Display name: strip the timestamp prefix, prettify the slug.
+            var name = String(item.dropLast(4))
+            if let r = name.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
+                                  options: .regularExpression) {
+                name.removeSubrange(r)
+            }
+            name = name.replacingOccurrences(of: "-", with: " ")
+                .replacingOccurrences(of: "_", with: " ")
+                .trimmingCharacters(in: .whitespaces)
+            if name.isEmpty { name = "(untitled)" }
+            out.append((path, name, date))
+        }
+        out.sort { $0.2 > $1.2 }
+        let changed = out.map(\.0) != files.map(\.path)
+        files = out.map { (path: $0.0, name: $0.1, date: $0.2) }
+        if changed { table.reloadData() }
+    }
+
+    @objc private func openSelected() {
+        let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
+        guard row >= 0, row < files.count else { return }
+        onOpen?(files[row].path)
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { files.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?,
+                   row: Int) -> NSView? {
+        let id = tableColumn?.identifier.rawValue ?? "name"
+        let cellID = NSUserInterfaceItemIdentifier("cell-\(id)")
+        let text: String
+        if id == "date" {
+            let df = DateFormatter()
+            df.dateStyle = .medium
+            df.timeStyle = .short
+            text = df.string(from: files[row].date)
+        } else {
+            text = files[row].name
+        }
+        let cell: NSTableCellView
+        if let reused = tableView.makeView(withIdentifier: cellID, owner: self) as? NSTableCellView {
+            cell = reused
+        } else {
+            cell = NSTableCellView()
+            cell.identifier = cellID
+            let field = NSTextField(labelWithString: "")
+            field.translatesAutoresizingMaskIntoConstraints = false
+            field.lineBreakMode = .byTruncatingTail
+            cell.addSubview(field)
+            cell.textField = field
+            NSLayoutConstraint.activate([
+                field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+                field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+                field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        }
+        cell.textField?.stringValue = text
+        if id == "date" {
+            cell.textField?.textColor = .secondaryLabelColor
+            cell.textField?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        }
+        return cell
+    }
+}
+
+// MARK: - Vocab page
+
+final class VocabViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+    private let table = NSTableView()
+    private let addField = NSTextField()
+    private var entries: [String] = []
+
+    override func loadView() {
+        let content = NSView()
+
+        let hint = NSTextField(wrappingLabelWithString:
+            "Names and jargon whisper should recognize during live transcription. "
+            + "Applied immediately — the vocabulary is read on every chunk.")
+        hint.font = NSFont.systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.translatesAutoresizingMaskIntoConstraints = false
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        let col = NSTableColumn(identifier: .init("entry"))
+        col.title = "Entry"
+        col.width = 420
+        table.addTableColumn(col)
+        table.dataSource = self
+        table.delegate = self
+        table.usesAlternatingRowBackgroundColors = true
+        table.allowsMultipleSelection = true
+        scroll.documentView = table
+
+        addField.placeholderString = "Add a name or term…"
+        addField.translatesAutoresizingMaskIntoConstraints = false
+        addField.target = self
+        addField.action = #selector(addEntry)
+
+        let addButton = NSButton(title: "Add", target: self, action: #selector(addEntry))
+        addButton.bezelStyle = .rounded
+        addButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let removeButton = NSButton(title: "Remove Selected", target: self,
+                                    action: #selector(removeSelected))
+        removeButton.bezelStyle = .rounded
+        removeButton.translatesAutoresizingMaskIntoConstraints = false
+
+        content.addSubview(hint)
+        content.addSubview(scroll)
+        content.addSubview(addField)
+        content.addSubview(addButton)
+        content.addSubview(removeButton)
+        NSLayoutConstraint.activate([
+            hint.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
+            hint.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            scroll.topAnchor.constraint(equalTo: hint.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            addField.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
+            addField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            addField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
+            addButton.leadingAnchor.constraint(equalTo: addField.trailingAnchor, constant: 8),
+            addButton.centerYAnchor.constraint(equalTo: addField.centerYAnchor),
+            removeButton.leadingAnchor.constraint(equalTo: addButton.trailingAnchor, constant: 16),
+            removeButton.centerYAnchor.constraint(equalTo: addField.centerYAnchor),
+            removeButton.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -12),
+            addField.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+        ])
+        self.view = content
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        load()
+    }
+
+    private func load() {
+        let text = (try? String(contentsOfFile: vocabPath(), encoding: .utf8)) ?? ""
+        entries = text.split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        table.reloadData()
+    }
+
+    private func save() {
+        // Same shape the file already uses: comma-separated, one line.
+        let dir = (vocabPath() as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? (entries.joined(separator: ", ") + "\n")
+            .write(toFile: vocabPath(), atomically: true, encoding: .utf8)
+    }
+
+    @objc private func addEntry() {
+        let value = addField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty else { return }
+        if !entries.contains(where: { $0.caseInsensitiveCompare(value) == .orderedSame }) {
+            entries.append(value)
+            save()
+            table.reloadData()
+        }
+        addField.stringValue = ""
+    }
+
+    @objc private func removeSelected() {
+        let rows = table.selectedRowIndexes
+        guard !rows.isEmpty else { return }
+        entries = entries.enumerated().filter { !rows.contains($0.offset) }.map(\.element)
+        save()
+        table.reloadData()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { entries.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?,
+                   row: Int) -> NSView? {
+        let cellID = NSUserInterfaceItemIdentifier("vocab-cell")
+        let cell: NSTableCellView
+        if let reused = tableView.makeView(withIdentifier: cellID, owner: self) as? NSTableCellView {
+            cell = reused
+        } else {
+            cell = NSTableCellView()
+            cell.identifier = cellID
+            let field = NSTextField(labelWithString: "")
+            field.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(field)
+            cell.textField = field
+            NSLayoutConstraint.activate([
+                field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+                field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+                field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        }
+        cell.textField?.stringValue = entries[row]
+        return cell
+    }
+}
+
+// MARK: - Upload page (queue + progress)
+
+final class UploadJob {
+    let url: URL
+    var status: String = "queued"
+    var finalPath: String? = nil
+    var done: Bool = false
+    var failed: Bool = false
+    init(url: URL) { self.url = url }
+}
+
+final class UploadViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+    private let table = NSTableView()
+    private var jobs: [UploadJob] = []
+    private var running = false
+    var onOpenTranscript: ((String) -> Void)?
+
+    private let dropLabel = NSTextField(labelWithString: "Drop audio files here to transcribe")
+    private let dropBox = NSBox()
+
+    override func loadView() {
+        let content = NSView()
+
+        dropBox.boxType = .custom
+        dropBox.cornerRadius = 14
+        dropBox.borderWidth = 2
+        dropBox.borderColor = NSColor.systemIndigo.withAlphaComponent(0.5)
+        dropBox.fillColor = NSColor.systemIndigo.withAlphaComponent(0.06)
+        dropBox.translatesAutoresizingMaskIntoConstraints = false
+
+        dropLabel.font = NSFont.boldSystemFont(ofSize: 16)
+        dropLabel.textColor = .systemIndigo
+        dropLabel.translatesAutoresizingMaskIntoConstraints = false
+        let sub = NSTextField(labelWithString:
+            "wav · m4a · mp3 · aiff · flac · mp4 · mov — multiple files queue up")
+        sub.font = NSFont.systemFont(ofSize: 11)
+        sub.textColor = .tertiaryLabelColor
+        sub.translatesAutoresizingMaskIntoConstraints = false
+        dropBox.contentView?.addSubview(dropLabel)
+        dropBox.contentView?.addSubview(sub)
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        let fileCol = NSTableColumn(identifier: .init("file"))
+        fileCol.title = "File"
+        fileCol.width = 260
+        let statusCol = NSTableColumn(identifier: .init("status"))
+        statusCol.title = "Status"
+        statusCol.width = 300
+        table.addTableColumn(fileCol)
+        table.addTableColumn(statusCol)
+        table.dataSource = self
+        table.delegate = self
+        table.usesAlternatingRowBackgroundColors = true
+        table.rowHeight = 26
+        scroll.documentView = table
+
+        content.addSubview(dropBox)
+        content.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            dropBox.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
+            dropBox.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            dropBox.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            dropBox.heightAnchor.constraint(equalToConstant: 110),
+            dropLabel.centerXAnchor.constraint(equalTo: dropBox.centerXAnchor),
+            dropLabel.centerYAnchor.constraint(equalTo: dropBox.centerYAnchor, constant: -10),
+            sub.centerXAnchor.constraint(equalTo: dropBox.centerXAnchor),
+            sub.topAnchor.constraint(equalTo: dropLabel.bottomAnchor, constant: 4),
+            scroll.topAnchor.constraint(equalTo: dropBox.bottomAnchor, constant: 12),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+        ])
+        self.view = content
+    }
+
+    func setDragActive(_ active: Bool) {
+        dropBox.borderColor = NSColor.systemIndigo.withAlphaComponent(active ? 1.0 : 0.5)
+        dropBox.fillColor = NSColor.systemIndigo.withAlphaComponent(active ? 0.15 : 0.06)
+    }
+
+    func enqueue(_ urls: [URL]) {
+        for url in urls {
+            jobs.append(UploadJob(url: url))
+        }
+        table.reloadData()
+        pump()
+    }
+
+    /// One job at a time from the app's side; the launcher's machine-wide
+    /// lock still guards against external concurrent refines.
+    private func pump() {
+        guard !running, let job = jobs.first(where: { !$0.done && !$0.failed && $0.status == "queued" }),
+              let launcher = launcherPath() else { return }
+        running = true
+        job.status = "starting…"
+        table.reloadData()
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["refine", job.url.path]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+
+        var lineBuffer = Data()
+        var allOutput = ""
+        pipe.fileHandleForReading.readabilityHandler = { [weak self, weak job] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            lineBuffer.append(data)
+            while let nl = lineBuffer.firstIndex(of: 0x0A) {
+                let lineData = lineBuffer.subdata(in: lineBuffer.startIndex..<nl)
+                lineBuffer.removeSubrange(lineBuffer.startIndex...nl)
+                guard let raw = String(data: lineData, encoding: .utf8) else { continue }
+                let line = raw.replacingOccurrences(
+                    of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespaces)
+                allOutput += line + "\n"
+                var newStatus: String? = nil
+                if line.hasPrefix("refine: progress"),
+                   let pct = Int(line.split(separator: " ").last ?? "") {
+                    let phase = line.contains(" diarize ") ? "identifying speakers" : "transcribing"
+                    newStatus = "\(phase) \(pct)%"
+                } else if line.hasPrefix("refine: status ") {
+                    newStatus = String(line.dropFirst("refine: status ".count))
+                } else if line.hasPrefix("TRANSCRIPT_PATH: ") {
+                    job?.finalPath = String(line.dropFirst("TRANSCRIPT_PATH: ".count))
+                }
+                if let st = newStatus {
+                    DispatchQueue.main.async {
+                        job?.status = st
+                        self?.table.reloadData()
+                    }
+                }
+            }
+        }
+        proc.terminationHandler = { [weak self, weak job] p in
+            pipe.fileHandleForReading.readabilityHandler = nil
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if p.terminationStatus == 0, job?.finalPath != nil {
+                    job?.done = true
+                    job?.status = "complete"
+                } else {
+                    job?.failed = true
+                    job?.status = "failed — " + String(allOutput.suffix(120))
+                }
+                self.running = false
+                self.table.reloadData()
+                self.pump()
+            }
+        }
+        do { try proc.run() } catch {
+            job.failed = true
+            job.status = "couldn't launch"
+            running = false
+            table.reloadData()
+        }
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { jobs.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?,
+                   row: Int) -> NSView? {
+        let job = jobs[row]
+        let id = tableColumn?.identifier.rawValue ?? "file"
+        if id == "file" {
+            let cell = NSTableCellView()
+            let field = NSTextField(labelWithString: job.url.lastPathComponent)
+            field.lineBreakMode = .byTruncatingMiddle
+            field.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(field)
+            cell.textField = field
+            NSLayoutConstraint.activate([
+                field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+                field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+                field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+            return cell
+        }
+        // Status column: text, or the completion button.
+        let cell = NSTableCellView()
+        if job.done {
+            let button = NSButton(title: "Upload complete — go to transcript",
+                                  target: self, action: #selector(goToTranscript(_:)))
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+            button.tag = row
+            button.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(button)
+            NSLayoutConstraint.activate([
+                button.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+                button.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        } else {
+            let field = NSTextField(labelWithString: job.status)
+            field.textColor = job.failed ? .systemRed : .secondaryLabelColor
+            field.font = NSFont.systemFont(ofSize: 11)
+            field.lineBreakMode = .byTruncatingTail
+            field.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(field)
+            cell.textField = field
+            NSLayoutConstraint.activate([
+                field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+                field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+                field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        }
+        return cell
+    }
+
+    @objc private func goToTranscript(_ sender: NSButton) {
+        guard sender.tag >= 0, sender.tag < jobs.count,
+              let path = jobs[sender.tag].finalPath else { return }
+        onOpenTranscript?(path)
+    }
+}
+
+// MARK: - Main window (status strip + sidebar + detail)
+
+final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+    private let sidebarItems = ["Meetings", "Vocab", "Upload"]
+    private let sidebar = NSTableView()
+
+    private let stripDot = NSTextField(labelWithString: "●")
+    private let stripLabel = NSTextField(labelWithString: "")
+    private let liveButton = NSButton(title: "Open Live Transcript", target: nil, action: nil)
+
+    private let detailContainer = NSView()
+    private var currentDetail: NSViewController?
+
+    let meetingsVC = MeetingsViewController()
+    let vocabVC = VocabViewController()
+    let uploadVC = UploadViewController()
+    let readerVC = TranscriptViewController()
+
+    private var pollTimer: Timer?
+
+    convenience init(forRealUse: Bool) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 960, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered, defer: false)
+        window.title = "Meetink"
+        window.center()
+        window.setFrameAutosaveName("MeetinkMainWindow")
+        window.minSize = NSSize(width: 640, height: 400)
+        self.init(window: window)
+        buildUI()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.updateStrip()
+        }
+        updateStrip()
+    }
+
+    private func buildUI() {
+        guard let window = self.window else { return }
+        let container = DropContainerView(frame: window.contentView?.bounds ?? .zero)
+        container.onAudioDrop = { [weak self] urls in
+            guard let self else { return }
+            self.uploadVC.enqueue(urls)
+            self.showPage(2)
+            self.sidebar.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+        }
+        container.onDragState = { [weak self] active in
+            self?.uploadVC.setDragActive(active)
+        }
+        window.contentView = container
+        guard let content = window.contentView else { return }
+
+        // Status strip.
+        let strip = NSStackView()
+        strip.orientation = .horizontal
+        strip.spacing = 8
+        strip.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        stripDot.font = NSFont.systemFont(ofSize: 12)
+        stripLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        liveButton.bezelStyle = .rounded
+        liveButton.controlSize = .small
+        liveButton.target = self
+        liveButton.action = #selector(openLive)
+        strip.addArrangedSubview(stripDot)
+        strip.addArrangedSubview(stripLabel)
+        strip.addArrangedSubview(NSView())
+        strip.addArrangedSubview(liveButton)
+
+        let stripDivider = NSBox()
+        stripDivider.boxType = .separator
+        stripDivider.translatesAutoresizingMaskIntoConstraints = false
+
+        // Sidebar.
+        let sideScroll = NSScrollView()
+        sideScroll.translatesAutoresizingMaskIntoConstraints = false
+        sideScroll.hasVerticalScroller = false
+        let col = NSTableColumn(identifier: .init("nav"))
+        sidebar.addTableColumn(col)
+        sidebar.headerView = nil
+        sidebar.rowHeight = 30
+        sidebar.dataSource = self
+        sidebar.delegate = self
+        sidebar.style = .sourceList
+        sideScroll.documentView = sidebar
+
+        let sideDivider = NSBox()
+        sideDivider.boxType = .separator
+        sideDivider.translatesAutoresizingMaskIntoConstraints = false
+
+        detailContainer.translatesAutoresizingMaskIntoConstraints = false
+
+        content.addSubview(strip)
+        content.addSubview(stripDivider)
+        content.addSubview(sideScroll)
+        content.addSubview(sideDivider)
+        content.addSubview(detailContainer)
+        NSLayoutConstraint.activate([
+            strip.topAnchor.constraint(equalTo: content.topAnchor),
+            strip.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            strip.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            strip.heightAnchor.constraint(equalToConstant: 34),
+            stripDivider.topAnchor.constraint(equalTo: strip.bottomAnchor),
+            stripDivider.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stripDivider.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            sideScroll.topAnchor.constraint(equalTo: stripDivider.bottomAnchor),
+            sideScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            sideScroll.widthAnchor.constraint(equalToConstant: 150),
+            sideScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            sideDivider.topAnchor.constraint(equalTo: stripDivider.bottomAnchor),
+            sideDivider.leadingAnchor.constraint(equalTo: sideScroll.trailingAnchor),
+            sideDivider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            sideDivider.widthAnchor.constraint(equalToConstant: 1),
+            detailContainer.topAnchor.constraint(equalTo: stripDivider.bottomAnchor),
+            detailContainer.leadingAnchor.constraint(equalTo: sideDivider.trailingAnchor),
+            detailContainer.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            detailContainer.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+        ])
+
+        meetingsVC.onOpen = { [weak self] path in
+            self?.openTranscript(path)
+        }
+        uploadVC.onOpenTranscript = { [weak self] path in
+            self?.openTranscript(path)
+        }
+
+        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        showPage(0)
+    }
+
+    private func setDetail(_ vc: NSViewController) {
+        if let old = currentDetail {
+            old.view.removeFromSuperview()
+            old.removeFromParent()
+        }
+        currentDetail = vc
+        vc.view.translatesAutoresizingMaskIntoConstraints = false
+        detailContainer.addSubview(vc.view)
+        NSLayoutConstraint.activate([
+            vc.view.topAnchor.constraint(equalTo: detailContainer.topAnchor),
+            vc.view.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor),
+            vc.view.trailingAnchor.constraint(equalTo: detailContainer.trailingAnchor),
+            vc.view.bottomAnchor.constraint(equalTo: detailContainer.bottomAnchor),
+        ])
+    }
+
+    func showPage(_ index: Int) {
+        switch index {
+        case 0: setDetail(meetingsVC)
+        case 1: setDetail(vocabVC)
+        default: setDetail(uploadVC)
+        }
+    }
+
+    func openTranscript(_ path: String?) {
+        readerVC.show(path: path)
+        setDetail(readerVC)
+        sidebar.deselectAll(nil)
+        if path == nil {
+            sidebar.selectRowIndexes(IndexSet(), byExtendingSelection: false)
+        }
+    }
+
+    @objc private func openLive() {
+        openTranscript(nil)
+    }
+
+    private func updateStrip() {
+        let recording = recordingPID() != nil
+        stripDot.textColor = recording ? .systemRed : .tertiaryLabelColor
+        stripLabel.stringValue = recording ? "Recording" : "Not recording"
+        liveButton.title = recording ? "Open Live Transcript" : "Open Latest Transcript"
+    }
+
+    // Sidebar table.
+    func numberOfRows(in tableView: NSTableView) -> Int { sidebarItems.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?,
+                   row: Int) -> NSView? {
+        let cellID = NSUserInterfaceItemIdentifier("nav-cell")
+        let cell: NSTableCellView
+        if let reused = tableView.makeView(withIdentifier: cellID, owner: self) as? NSTableCellView {
+            cell = reused
+        } else {
+            cell = NSTableCellView()
+            cell.identifier = cellID
+            let field = NSTextField(labelWithString: "")
+            field.font = NSFont.systemFont(ofSize: 13)
+            field.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(field)
+            cell.textField = field
+            NSLayoutConstraint.activate([
+                field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+                field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        }
+        cell.textField?.stringValue = sidebarItems[row]
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard sidebar.selectedRow >= 0 else { return }
+        showPage(sidebar.selectedRow)
+    }
+}
+
+// MARK: - App delegate (menubar + lifecycle)
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var transcriptWC: TranscriptWindowController?
-    private var importWCs: [TranscriptWindowController] = []
+    private var mainWC: MainWindowController?
     private var pollTimer: Timer?
     private var lastRecording = false
     private var reallyQuit = false
 
-    /// ⌘Q / Dock-quit / switcher-quit means "put the window away" — the
-    /// menubar presence is the app and should survive (Slack/Discord
-    /// pattern). Real exit is the menubar's "Quit Completely". System
-    /// shutdown/logout must still work: those quit events carry a 'why?'
-    /// reason attribute, and we always honor them.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if reallyQuit { return .terminateNow }
         if let event = NSAppleEventManager.shared().currentAppleEvent,
            event.attributeDescriptor(forKeyword: AEKeyword(0x7768793F) /* 'why?' */) != nil {
             return .terminateNow   // shutdown / restart / logout
         }
-        transcriptWC?.window?.close()
+        mainWC?.window?.close()
         NSApp.setActivationPolicy(.accessory)
         return .terminateCancel
     }
@@ -861,11 +1300,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMainMenu()
-        // Dock/⌘Tab icon: the bundle's Meetink.icns is the source of truth;
-        // this runtime copy only covers running the bare binary outside the
-        // bundle (dev/testing). Indigo glyph on a light tile — the glyph
-        // carries the color so macOS 26's auto dark-mode icon variant
-        // (dark tile, glyph preserved) stays recognizable.
         NSApp.applicationIconImage = mWaveformImage(
             size: 512,
             barColor: NSColor(srgbRed: 0.345, green: 0.337, blue: 0.839, alpha: 1),
@@ -879,47 +1313,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.pollState()
         }
 
-        // Window-close drops us back to menubar-only (.accessory) once the
-        // LAST window (main or import) goes away, so the Dock/⌘Tab entry
-        // only exists while there's a window to switch to.
         NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] note in
-                guard let self, let closing = note.object as? NSWindow else { return }
-                self.importWCs.removeAll { $0.window == closing }
-                let mainOpen = self.transcriptWC?.window.map {
-                    $0.isVisible && $0 != closing } ?? false
-                let importsOpen = self.importWCs.contains {
-                    $0.window.map { $0.isVisible && $0 != closing } ?? false }
-                if !mainOpen && !importsOpen {
-                    NSApp.setActivationPolicy(.accessory)
-                }
+                guard let self, let closing = note.object as? NSWindow,
+                      closing == self.mainWC?.window else { return }
+                NSApp.setActivationPolicy(.accessory)
             }
 
-        showTranscript()
+        showApp()
     }
 
-    /// meetink://transcribe — the REPL's /upload opens the same picker the
-    /// menubar action uses (URL scheme is the one IPC channel an already-
-    /// running app gets for free).
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls where url.scheme == "meetink" {
             if url.host == "transcribe" {
-                transcribeAudio()
+                showApp(page: 2)
             }
         }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication,
                                        hasVisibleWindows flag: Bool) -> Bool {
-        showTranscript()
+        showApp()
         return true
     }
 
-    /// Key equivalents (⌘F/⌘C/⌘A/⌘W/⌘Q) resolve through the main menu —
-    /// which a bare NSApplication.run() app doesn't have until we build one.
     private func buildMainMenu() {
         let main = NSMenu()
-
         let appItem = NSMenuItem()
         main.addItem(appItem)
         let appMenu = NSMenu()
@@ -927,8 +1346,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")
         appMenu.addItem(.separator())
-        // ⌘Q routes through applicationShouldTerminate → retreats to the
-        // menu bar rather than exiting (see note there).
         appMenu.addItem(withTitle: "Quit to Menu Bar",
                         action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
@@ -945,6 +1362,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(withTitle: "Copy",
                          action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste",
+                         action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All",
                          action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenu.addItem(.separator())
@@ -958,11 +1377,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                   keyEquivalent: "g")
         findNext.tag = Int(NSTextFinder.Action.nextMatch.rawValue)
         editMenu.addItem(findNext)
-        let findPrev = NSMenuItem(title: "Find Previous",
-                                  action: #selector(NSResponder.performTextFinderAction(_:)),
-                                  keyEquivalent: "G")
-        findPrev.tag = Int(NSTextFinder.Action.previousMatch.rawValue)
-        editMenu.addItem(findPrev)
         editItem.submenu = editMenu
 
         let windowItem = NSMenuItem()
@@ -972,7 +1386,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                            action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowItem.submenu = windowMenu
         NSApp.windowsMenu = windowMenu
-
         NSApp.mainMenu = main
     }
 
@@ -993,7 +1406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.image = img
         } else {
             let img = mWaveformImage(size: 18, barColor: .black)
-            img.isTemplate = true   // adapts to menubar light/dark
+            img.isTemplate = true
             button.image = img
         }
     }
@@ -1009,8 +1422,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(status)
         menu.addItem(.separator())
 
-        // One toggle, not a Start + Stop pair — recording is binary, and
-        // showing a disabled twin of the current state was just noise.
         let toggle = NSMenuItem(
             title: recording ? "Stop Recording" : "Start Recording",
             action: recording ? #selector(stopRecording) : #selector(startRecording),
@@ -1020,21 +1431,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(toggle)
 
         menu.addItem(.separator())
-        let show = NSMenuItem(title: "Show Transcript",
-                              action: #selector(showTranscriptAction), keyEquivalent: "t")
+        let show = NSMenuItem(title: "Open Meetink",
+                              action: #selector(showAppAction), keyEquivalent: "t")
         show.target = self
         menu.addItem(show)
 
         let upload = NSMenuItem(title: "Transcribe Audio",
                                 action: #selector(transcribeAudio), keyEquivalent: "u")
         upload.target = self
-        upload.isEnabled = launcherPath() != nil
         menu.addItem(upload)
 
         let repl = NSMenuItem(title: "Open REPL",
                               action: #selector(openREPL), keyEquivalent: "r")
         repl.target = self
-        repl.isEnabled = launcherPath() != nil
         menu.addItem(repl)
 
         let folder = NSMenuItem(title: "Open Transcripts Folder",
@@ -1056,14 +1465,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launcher)
         proc.arguments = [subcommand]
-        // The app IS the tail window — suppress the terminal one the
-        // launcher would otherwise open (window.sh also auto-detects the
-        // app, this is belt-and-suspenders for older launcher revisions).
         var env = ProcessInfo.processInfo.environment
         env["MEETINK_NO_TAIL"] = "1"
         proc.environment = env
-        // Never discard launcher output: a start that dies pre-spawn (the
-        // whisper-server-not-on-PATH incident) must leave a trail.
         let logPath = "/tmp/meetink-app-launcher.log"
         if !FileManager.default.fileExists(atPath: logPath) {
             FileManager.default.createFile(atPath: logPath, contents: nil)
@@ -1075,20 +1479,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             proc.standardError = h
         }
         try? proc.run()
-        // Recording state flips within a couple of seconds; poll early so
-        // the icon doesn't lag the click.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             self?.pollState()
         }
     }
 
-    @objc private func startRecording() { runLauncher("start"); showTranscript() }
-    @objc private func stopRecording() { runLauncher("stop") }
-    @objc private func showTranscriptAction() { showTranscript() }
+    @objc private func startRecording() {
+        runLauncher("start")
+        showApp()
+        mainWC?.openTranscript(nil)
+    }
 
-    /// Open the meetink REPL in the user's terminal — iTerm when installed
-    /// (matches where meetink users live), Terminal.app otherwise. First use
-    /// triggers a one-time Automation prompt (Meetink → iTerm/Terminal).
+    @objc private func stopRecording() { runLauncher("stop") }
+    @objc private func showAppAction() { showApp() }
+
+    @objc private func transcribeAudio() { showApp(page: 2) }
+
     @objc private func openREPL() {
         guard let launcher = launcherPath() else { return }
         let hasITerm = FileManager.default.fileExists(atPath: "/Applications/iTerm.app")
@@ -1115,140 +1521,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openFolder() {
-        let base = (liveSymlinkPath() as NSString).deletingLastPathComponent
-        NSWorkspace.shared.open(URL(fileURLWithPath: base))
+        NSWorkspace.shared.open(URL(fileURLWithPath: transcriptsDir()))
     }
 
-    private func showTranscript() {
-        if transcriptWC == nil {
-            transcriptWC = TranscriptWindowController(fixedPath: nil, autosave: true)
-            transcriptWC?.importHandler = { [weak self] url in
-                guard let self else { return }
-                self.startImport(url, into: self.transcriptWC)
-            }
+    private func showApp(page: Int? = nil) {
+        if mainWC == nil {
+            mainWC = MainWindowController(forRealUse: true)
         }
-        // "Show Transcript" means the LIVE transcript — if a drop
-        // repurposed the main window into an import view, put it back.
-        if transcriptWC?.isShowingImport == true {
-            transcriptWC?.returnToLive()
-        }
-        // Visible window → appear in ⌘Tab and the Dock so the app can't be
-        // "lost" behind other windows. Back to .accessory on window close.
         NSApp.setActivationPolicy(.regular)
-        transcriptWC?.showWindow(nil)
-        transcriptWC?.window?.makeKeyAndOrderFront(nil)
+        mainWC?.showWindow(nil)
+        mainWC?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-    }
-
-    // MARK: Audio-file import
-
-    /// Menubar "Transcribe Audio" (and /upload via meetink://transcribe):
-    /// opens a persistent blank window inviting a drag-and-drop. The window
-    /// stays put — progress renders in it, then the finished transcript.
-    /// Deliberately NOT a file picker: modal panels from a menubar app are
-    /// easy to lose, and the drop flow is the one every other window
-    /// already teaches.
-    @objc private func transcribeAudio() {
-        let wc = TranscriptWindowController(fixedPath: nil)
-        wc.importHandler = { [weak self, weak wc] u in
-            self?.startImport(u, into: wc)
+        if let page {
+            mainWC?.showPage(page)
         }
-        importWCs.append(wc)
-        wc.showDropPrompt()
-        NSApp.setActivationPolicy(.regular)
-        wc.showWindow(nil)
-        wc.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    /// Drops pass the window they landed on as `into`; it's reused only if
-    /// it's an empty viewer, otherwise a new window opens. Menubar/URL
-    /// invocations pass nil (always a new window).
-    private func startImport(_ url: URL, into target: TranscriptWindowController?) {
-        if recordingPID() != nil {
-            let alert = NSAlert()
-            alert.messageText = "Recording in progress"
-            alert.informativeText =
-                "Stop the current recording before importing an audio file."
-            alert.runModal()
-            return
-        }
-        guard let launcher = launcherPath() else { return }
-
-        // Occupancy decides: an empty window (no transcript, not busy)
-        // gets filled; a window tied to content spawns a sibling.
-        let wc: TranscriptWindowController
-        if let target, target.isEmptyViewer {
-            wc = target
-        } else {
-            wc = TranscriptWindowController(fixedPath: nil)
-            wc.importHandler = { [weak self, weak wc] u in
-                self?.startImport(u, into: wc)
-            }
-            importWCs.append(wc)
-        }
-        wc.window?.title = "Import — \(url.lastPathComponent)"
-        NSApp.setActivationPolicy(.regular)
-        wc.showWindow(nil)
-        wc.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        wc.beginImportProgress(filename: url.lastPathComponent)
-
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: launcher)
-        proc.arguments = ["refine", url.path]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-
-        // Stream the launcher's output live: "refine: progress <label> <pct>"
-        // lines drive the bar; "TRANSCRIPT_PATH: ..." names the final file
-        // (titling renames it, so the pre-import name is useless).
-        var lineBuffer = Data()
-        var finalPath: String? = nil
-        var allOutput = ""
-        pipe.fileHandleForReading.readabilityHandler = { [weak wc] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            lineBuffer.append(data)
-            while let nl = lineBuffer.firstIndex(of: 0x0A) {
-                let lineData = lineBuffer.subdata(in: lineBuffer.startIndex..<nl)
-                lineBuffer.removeSubrange(lineBuffer.startIndex...nl)
-                guard let raw = String(data: lineData, encoding: .utf8) else { continue }
-                let line = raw.replacingOccurrences(
-                    of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
-                    .trimmingCharacters(in: .whitespaces)
-                allOutput += line + "\n"
-                if line.hasPrefix("refine: progress"),
-                   let pct = Int(line.split(separator: " ").last ?? "") {
-                    // Status lines own the label; progress events only move
-                    // the bar (and flip it back to determinate).
-                    DispatchQueue.main.async { wc?.updateImportProgress(pct) }
-                } else if line.hasPrefix("refine: status ") {
-                    let status = String(line.dropFirst("refine: status ".count))
-                    DispatchQueue.main.async {
-                        wc?.updateImportStatus("\(url.lastPathComponent): \(status)")
-                    }
-                } else if line.hasPrefix("TRANSCRIPT_PATH: ") {
-                    finalPath = String(line.dropFirst("TRANSCRIPT_PATH: ".count))
-                }
-            }
-        }
-        proc.terminationHandler = { [weak wc] p in
-            pipe.fileHandleForReading.readabilityHandler = nil
-            DispatchQueue.main.async {
-                if p.terminationStatus == 0, let path = finalPath {
-                    wc?.finishImport(path: path)
-                } else {
-                    wc?.finishImport(path: nil)
-                    let alert = NSAlert()
-                    alert.messageText = "Couldn't transcribe \(url.lastPathComponent)"
-                    alert.informativeText = String(allOutput.suffix(400))
-                    alert.runModal()
-                }
-            }
-        }
-        try? proc.run()
     }
 }
 
