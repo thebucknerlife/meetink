@@ -172,6 +172,56 @@ final class AudioBuffer: @unchecked Sendable {
     }
 }
 
+// MARK: - Simulation mode (test harness)
+
+// MEETINK_SIM_SYS / MEETINK_SIM_MIC (raw s16le/16k/mono files, prepared by
+// `meetink simulate`) feed file audio through the REAL pipeline at
+// MEETINK_SIM_RATE x real time — same buffers the hardware taps fill, so
+// the RMS gate, live whisper, live diarization, merger, spooling and the
+// whole /stop pipeline behave exactly as in a meeting. No SCK, no mic,
+// therefore NO permissions — runs anywhere, including CI-ish contexts.
+
+func loadRawSamples(_ path: String) -> [Float] {
+    guard let data = FileManager.default.contents(atPath: path) else { return [] }
+    var out = [Float]()
+    out.reserveCapacity(data.count / 2)
+    data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+        for v in buf.bindMemory(to: Int16.self) {
+            out.append(Float(Int16(littleEndian: v)) / 32768.0)
+        }
+    }
+    return out
+}
+
+func startSimFeeder(sysPath: String?, micPath: String?, rate: Double,
+                    buffer: AudioBuffer) {
+    let sys = sysPath.map(loadRawSamples) ?? []
+    let mic = micPath.map(loadRawSamples) ?? []
+    fputs("sim inputs: sys=\(sys.count / Int(sampleRate))s "
+          + "mic=\(mic.count / Int(sampleRate))s rate=\(rate)x\n", stderr)
+    Thread.detachNewThread {
+        var si = 0, mi = 0
+        let tick = 0.5
+        let per = max(1, Int(Double(sampleRate) * tick * rate))
+        while si < sys.count || mi < mic.count {
+            if si < sys.count {
+                let end = min(si + per, sys.count)
+                buffer.appendSystem(Array(sys[si..<end]))
+                si = end
+            }
+            if mi < mic.count {
+                let end = min(mi + per, mic.count)
+                buffer.appendMic(Array(mic[mi..<end]))
+                mi = end
+            }
+            Thread.sleep(forTimeInterval: tick)
+        }
+        // The launcher's `meetink simulate` greps for this marker, drains,
+        // and auto-runs stop.
+        fputs("simulation input exhausted\n", stderr)
+    }
+}
+
 // MARK: - Transcription via whisper-server
 
 /// RMS floor below which a chunk is treated as silence and never sent to
@@ -1018,7 +1068,20 @@ struct LocalSpeechCapture {
 
         let audioBuffer = AudioBuffer()
 
+        // --- Simulation mode: file audio instead of hardware ---
+        let simSysPath = ProcessInfo.processInfo.environment["MEETINK_SIM_SYS"]
+        let simMicPath = ProcessInfo.processInfo.environment["MEETINK_SIM_MIC"]
+        let simMode = simSysPath != nil || simMicPath != nil
+        let simRate = Double(ProcessInfo.processInfo.environment["MEETINK_SIM_RATE"] ?? "1") ?? 1.0
+        if simMode {
+            fputs("SIMULATION MODE — file audio through the real pipeline, no hardware, no permissions\n", stderr)
+            startSimFeeder(sysPath: simSysPath, micPath: simMicPath,
+                           rate: simRate, buffer: audioBuffer)
+        }
+
         // --- System audio via ScreenCaptureKit ---
+        var scStream: SCStream? = nil
+        if !simMode {
         fputs("Requesting screen capture permission...\n", stderr)
 
         let content: SCShareableContent
@@ -1058,7 +1121,9 @@ struct LocalSpeechCapture {
             Foundation.exit(1)
         }
 
+        scStream = stream
         fputs("System audio capture started\n", stderr)
+        }
 
         // --- Microphone via AVAudioEngine ---
         //
@@ -1087,6 +1152,12 @@ struct LocalSpeechCapture {
         // All three converge on the same rebuild path, serialised on a
         // dedicated queue so a flurry of signals doesn't fire concurrent
         // engine.stop() / installTap() calls.
+        //
+        // (Simulation mode skips ALL of this — the feeder thread fills the
+        // same AudioBuffer directly, so no mic hardware, no permissions.)
+        var micEngineRef: AVAudioEngine? = nil
+        var micWatchdogRef: DispatchSourceTimer? = nil
+        if !simMode {
         let engine = AVAudioEngine()
 
         // Acoustic echo cancellation — OPT-IN (MEETINK_AEC=on), default off.
@@ -1236,6 +1307,9 @@ struct LocalSpeechCapture {
             }
         }
         micWatchdogTimer.resume()
+        micEngineRef = engine
+        micWatchdogRef = micWatchdogTimer
+        }
 
         fputs("\n=== Meeting capture running ===\n", stderr)
         fputs("Transcript: \(transcriptPath)\n", stderr)
@@ -1302,10 +1376,12 @@ struct LocalSpeechCapture {
         }
 
         // --- Shutdown ---
-        micWatchdogTimer.cancel()
-        engine.stop()
-        engine.inputNode.removeTap(onBus: 0)
-        try await stream.stopCapture()
+        micWatchdogRef?.cancel()
+        micEngineRef?.stop()
+        micEngineRef?.inputNode.removeTap(onBus: 0)
+        if let scStream {
+            try await scStream.stopCapture()
+        }
 
         // Flush any buffered merged transcript lines
         transcriptMerger.flushAll()

@@ -301,6 +301,78 @@ cmd_upload() {
     print -P "${C[green]}✓${C[reset]} Opening the Transcribe Audio window in Meetink.app"
 }
 
+# --- Simulated meeting (test harness) ---
+# Feed audio file(s) through the ENTIRE real pipeline without hardware or
+# permissions: whisper live, diarize live, the app window filling in, spool,
+# and the full stop pipeline (refine -> names -> title -> summary). The
+# capture binary's simulation mode replaces only the hardware taps.
+#
+#   meetink simulate call.m4a                 # file = the remote side (headset call)
+#   meetink simulate --mic room.m4a           # file = the mic (in-person / speakerphone)
+#   meetink simulate --sys a.m4a --mic b.m4a  # hybrid
+#   ... [--rate 3]                            # 3x faster than real time
+cmd_simulate() {
+    local sys="" mic="" rate=1
+    while (( $# > 0 )); do
+        case "$1" in
+            --sys)  sys="$2";  shift 2 ;;
+            --mic)  mic="$2";  shift 2 ;;
+            --rate) rate="$2"; shift 2 ;;
+            *)      if [[ -z "$sys" ]]; then sys="$1"; else mic="$1"; fi; shift ;;
+        esac
+    done
+    if [[ -z "$sys" && -z "$mic" ]]; then
+        print -P "${C[red]}usage:${C[reset]} meetink simulate [--sys file] [--mic file] [--rate N] <file>"
+        print -P "  ${C[dim]}Bare file = system audio (a normal call). --mic = in-person/speakerphone. Both = hybrid.${C[reset]}"
+        return 1
+    fi
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        print -P "${C[red]}error:${C[reset]} ffmpeg not found (brew install ffmpeg)"
+        return 1
+    fi
+    local f
+    for f in "$sys" "$mic"; do
+        if [[ -n "$f" && ! -f "$f" ]]; then
+            print -P "${C[red]}error:${C[reset]} no such file: $f"
+            return 1
+        fi
+    done
+
+    local simdir="/tmp/meetink-sim"
+    mkdir -p "$simdir"
+    export MEETINK_SIM_RATE="$rate"
+    if [[ -n "$sys" ]]; then
+        ffmpeg -v error -y -i "$sys" -ar 16000 -ac 1 -f s16le "$simdir/sys.raw" || return 1
+        export MEETINK_SIM_SYS="$simdir/sys.raw"
+    fi
+    if [[ -n "$mic" ]]; then
+        ffmpeg -v error -y -i "$mic" -ar 16000 -ac 1 -f s16le "$simdir/mic.raw" || return 1
+        export MEETINK_SIM_MIC="$simdir/mic.raw"
+    fi
+
+    print -P "${C[bright_yellow]}▸${C[reset]} ${C[bold]}Simulated meeting${C[reset]} ${C[dim]}(rate ${rate}x — watch the app window; auto-stops when the audio ends)${C[reset]}"
+    cmd_start
+
+    # Wait for the feeder's end-marker, give the last chunks a drain window,
+    # then run the full stop pipeline automatically.
+    local waited=0
+    while ! grep -q "simulation input exhausted" /tmp/meetink-capture.log 2>/dev/null; do
+        sleep 2
+        waited=$((waited + 2))
+        if [[ ! -f "$PID_FILE" ]] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            print -P "${C[yellow]}⚠${C[reset]} capture exited before the simulation finished ${C[dim]}(see /tmp/meetink-capture.log)${C[reset]}"
+            break
+        fi
+        if (( waited > 14400 )); then
+            print -P "${C[yellow]}⚠${C[reset]} simulation timeout"
+            break
+        fi
+    done
+    sleep 8
+    cmd_stop
+    unset MEETINK_SIM_SYS MEETINK_SIM_MIC MEETINK_SIM_RATE
+}
+
 # --- Download whisper model ---
 download_model() {
     local model_name="${1:-small.en}"
@@ -921,6 +993,7 @@ cmd_help() {
     bullet "app      " "launch Meetink.app (menu bar + native transcript window)"
     bullet "refine   " "transcribe an audio file (post-meeting refine runs on stop)"
     bullet "upload   " "open the app's Transcribe Audio drop window"
+    bullet "simulate " "test harness: feed an audio file through the real pipeline (--mic/--sys/--rate)"
     bullet "prompt   " "edit the custom vocabulary (names/jargon whisper should know)"
     bullet "help     " "show this help"
     print -P ""
@@ -977,6 +1050,7 @@ case "${1:-}" in
     refine|import|transcribe)
                        shift 2>/dev/null; cmd_refine "$@" ;;
     upload)            cmd_upload ;;
+    simulate|sim)      shift 2>/dev/null; cmd_simulate "$@" ;;
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
     _build_capture)    build_capture ;;

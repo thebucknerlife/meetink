@@ -875,7 +875,7 @@ SLASH_COMMANDS = [
     "/start", "/stop", "/status", "/tail", "/prompt", "/transcripts",
     "/model", "/llm", "/diarize", "/profile", "/project", "/me", "/ask",
     "/context", "/index", "/watch", "/setup", "/clear", "/help", "/quit",
-    "/upload",
+    "/upload", "/simulate",
 ]
 
 
@@ -986,6 +986,7 @@ _NESTED_COMMANDS = {
     "/prompt": None,
     "/transcripts": None,
     "/upload": None,
+    "/simulate": None,
     "/setup": None,
     "/clear": None,
     "/help": None,
