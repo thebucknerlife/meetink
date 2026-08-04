@@ -202,6 +202,60 @@ audio_archive_session() {
     return 0
 }
 
+# Re-run the refine pipeline on an EXISTING meeting using its kept audio —
+# for picking up pipeline improvements (echo suppression, diarization,
+# thresholds) on old transcripts. Prefers the two spool wavs (full
+# mic/sys separation); falls back to the mixed .m4a (single-stream).
+#   $1 = transcript path (or empty = the live/latest transcript)
+cmd_reprocess() {
+    local file="${1:-$MK_TRANSCRIPT}" actual
+    actual="$file"
+    [[ -L "$file" ]] && actual=$(readlink "$file" 2>/dev/null)
+    if [[ ! -f "$actual" ]]; then
+        print -P "${C[red]}error:${C[reset]} no such transcript: $file"
+        return 1
+    fi
+    if ! refine_available; then
+        print -P "${C[red]}error:${C[reset]} parakeet venv not installed"
+        return 1
+    fi
+    local base="${actual%.txt}"
+    local started=$(grep '^Started:' "$actual" 2>/dev/null | head -1 | sed 's/^Started: //')
+    local me=$(me_name_get 2>/dev/null)
+    local tmpdir=$(mktemp -d -t meetink-reproc)
+    local -a args=(--out "$tmpdir/out.txt" --me "${me:-ME}" --header-from "$actual")
+    [[ -n "$started" ]] && args+=(--started "$started")
+
+    if [[ -s "$base.mic.wav" || -s "$base.sys.wav" ]]; then
+        [[ -s "$base.mic.wav" ]] && { ffmpeg -v error -y -i "$base.mic.wav" -ar 16000 -ac 1 -f s16le "$tmpdir/mic.raw" && args+=(--mic "$tmpdir/mic.raw"); }
+        [[ -s "$base.sys.wav" ]] && { ffmpeg -v error -y -i "$base.sys.wav" -ar 16000 -ac 1 -f s16le "$tmpdir/sys.raw" && args+=(--sys "$tmpdir/sys.raw"); }
+        print -P "${C[bright_yellow]}▸${C[reset]} Reprocessing ${C[bold]}${actual:t}${C[reset]} ${C[dim]}(from kept spools)...${C[reset]}"
+    elif [[ -s "$base.m4a" ]]; then
+        ffmpeg -v error -y -i "$base.m4a" -ar 16000 -ac 1 -f s16le "$tmpdir/sys.raw" || { rm -rf "$tmpdir"; return 1 }
+        args+=(--sys "$tmpdir/sys.raw")
+        print -P "${C[bright_yellow]}▸${C[reset]} Reprocessing ${C[bold]}${actual:t}${C[reset]} ${C[dim]}(from kept .m4a — single stream, no mic/sys separation)...${C[reset]}"
+    else
+        print -P "${C[red]}error:${C[reset]} no kept audio for this meeting ${C[dim]}(needs .mic/.sys.wav or .m4a — enable keep audio in Settings)${C[reset]}"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    _refine_lock
+    local rc=0
+    "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log || rc=$?
+    _refine_unlock
+    if (( rc == 0 )) && grep -qE '^\[' "$tmpdir/out.txt"; then
+        cp "$actual" "${base}.pre-reprocess.txt" 2>/dev/null
+        cat "$tmpdir/out.txt" > "$actual"
+        [[ -f "$tmpdir/out.txt.timing.json" ]] && mv "$tmpdir/out.txt.timing.json" "${base}.timing.json"
+        local n=$(grep -cE '^\[[0-9:]{8}\]' "$actual")
+        print -P "${C[green]}✓${C[reset]} Reprocessed: ${n} lines ${C[dim]}(previous kept: ${base:t}.pre-reprocess.txt)${C[reset]}"
+    else
+        print -P "${C[red]}error:${C[reset]} reprocess failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
+    fi
+    rm -rf "$tmpdir"
+}
+
 # Import an audio file as a transcript: decode → parakeet → diarize →
 # title → summary. The transcript lands in the active project's folder and
 # live.txt points at it (unless a recording is in flight), so the app

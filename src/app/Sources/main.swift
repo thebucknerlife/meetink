@@ -333,6 +333,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var speakers: [(name: String, fraction: Double)] = []
     private let statusDot = NSTextField(labelWithString: "●")
     private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
+    private let folderButton = NSButton(title: "Open Folder", target: nil, action: nil)
     private let jumpButton = NSButton(title: "", target: nil, action: nil)
 
     private var pollTimer: Timer?
@@ -351,6 +352,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let timeLabel = NSTextField(labelWithString: "")
     private let scrubber = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
     private var playerBarHeight: NSLayoutConstraint? = nil
+    private let noAudioLabel = NSTextField(labelWithString: "No audio available — enable “Keep audio recording” in Settings")
     private var playTimer: Timer? = nil
     private var lineRanges: [Int: NSRange] = [:]     // line index -> text range
     private var lineOffsets: [Double] = []           // line index -> seconds into audio
@@ -376,6 +378,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         headerField.lineBreakMode = .byTruncatingTail
         headerField.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
+        folderButton.bezelStyle = .rounded
+        folderButton.controlSize = .small
+        folderButton.font = NSFont.systemFont(ofSize: 11)
+        folderButton.target = self
+        folderButton.action = #selector(openFolder)
         copyButton.bezelStyle = .rounded
         copyButton.controlSize = .small
         copyButton.font = NSFont.systemFont(ofSize: 11)
@@ -385,6 +392,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         header.addArrangedSubview(statusDot)
         header.addArrangedSubview(headerField)
         header.addArrangedSubview(NSView())
+        header.addArrangedSubview(folderButton)
         header.addArrangedSubview(copyButton)
 
         let divider = NSBox()
@@ -471,6 +479,15 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         playerBar.spacing = 10
         playerBar.edgeInsets = NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12)
         playerBar.translatesAutoresizingMaskIntoConstraints = false
+        noAudioLabel.font = NSFont.systemFont(ofSize: 11)
+        noAudioLabel.textColor = .tertiaryLabelColor
+        noAudioLabel.isHidden = true
+        playerBar.addSubview(noAudioLabel)
+        noAudioLabel.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            noAudioLabel.centerYAnchor.constraint(equalTo: playerBar.centerYAnchor),
+            noAudioLabel.leadingAnchor.constraint(equalTo: playerBar.leadingAnchor, constant: 12),
+        ])
         playerBar.addArrangedSubview(barButton("gobackward.10", #selector(back10)))
         playerBar.addArrangedSubview(playButton)
         playerBar.addArrangedSubview(barButton("goforward.10", #selector(fwd10)))
@@ -550,6 +567,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func jumpToEnd() {
         textView.scrollToEndOfDocument(nil)
         jumpButton.isHidden = true
+    }
+
+    @objc private func openFolder() {
+        guard !lastResolvedPath.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(
+            [URL(fileURLWithPath: lastResolvedPath)])
     }
 
     @objc private func copyAll() {
@@ -689,8 +712,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             audioPath = nil
             stopPlayback()
         }
-        playerBar.isHidden = audioPath == nil
-        playerBarHeight?.constant = audioPath == nil ? 0 : 34
+        // Archived transcripts always show the bar (consistent UX); it just
+        // says so when no audio was kept. Live views hide it entirely.
+        let archived = !liveRecording && !lastResolvedPath.isEmpty && !snapshot.lines.isEmpty
+        playerBar.isHidden = !archived
+        playerBarHeight?.constant = archived ? 34 : 0
+        for v in playerBar.arrangedSubviews { v.isHidden = (audioPath == nil) }
+        noAudioLabel.isHidden = !(archived && audioPath == nil)
         updatePlayerUI()
     }
 
@@ -894,21 +922,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     .foregroundColor: color(for: block.speaker),
                     .paragraphStyle: headerPara,
                 ]
-                // Every label is clickable — unnamed speakers get named,
-                // named ones can be REassigned (wrong guess, wrong person).
-                var comps = URLComponents()
-                comps.scheme = "meetink-assign"
-                comps.host = "x"
-                comps.queryItems = [URLQueryItem(name: "label", value: block.speaker)]
-                if let url = comps.url {
-                    speakerAttrs[.link] = url
-                    speakerAttrs[.toolTip] = unknownSpeakerNumber(block.speaker) != nil
-                        ? "Click to name this speaker"
-                        : "Click to reassign this speaker"
-                    speakerAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-                    speakerAttrs[.underlineColor] = color(for: block.speaker)
-                        .withAlphaComponent(0.35)
-                }
+                // Renaming lives ONLY in the speakers panel — inline names
+                // are play targets (when audio exists) or inert, so the
+                // transcript behaves identically with or without audio.
                 var stampAttrs: [NSAttributedString.Key: Any] = [
                     .font: monoFont,
                     .foregroundColor: NSColor.tertiaryLabelColor,
@@ -1004,8 +1020,106 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         table.target = self
         table.doubleAction = #selector(openSelected)
         table.usesAlternatingRowBackgroundColors = true
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Rename…", action: #selector(renameClicked), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Delete", action: #selector(deleteClicked), keyEquivalent: ""))
+        for item in menu.items { item.target = self }
+        table.menu = menu
         scroll.documentView = table
         self.view = scroll
+    }
+
+    private func clickedFile() -> (path: String, name: String)? {
+        let row = table.clickedRow
+        guard row >= 0, row < files.count else { return nil }
+        return (files[row].path, files[row].name)
+    }
+
+    /// Rename a meeting: new display name → slug, stamped prefix kept.
+    /// Folder-style sessions rename the folder + every same-basename file
+    /// (the invariant titling relies on); flat legacy files rename in place.
+    @objc private func renameClicked() {
+        guard let f = clickedFile() else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename meeting"
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = f.name
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        var slug = field.stringValue.trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "/", with: "-")
+        guard !slug.isEmpty else { return }
+        slug = slug.replacingOccurrences(of: " ", with: "-")
+        let fm = FileManager.default
+        let base = ((f.path as NSString).lastPathComponent as NSString).deletingPathExtension
+        // Keep the leading timestamp if present.
+        var prefix = ""
+        if let r = base.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
+                              options: .regularExpression) {
+            prefix = String(base[r])
+            if !prefix.hasSuffix("_") { prefix += "_" }
+        }
+        let newBase = prefix + slug
+        let dir = (f.path as NSString).deletingLastPathComponent
+        if (dir as NSString).lastPathComponent == base {
+            // Folder-style: rename folder, then same-basename inner files.
+            let parent = (dir as NSString).deletingLastPathComponent
+            let newDir = parent + "/" + newBase
+            guard !fm.fileExists(atPath: newDir),
+                  (try? fm.moveItem(atPath: dir, toPath: newDir)) != nil else { return }
+            for item in (try? fm.contentsOfDirectory(atPath: newDir)) ?? []
+            where item.hasPrefix(base + ".") {
+                let suffix = String(item.dropFirst(base.count))
+                try? fm.moveItem(atPath: newDir + "/" + item,
+                                 toPath: newDir + "/" + newBase + suffix)
+            }
+            retargetLiveIfNeeded(oldPath: f.path, newPath: newDir + "/" + newBase + ".txt")
+        } else {
+            for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+            where item.hasPrefix(base + ".") {
+                let suffix = String(item.dropFirst(base.count))
+                try? fm.moveItem(atPath: dir + "/" + item,
+                                 toPath: dir + "/" + newBase + suffix)
+            }
+            retargetLiveIfNeeded(oldPath: f.path, newPath: dir + "/" + newBase + ".txt")
+        }
+        refresh()
+    }
+
+    private func retargetLiveIfNeeded(oldPath: String, newPath: String) {
+        let live = liveSymlinkPath()
+        if let t = try? FileManager.default.destinationOfSymbolicLink(atPath: live),
+           t == oldPath {
+            try? FileManager.default.removeItem(atPath: live)
+            try? FileManager.default.createSymbolicLink(atPath: live,
+                                                        withDestinationPath: newPath)
+        }
+    }
+
+    @objc private func deleteClicked() {
+        guard let f = clickedFile() else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete “\(f.name)”?"
+        alert.informativeText = "The meeting (transcript, summary, audio) moves to the Trash."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Move to Trash")
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        let dir = (f.path as NSString).deletingLastPathComponent
+        let base = ((f.path as NSString).lastPathComponent as NSString).deletingPathExtension
+        let fm = FileManager.default
+        if (dir as NSString).lastPathComponent == base {
+            try? fm.trashItem(at: URL(fileURLWithPath: dir), resultingItemURL: nil)
+        } else {
+            for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+            where item.hasPrefix(base + ".") {
+                try? fm.trashItem(at: URL(fileURLWithPath: dir + "/" + item),
+                                  resultingItemURL: nil)
+            }
+        }
+        refresh()
     }
 
     override func viewDidLoad() {
@@ -1472,6 +1586,150 @@ final class UploadViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 }
 
+// MARK: - Profiles page
+
+/// Voice profiles: rename, delete, and see which meetings a person was in.
+final class ProfilesViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+    private let table = NSTableView()
+    private let detail = NSTextField(wrappingLabelWithString: "")
+    private var profiles: [(name: String, samples: Int)] = []
+
+    override func loadView() {
+        let root = NSView()
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        let nameCol = NSTableColumn(identifier: .init("name")); nameCol.title = "Profile"; nameCol.width = 220
+        let sampCol = NSTableColumn(identifier: .init("samples")); sampCol.title = "Voice samples"; sampCol.width = 120
+        table.addTableColumn(nameCol); table.addTableColumn(sampCol)
+        table.dataSource = self; table.delegate = self
+        table.usesAlternatingRowBackgroundColors = true
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Rename…", action: #selector(renameProfile), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Delete", action: #selector(deleteProfile), keyEquivalent: ""))
+        for i in menu.items { i.target = self }
+        table.menu = menu
+        scroll.documentView = table
+        detail.font = NSFont.systemFont(ofSize: 11)
+        detail.textColor = .secondaryLabelColor
+        detail.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(scroll); root.addSubview(detail)
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: root.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: detail.topAnchor, constant: -8),
+            detail.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            detail.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            detail.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
+            detail.heightAnchor.constraint(greaterThanOrEqualToConstant: 40),
+        ])
+        self.view = root
+    }
+
+    override func viewWillAppear() { super.viewWillAppear(); refresh() }
+
+    private func refresh() {
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:8179/profiles")!)
+        req.timeoutInterval = 3
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            var out: [(String, Int)] = []
+            if let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let arr = obj["profiles"] as? [[String: Any]] {
+                out = arr.compactMap { p in
+                    guard let n = p["name"] as? String else { return nil }
+                    return (n, (p["samples"] as? Int) ?? 0)
+                }
+            }
+            DispatchQueue.main.async {
+                self?.profiles = out.map { (name: $0.0, samples: $0.1) }
+                self?.table.reloadData()
+                self?.detail.stringValue = out.isEmpty
+                    ? "No profiles (is the diarize server running?)" : "Select a profile to see recent meetings."
+            }
+        }.resume()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { profiles.count }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let id = tableColumn?.identifier.rawValue ?? "name"
+        let cell = NSTableCellView()
+        let f = NSTextField(labelWithString: id == "name" ? profiles[row].name : "\(profiles[row].samples)")
+        f.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(f); cell.textField = f
+        NSLayoutConstraint.activate([
+            f.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            f.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let row = table.selectedRow
+        guard row >= 0, row < profiles.count else { return }
+        let name = profiles[row].name.uppercased()
+        DispatchQueue.global().async { [weak self] in
+            // Which recent meetings does this voice appear in?
+            let dir = transcriptsDir()
+            let fm = FileManager.default
+            var hits: [String] = []
+            let folders = ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).sorted(by: >)
+            for item in folders.prefix(40) {
+                let tx = dir + "/" + item + "/" + item + ".txt"
+                guard fm.fileExists(atPath: tx),
+                      let txt = try? String(contentsOfFile: tx, encoding: .utf8) else { continue }
+                if txt.contains("] \(name):") { hits.append(item) }
+                if hits.count >= 8 { break }
+            }
+            DispatchQueue.main.async {
+                self?.detail.stringValue = hits.isEmpty
+                    ? "\(name): not seen in recent meetings."
+                    : "\(name) heard in: " + hits.joined(separator: ", ")
+            }
+        }
+    }
+
+    private func clickedName() -> String? {
+        let r = table.clickedRow
+        return r >= 0 && r < profiles.count ? profiles[r].name : nil
+    }
+
+    @objc private func renameProfile() {
+        guard let old = clickedName() else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename profile “\(old)”"
+        alert.informativeText = "Renames the voice profile and merges into an existing one if the name is taken."
+        alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.stringValue = old
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let new = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !new.isEmpty, new != old else { return }
+        var comps = URLComponents(string: "http://127.0.0.1:8179/session/rename")!
+        comps.queryItems = [.init(name: "from", value: old), .init(name: "to", value: new)]
+        var req = URLRequest(url: comps.url!); req.httpMethod = "POST"
+        URLSession.shared.dataTask(with: req) { [weak self] _, _, _ in
+            DispatchQueue.main.async { self?.refresh() }
+        }.resume()
+    }
+
+    @objc private func deleteProfile() {
+        guard let name = clickedName() else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete profile “\(name)”?"
+        alert.informativeText = "Their voice will no longer be recognized in future meetings."
+        alert.addButton(withTitle: "Cancel"); alert.addButton(withTitle: "Delete")
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        let enc = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:8179/profiles/\(enc)")!)
+        req.httpMethod = "DELETE"
+        URLSession.shared.dataTask(with: req) { [weak self] _, _, _ in
+            DispatchQueue.main.async { self?.refresh() }
+        }.resume()
+    }
+}
+
 // MARK: - Settings page
 
 /// Checkbox settings, persisted as key=value lines in ~/.meetink/config —
@@ -1552,7 +1810,7 @@ final class SettingsViewController: NSViewController {
 // MARK: - Main window (status strip + sidebar + detail)
 
 final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
-    private let sidebarItems = ["Meetings", "Vocab", "Upload"]
+    private let sidebarItems = ["Meetings", "Vocab", "Upload", "Profiles"]
     private let sidebar = NSTableView()
 
     private let stripDot = NSTextField(labelWithString: "●")
@@ -1571,6 +1829,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     let uploadVC = UploadViewController()
     let readerVC = TranscriptViewController()
     let settingsVC = SettingsViewController()
+    let profilesVC = ProfilesViewController()
     private let settingsButton = NSButton()
 
     private var pollTimer: Timer?
@@ -1736,14 +1995,15 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         switch index {
         case 0: setDetail(meetingsVC)
         case 1: setDetail(vocabVC)
-        case 3: setDetail(settingsVC)
+        case 3: setDetail(profilesVC)
+        case 4: setDetail(settingsVC)
         default: setDetail(uploadVC)
         }
     }
 
     @objc private func openSettings() {
         sidebar.deselectAll(nil)
-        showPage(3)
+        showPage(4)
     }
 
     func openTranscript(_ path: String?) {

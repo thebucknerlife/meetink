@@ -1097,6 +1097,7 @@ cmd_help() {
     bullet "upload   " "open the app's Transcribe Audio drop window"
     bullet "simulate " "test harness: feed an audio file through the real pipeline (--mic/--sys/--rate)"
     bullet "migrate  " "move flat-layout transcripts into per-session folders (runs on start too)"
+    bullet "reprocess" "re-run the refine pipeline on an old meeting's kept audio"
     bullet "prompt   " "edit the custom vocabulary (names/jargon whisper should know)"
     bullet "help     " "show this help"
     print -P ""
@@ -1155,6 +1156,7 @@ case "${1:-}" in
     upload)            cmd_upload ;;
     simulate|sim)      shift 2>/dev/null; cmd_simulate "$@" ;;
     migrate)           cmd_migrate ;;
+    reprocess)         shift 2>/dev/null; cmd_reprocess "$@" ;;
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
     _build_capture)    build_capture ;;
