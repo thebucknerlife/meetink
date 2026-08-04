@@ -990,6 +990,7 @@ cmd_stop() {
     # voice profile and rewrites the transcript, so titling/summary below
     # see named speakers. Conservative by design; disable with
     # MEETINK_INFER_NAMES=off or infer_names=false in config.
+    print -- "generating names, title and summary (step 3/3)" > /tmp/meetink-postproc.state
     if typeset -f infer_speaker_names >/dev/null 2>&1; then
         infer_speaker_names "$MK_TRANSCRIPT"
     fi
@@ -1001,6 +1002,8 @@ cmd_stop() {
         local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
         [[ -n "$actual" && -f "$actual" ]] && title_session_file "$actual"
     fi
+
+    rm -f /tmp/meetink-postproc.state
 
     if [[ -f "$MK_TRANSCRIPT" ]]; then
         local lines=$(wc -l < "$MK_TRANSCRIPT" | tr -d ' ')

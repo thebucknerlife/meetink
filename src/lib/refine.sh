@@ -95,10 +95,27 @@ refine_session() {
     [[ -s "$sys" ]] && args+=(--sys "$sys")
 
     _refine_lock
-    # `|| rc=$?`: the launcher runs with set -e — a bare failing command
-    # would kill the whole script before the error branch runs.
+    # Stream progress into the postproc state file so the app's status bar
+    # can narrate ("post-processing… identifying speakers 43% (step 2/3)").
+    # rc comes from pipestatus[1] — the pipeline's last command is the
+    # reader loop, which always succeeds.
+    local state=/tmp/meetink-postproc.state
+    print -- "starting (step 1/3)" > "$state"
     local rc=0
-    "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log || rc=$?
+    "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log | \
+        while IFS= read -r line; do
+            print -- "$line"
+            case "$line" in
+                "refine: progress diarize "*)
+                    print -- "identifying speakers ${line##* }% (step 2/3)" > "$state" ;;
+                "refine: progress "*)
+                    local -a w=(${=line})
+                    print -- "transcribing ${w[3]} ${w[4]}% (step 1/3)" > "$state" ;;
+                "refine: status "*)
+                    print -- "${line#refine: status } (step 2/3)" > "$state" ;;
+            esac
+        done
+    rc=${pipestatus[1]}
     _refine_unlock
     if (( rc == 0 )); then
         # Keep the raw live version for comparison/debugging, then replace

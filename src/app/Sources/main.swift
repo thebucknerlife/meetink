@@ -232,6 +232,33 @@ let speakerPalette: [NSColor] = [
     .systemTeal, .systemPink, .systemIndigo, .systemBrown,
 ]
 
+/// Per-transcript color assignment: first-appearance order walks the
+/// palette, so every speaker in a meeting gets a DISTINCT color (hashing
+/// collided — Ross and Greg both landed on red). Falls back to hashing
+/// only past the palette's end.
+func speakerColorMap(_ snap: TranscriptSnapshot) -> [String: NSColor] {
+    var map: [String: NSColor] = [:]
+    var i = 0
+    for l in snap.lines where map[l.speaker] == nil {
+        map[l.speaker] = i < speakerPalette.count
+            ? speakerPalette[i] : speakerColor(l.speaker)
+        i += 1
+    }
+    return map
+}
+
+/// Post-processing state written by cmd_stop's pipeline (refine → names →
+/// title). nil when idle; stale files (crashed pipeline) are ignored.
+func postprocState() -> String? {
+    let path = "/tmp/meetink-postproc.state"
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+          let m = attrs[.modificationDate] as? Date,
+          Date().timeIntervalSince(m) < 1800,
+          let txt = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+    let line = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+    return line.isEmpty ? nil : line
+}
+
 func speakerColor(_ speaker: String) -> NSColor {
     var h = 0
     for u in speaker.unicodeScalars { h = (h &* 31 &+ Int(u.value)) & 0x7fffffff }
@@ -308,6 +335,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var lastResolvedPath: String = ""
     private var rawText: String = ""
     private var snapshot = TranscriptSnapshot()
+    private var colorMap: [String: NSColor] = [:]
+    private func color(for speaker: String) -> NSColor {
+        colorMap[speaker] ?? speakerColor(speaker)
+    }
 
     /// nil = follow the live symlink; a path = show that transcript.
     private(set) var fixedPath: String? = nil
@@ -633,7 +664,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
         let sp = speakers[row]
         nameField.stringValue = sp.name
-        nameField.textColor = speakerColor(sp.name)
+        nameField.textColor = color(for: sp.name)
         nameField.toolTip = unknownSpeakerNumber(sp.name) != nil
             ? "Click to name this speaker" : "Click to reassign this speaker"
         pctField.stringValue = "\(Int((sp.fraction * 100).rounded()))%"
@@ -641,6 +672,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     }
 
     private func render(empty: Bool) {
+        colorMap = speakerColorMap(snapshot)
+        speakersTable.reloadData()
         let wasPinned = pinnedToBottom
         let out = NSMutableAttributedString()
         let bodyFont = NSFont.systemFont(ofSize: 13)
@@ -660,7 +693,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             for block in snapshot.blocks {
                 var speakerAttrs: [NSAttributedString.Key: Any] = [
                     .font: NSFont.boldSystemFont(ofSize: 13),
-                    .foregroundColor: speakerColor(block.speaker),
+                    .foregroundColor: color(for: block.speaker),
                     .paragraphStyle: headerPara,
                 ]
                 // Every label is clickable — unnamed speakers get named,
@@ -675,7 +708,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                         ? "Click to name this speaker"
                         : "Click to reassign this speaker"
                     speakerAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-                    speakerAttrs[.underlineColor] = speakerColor(block.speaker)
+                    speakerAttrs[.underlineColor] = color(for: block.speaker)
                         .withAlphaComponent(0.35)
                 }
                 out.append(NSAttributedString(string: block.speaker, attributes: speakerAttrs))
@@ -718,6 +751,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
         parts.append("\(snapshot.lines.count) lines")
         if !recording && snapshot.endedAt != nil { parts.append("ended") }
+        if !recording, fixedPath == nil, let pp = postprocState() {
+            parts.append("post-processing… \(pp)")
+            statusDot.textColor = .systemOrange
+        }
         if fixedPath == nil && !recording && snapshot.lines.isEmpty {
             parts = ["not recording"]
         }
@@ -1013,6 +1050,7 @@ final class UploadViewController: NSViewController, NSTableViewDataSource, NSTab
     private let table = NSTableView()
     private var jobs: [UploadJob] = []
     private var running = false
+    var isBusy: Bool { running }
     var onOpenTranscript: ((String) -> Void)?
 
     private let dropLabel = NSTextField(labelWithString: "Drop audio files here to transcribe")
@@ -1521,6 +1559,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         let recording = recordingPID() != nil
         stripDot.textColor = recording ? .systemRed : .tertiaryLabelColor
         stripLabel.stringValue = recording ? "Recording" : "Not recording"
+        if !recording, let pp = postprocState() {
+            stripDot.textColor = .systemOrange
+            stripLabel.stringValue = "Post-processing… \(pp)"
+        }
         recordButton.title = recording ? "Stop Recording" : "Start Recording"
         recordButton.isEnabled = true
         liveButton.title = recording ? "Open Live Transcript" : "Open Latest Transcript"
@@ -1568,7 +1610,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var reallyQuit = false
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if reallyQuit { return .terminateNow }
+        if reallyQuit {
+            // Quit Completely — but warn when quitting would strand work.
+            // In-flight uploads are child processes of THIS app (they die
+            // with it), and the stop pipeline's refine gets SIGPIPEd when
+            // its output pipe closes. A live recording survives (launcher-
+            // owned) but keeps running headless, which surprises people.
+            var reasons: [String] = []
+            if recordingPID() != nil {
+                reasons.append("A recording is in progress — it will KEEP "
+                    + "recording in the background. Use Stop Recording first "
+                    + "if you want it to end.")
+            }
+            if mainWC?.uploadVC.isBusy == true {
+                reasons.append("A file transcription is running — quitting "
+                    + "aborts it.")
+            }
+            if postprocState() != nil {
+                reasons.append("A meeting is still post-processing — "
+                    + "quitting may abort the refine pass.")
+            }
+            if !reasons.isEmpty {
+                let alert = NSAlert()
+                alert.messageText = "Quit Meetink completely?"
+                alert.informativeText = reasons.joined(separator: "\n\n")
+                alert.addButton(withTitle: "Cancel")
+                alert.addButton(withTitle: "Quit Anyway")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    reallyQuit = false
+                    return .terminateCancel
+                }
+            }
+            return .terminateNow
+        }
         if let event = NSAppleEventManager.shared().currentAppleEvent,
            event.attributeDescriptor(forKeyword: AEKeyword(0x7768793F) /* 'why?' */) != nil {
             return .terminateNow   // shutdown / restart / logout
