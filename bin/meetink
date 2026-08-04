@@ -382,6 +382,20 @@ cmd_simulate() {
     unset MEETINK_SIM_SYS MEETINK_SIM_MIC MEETINK_SIM_RATE
 }
 
+# --- One-shot migration to per-session folders ---
+# start runs this automatically for the active dir; the manual command also
+# sweeps every project folder.
+cmd_migrate() {
+    migrate_session_folders "$MK_TRANSCRIPTS_DIR"
+    if [[ "$MK_TRANSCRIPTS_DIR" == "$MK_TRANSCRIPTS_BASE" ]]; then
+        local name
+        while IFS= read -r name; do
+            migrate_session_folders "$MK_TRANSCRIPTS_BASE/$name"
+        done < <(project_list_names)
+    fi
+    print -P "${C[green]}✓${C[reset]} Transcripts are in per-session folders ${C[dim]}(${MK_TRANSCRIPTS_DIR/$HOME/~})${C[reset]}"
+}
+
 # --- Download whisper model ---
 download_model() {
     local model_name="${1:-small.en}"
@@ -502,6 +516,63 @@ migrate_legacy_install() {
 # is $MK_TRANSCRIPTS_DIR (visible, defaults to ~/Documents/meetink/).
 # Renames the singleton "live.txt" using its mtime so it isn't overwritten
 # the next time we set up a fresh symlink.
+# Migrate flat-layout transcripts into per-session folders (one directory
+# per meeting, named like the transcript inside — see cmd_start). Idempotent
+# and conservative: anything already foldered, colliding, or in use by the
+# in-flight recording is left alone; legacy flat files keep working anyway.
+# Titled flat sessions get their orphaned timestamp-named .live-raw sidecar
+# adopted by trimmed-minute prefix (flat-era titling renamed only the .txt).
+#   $1 = transcripts dir to sweep
+migrate_session_folders() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 0
+    setopt local_options null_glob
+
+    # Never move the file the live recording is writing.
+    local active=""
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        active=$(readlink "$dir/live.txt" 2>/dev/null)
+    fi
+
+    local f base folder s moved=0
+    for f in "$dir"/*.txt(.N); do
+        base="${f:t:r}"
+        [[ "$base" == *.live-raw ]] && continue   # moves with its owner
+        [[ -n "$active" && "$f" == "$active" ]] && continue
+        folder="$dir/$base"
+        [[ -e "$folder" ]] && continue            # collision — leave flat
+        mkdir -p "$folder" || continue
+        for s in "$dir/$base".*; do
+            mv "$s" "$folder/" 2>/dev/null || true
+        done
+        # Titled session (<date>_<HH-MM>_<slug>): adopt the orphaned
+        # timestamp-named live-raw from the same minute, if one exists.
+        if [[ "$base" == [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]_* ]]; then
+            local prefix="${base[1,16]}"
+            for s in "$dir/${prefix}"-[0-9][0-9].live-raw.txt(.N); do
+                mv "$s" "$folder/" 2>/dev/null || true
+            done
+        fi
+        # NOT (( moved++ )): post-increment yields the OLD value, so the
+        # first bump evaluates to 0 = failure and set -e kills the script.
+        moved=$(( moved + 1 ))
+    done
+
+    # Re-point live.txt if its flat target just moved into a folder.
+    local live="$dir/live.txt"
+    if [[ -L "$live" ]]; then
+        local t=$(readlink "$live" 2>/dev/null)
+        if [[ -n "$t" && ! -e "$t" && -f "$dir/${t:t:r}/${t:t}" ]]; then
+            ln -sfn "$dir/${t:t:r}/${t:t}" "$live"
+        fi
+    fi
+
+    if (( moved > 0 )); then
+        print -P "${C[dim]}Migrated $moved meeting(s) into per-session folders${C[reset]}"
+    fi
+    return 0
+}
+
 migrate_transcripts() {
     local old_dir="$MK_HOME/transcripts"
     [[ -d "$old_dir" ]] || return 0
@@ -751,6 +822,7 @@ cmd_start() {
 
     mkdir -p "$MK_TRANSCRIPTS_DIR" "$MK_HOME/prompts"
     migrate_transcripts
+    migrate_session_folders "$MK_TRANSCRIPTS_DIR"
 
     # Re-resolve MK_MODEL each /start so /model use picks up next time.
     if [[ -z "$MEETINK_MODEL" ]]; then
@@ -1021,6 +1093,7 @@ cmd_help() {
     bullet "refine   " "transcribe an audio file (post-meeting refine runs on stop)"
     bullet "upload   " "open the app's Transcribe Audio drop window"
     bullet "simulate " "test harness: feed an audio file through the real pipeline (--mic/--sys/--rate)"
+    bullet "migrate  " "move flat-layout transcripts into per-session folders (runs on start too)"
     bullet "prompt   " "edit the custom vocabulary (names/jargon whisper should know)"
     bullet "help     " "show this help"
     print -P ""
@@ -1078,6 +1151,7 @@ case "${1:-}" in
                        shift 2>/dev/null; cmd_refine "$@" ;;
     upload)            cmd_upload ;;
     simulate|sim)      shift 2>/dev/null; cmd_simulate "$@" ;;
+    migrate)           cmd_migrate ;;
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
     _build_capture)    build_capture ;;

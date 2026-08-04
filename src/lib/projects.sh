@@ -74,6 +74,10 @@ project_list_names() {
         # .idx sidecars also live here; they are not projects.
         [[ "$name" == [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]* ]] && continue
         [[ "$name" == *.idx ]] && continue
+        # A folder holding a transcript named after itself is a per-session
+        # meeting folder (the invariant cmd_start/migration guarantee), not
+        # a project — hand-named meetings like "Abhi 8-3/" land here.
+        [[ -f "$d/${name}.txt" ]] && continue
         print -- "$name"
     done
 }
