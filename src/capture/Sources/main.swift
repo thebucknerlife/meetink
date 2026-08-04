@@ -1224,18 +1224,33 @@ struct LocalSpeechCapture {
 
         let installMicTap: () throws -> Void = {
             let inputNode = engine.inputNode
-            let inputFormat = inputNode.outputFormat(forBus: 0)
             // During a device swap the engine briefly reports a zero-rate
             // format; installing a tap on it raises. Skip and wait for the
             // next configuration-change notification to deliver a real one.
-            guard inputFormat.sampleRate > 0 else {
+            guard inputNode.outputFormat(forBus: 0).sampleRate > 0 else {
                 fputs("Mic input format not ready yet, will retry on next configuration change\n", stderr)
                 return
             }
-            let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { inBuffer, _ in
+            // format: nil — the tap adopts whatever format the node has AT
+            // INSTALL TIME. Passing a queried format instead is a crash: if
+            // the device flips between the query and the install (AirPods
+            // dropping call mode when a meeting ends — 24 kHz HFP mic),
+            // installTap raises an Objective-C NSException that Swift
+            // try/catch CANNOT catch, and the whole process dies mid-flush
+            // (field crash: 71-min call, no Ended footer, no refine, spools
+            // orphaned). The converter is built lazily from each buffer's
+            // actual format for the same reason.
+            var converter: AVAudioConverter? = nil
+            var converterInputFormat: AVAudioFormat? = nil
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { inBuffer, _ in
+                let inFormat = inBuffer.format
+                guard inFormat.sampleRate > 0 else { return }
+                if converterInputFormat != inFormat {
+                    converter = AVAudioConverter(from: inFormat, to: targetFormat)
+                    converterInputFormat = inFormat
+                }
                 guard let converter = converter else { return }
-                let ratio = sampleRate / inputFormat.sampleRate
+                let ratio = sampleRate / inFormat.sampleRate
                 let outputFrameCount = AVAudioFrameCount(Double(inBuffer.frameLength) * ratio)
                 guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputFrameCount) else { return }
                 let status = converter.convert(to: outBuffer, error: nil) { _, outStatus in
@@ -1267,6 +1282,7 @@ struct LocalSpeechCapture {
                 fputs("[\(reason)] rebuilding mic tap...\n", stderr)
                 engine.stop()
                 engine.inputNode.removeTap(onBus: 0)
+                engine.reset()
                 do {
                     try installMicTap()
                     fputs("Mic capture resumed (trigger=\(reason))\n", stderr)
@@ -1326,6 +1342,7 @@ struct LocalSpeechCapture {
                 // Direct call here is safe — we're already on the rebuild queue.
                 engine.stop()
                 engine.inputNode.removeTap(onBus: 0)
+                engine.reset()
                 do {
                     try installMicTap()
                     fputs("Mic capture resumed (trigger=heartbeat-stall)\n", stderr)
