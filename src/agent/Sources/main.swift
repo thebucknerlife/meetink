@@ -134,7 +134,20 @@ func cmdEvents(args: [String]) -> Int32 {
         end: end,
         calendars: nil  // all calendars
     )
-    let events = store.events(matching: predicate)
+    // Calendars the user unchecked in Settings (CSV of calendar IDs via
+    // --hidden-calendars) are filtered here so every consumer — the app's
+    // Link Event picker and the watcher alike — sees the same view.
+    var hiddenIds = Set<String>()
+    var j = 0
+    while j < args.count {
+        if args[j] == "--hidden-calendars", j + 1 < args.count {
+            hiddenIds = Set(args[j + 1].split(separator: ",").map(String.init))
+        }
+        j += 1
+    }
+    let events = store.events(matching: predicate).filter {
+        !hiddenIds.contains($0.calendar?.calendarIdentifier ?? "")
+    }
 
     var out: [[String: Any]] = []
     for e in events {
@@ -180,6 +193,7 @@ func cmdEvents(args: [String]) -> Int32 {
         let dict: [String: Any] = [
             "id":            e.eventIdentifier ?? e.calendarItemIdentifier,
             "title":         e.title ?? "(untitled)",
+            "calendarId":    e.calendar?.calendarIdentifier ?? "",
             "start":         isoFormatter.string(from: e.startDate),
             "end":           isoFormatter.string(from: e.endDate),
             "attendees":     attendeesArr,
@@ -556,6 +570,33 @@ let mode = allArgs[1]
 let rest = Array(allArgs.dropFirst(2))
 
 switch mode {
+case "calendars":
+    // All event calendars, grouped by account — the Settings page's
+    // show/hide list. Same permission dance as events.
+    let store = EKEventStore()
+    let sem = DispatchSemaphore(value: 0)
+    var granted = false
+    if #available(macOS 14.0, *) {
+        store.requestFullAccessToEvents { ok, _ in granted = ok; sem.signal() }
+    } else {
+        store.requestAccess(to: .event) { ok, _ in granted = ok; sem.signal() }
+    }
+    sem.wait()
+    if !granted {
+        eprint("Calendar access denied.")
+        exit(3)
+    }
+    let cals: [[String: String]] = store.calendars(for: .event).map {
+        ["id": $0.calendarIdentifier,
+         "title": $0.title,
+         "account": $0.source?.title ?? "Other"]
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: cals),
+       let str = String(data: data, encoding: .utf8) {
+        print(str)
+    }
+    exit(0)
+
 case "events":
     exit(cmdEvents(args: rest))
 case "notify":

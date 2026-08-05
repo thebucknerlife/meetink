@@ -916,9 +916,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let iso = ISO8601DateFormatter()
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: agent)
-        proc.arguments = ["events",
-                          "--from", iso.string(from: start.addingTimeInterval(-4 * 3600)),
-                          "--to", iso.string(from: start.addingTimeInterval(8 * 3600))]
+        var eventArgs = ["events",
+                         "--from", iso.string(from: start.addingTimeInterval(-4 * 3600)),
+                         "--to", iso.string(from: start.addingTimeInterval(8 * 3600))]
+        if let hidden = configValue("hidden_calendars"), !hidden.isEmpty {
+            eventArgs += ["--hidden-calendars", hidden]
+        }
+        proc.arguments = eventArgs
         let pipe = Pipe()
         proc.standardOutput = pipe
         eventButton.isEnabled = false
@@ -2475,6 +2479,8 @@ final class SettingsViewController: NSViewController {
         checkboxWithTitle: "Keep audio spools", target: nil, action: nil)
     private let watchBox = NSButton(
         checkboxWithTitle: "Auto-record meetings", target: nil, action: nil)
+    private let calendarsStack = NSStackView()
+    private var calendarBoxes: [(box: NSButton, id: String)] = []
     private let keepAudioBox = NSButton(
         checkboxWithTitle: "Keep audio recording", target: nil, action: nil)
 
@@ -2508,15 +2514,25 @@ final class SettingsViewController: NSViewController {
             "Watch the calendar and running meeting apps; start recording "
             + "automatically (1-minute warning for scheduled meetings). Runs "
             + "whenever Meetink is running — no REPL needed.")
+        let calTitle = NSTextField(labelWithString: "Calendars")
+        calTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        let calCaption = caption(
+            "Unchecked calendars are ignored by auto-record and the "
+            + "Link Event picker (e.g. calendars you merely subscribe to).")
+        calendarsStack.orientation = .vertical
+        calendarsStack.alignment = .leading
+        calendarsStack.spacing = 4
+
         let footnote = caption(
             "Applies from the next recording. Stored in ~/.meetink/config "
-            + "(keep_audio, keep_spools, watch_enabled).")
+            + "(keep_audio, keep_spools, watch_enabled, hidden_calendars).")
 
         let stack = NSStackView(views: [
             title,
             watchBox, watchCaption,
             keepAudioBox, audioCaption,
             keepSpoolsBox, spoolsCaption,
+            calTitle, calCaption, calendarsStack,
             footnote,
         ])
         stack.orientation = .vertical
@@ -2528,7 +2544,10 @@ final class SettingsViewController: NSViewController {
         stack.setCustomSpacing(2, after: keepAudioBox)
         stack.setCustomSpacing(18, after: audioCaption)
         stack.setCustomSpacing(2, after: keepSpoolsBox)
-        stack.setCustomSpacing(28, after: spoolsCaption)
+        stack.setCustomSpacing(20, after: spoolsCaption)
+        stack.setCustomSpacing(2, after: calTitle)
+        stack.setCustomSpacing(8, after: calCaption)
+        stack.setCustomSpacing(24, after: calendarsStack)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         root.addSubview(stack)
@@ -2546,6 +2565,57 @@ final class SettingsViewController: NSViewController {
         keepAudioBox.state = configBool("keep_audio") ? .on : .off
         keepSpoolsBox.state = configBool("keep_spools") ? .on : .off
         watchBox.state = configBool("watch_enabled") ? .on : .off
+        loadCalendars()
+    }
+
+    /// Populate the Calendars section from the agent (grouped by account).
+    private func loadCalendars() {
+        let agent = "\(mkHome)/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
+        guard FileManager.default.isExecutableFile(atPath: agent) else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: agent)
+        proc.arguments = ["calendars"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        DispatchQueue.global().async { [weak self] in
+            do { try proc.run() } catch { return }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            let cals = (try? JSONSerialization.jsonObject(with: data)
+                        as? [[String: String]]) ?? []
+            DispatchQueue.main.async { self?.renderCalendars(cals) }
+        }
+    }
+
+    private func renderCalendars(_ cals: [[String: String]]) {
+        for v in calendarsStack.arrangedSubviews { v.removeFromSuperview() }
+        calendarBoxes = []
+        let hidden = Set((configValue("hidden_calendars") ?? "")
+            .split(separator: ",").map(String.init))
+        let grouped = Dictionary(grouping: cals) { $0["account"] ?? "Other" }
+        for account in grouped.keys.sorted() {
+            let header = NSTextField(labelWithString: account)
+            header.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            header.textColor = .secondaryLabelColor
+            calendarsStack.addArrangedSubview(header)
+            for cal in grouped[account]! .sorted(by: { ($0["title"] ?? "") < ($1["title"] ?? "") }) {
+                let box = NSButton(checkboxWithTitle: cal["title"] ?? "?",
+                                   target: self, action: #selector(calendarToggled))
+                box.font = NSFont.systemFont(ofSize: 12)
+                box.state = hidden.contains(cal["id"] ?? "") ? .off : .on
+                calendarsStack.addArrangedSubview(box)
+                calendarBoxes.append((box, cal["id"] ?? ""))
+            }
+        }
+        if cals.isEmpty {
+            calendarsStack.addArrangedSubview(NSTextField(
+                labelWithString: "No calendars (grant calendar access first)."))
+        }
+    }
+
+    @objc private func calendarToggled() {
+        let hidden = calendarBoxes.filter { $0.box.state == .off }.map(\.id)
+        configSetValue("hidden_calendars", hidden.joined(separator: ","))
     }
 
     @objc private func toggled(_ sender: NSButton) {

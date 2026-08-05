@@ -170,9 +170,18 @@ def _agent_events(hours: int = 8) -> list[dict]:
     if not MK_AGENT.is_file():
         return []
     try:
+        hidden = ""
+        cfg = MK_HOME / "config"
+        if cfg.is_file():
+            for line in cfg.read_text().splitlines():
+                if line.startswith("hidden_calendars="):
+                    hidden = line.split("=", 1)[1].strip()
+                    break
+        cmd = [str(MK_AGENT), "events", "--hours", str(hours)]
+        if hidden:
+            cmd += ["--hidden-calendars", hidden]
         proc = subprocess.run(
-            [str(MK_AGENT), "events", "--hours", str(hours)],
-            capture_output=True, text=True, timeout=15,
+            cmd, capture_output=True, text=True, timeout=15,
         )
         if proc.returncode != 0:
             return []
