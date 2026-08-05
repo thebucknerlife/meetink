@@ -298,8 +298,25 @@ cmd_reprocess() {
     fi
 
     _refine_lock
+    # Same progress narration cmd_stop's refine gets — the app's status
+    # bar shows "post-processing… <phase> (step N/3)" while this runs.
+    local state=/tmp/meetink-postproc.state
+    print -- "starting (step 1/3)" > "$state"
     local rc=0
-    "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log || rc=$?
+    "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log | \
+        while IFS= read -r line; do
+            print -- "$line"
+            case "$line" in
+                "refine: progress diarize "*)
+                    print -- "identifying speakers ${line##* }% (step 2/3)" > "$state" ;;
+                "refine: progress "*)
+                    local -a w=(${=line})
+                    print -- "transcribing ${w[3]} ${w[4]}% (step 1/3)" > "$state" ;;
+                "refine: status "*)
+                    print -- "${line#refine: status } (step 2/3)" > "$state" ;;
+            esac
+        done
+    rc=${pipestatus[1]}
     _refine_unlock
     if (( rc == 0 )) && grep -qE '^\[' "$tmpdir/out.txt"; then
         cp "$actual" "${base}.pre-reprocess.txt" 2>/dev/null
@@ -310,6 +327,7 @@ cmd_reprocess() {
         # Rebuild the listenable m4a too — reprocess exists to pick up
         # pipeline improvements, and the audio pipeline is part of that.
         if [[ -s "$tmpdir/mic.raw" && -s "$tmpdir/sys.raw" ]]; then
+            print -- "enhancing audio (step 3/3)" > /tmp/meetink-postproc.state
             _mix_enhanced_m4a "$tmpdir/mic.raw" "$tmpdir/sys.raw" "${base}.m4a" && \
                 print -P "${C[green]}✓${C[reset]} Audio rebuilt: ${C[dim]}${base:t}.m4a (enhanced)${C[reset]}"
         fi
@@ -317,6 +335,7 @@ cmd_reprocess() {
         print -P "${C[red]}error:${C[reset]} reprocess failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
     fi
     rm -rf "$tmpdir"
+    rm -f /tmp/meetink-postproc.state
 }
 
 # Import an audio file as a transcript: decode → parakeet → diarize →

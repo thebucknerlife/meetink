@@ -165,6 +165,70 @@ func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> N
     return img
 }
 
+/// Rename a meeting to a new display name: slugify, keep the timestamp
+/// prefix, move the session folder + every same-basename file (or the flat
+/// siblings), and retarget live.txt if it pointed at the old path. Returns
+/// the transcript's new path, or nil when nothing moved.
+func renameMeeting(txtPath: String, displayName: String) -> String? {
+    var slug = displayName.trimmingCharacters(in: .whitespaces)
+        .replacingOccurrences(of: "/", with: "-")
+        .replacingOccurrences(of: " ", with: "-")
+    guard !slug.isEmpty else { return nil }
+    let fm = FileManager.default
+    let base = ((txtPath as NSString).lastPathComponent as NSString).deletingPathExtension
+    var prefix = ""
+    if let r = base.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
+                          options: .regularExpression) {
+        prefix = String(base[r])
+        if !prefix.hasSuffix("_") { prefix += "_" }
+    }
+    let newBase = prefix + slug
+    guard newBase != base else { return txtPath }
+    let dir = (txtPath as NSString).deletingLastPathComponent
+    var newTxt: String
+    if (dir as NSString).lastPathComponent == base {
+        let parent = (dir as NSString).deletingLastPathComponent
+        let newDir = parent + "/" + newBase
+        guard !fm.fileExists(atPath: newDir),
+              (try? fm.moveItem(atPath: dir, toPath: newDir)) != nil else { return nil }
+        for item in (try? fm.contentsOfDirectory(atPath: newDir)) ?? []
+        where item.hasPrefix(base + ".") {
+            let suffix = String(item.dropFirst(base.count))
+            try? fm.moveItem(atPath: newDir + "/" + item,
+                             toPath: newDir + "/" + newBase + suffix)
+        }
+        newTxt = newDir + "/" + newBase + ".txt"
+    } else {
+        for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+        where item.hasPrefix(base + ".") {
+            let suffix = String(item.dropFirst(base.count))
+            try? fm.moveItem(atPath: dir + "/" + item,
+                             toPath: dir + "/" + newBase + suffix)
+        }
+        newTxt = dir + "/" + newBase + ".txt"
+    }
+    let live = liveSymlinkPath()
+    if let t = try? fm.destinationOfSymbolicLink(atPath: live), t == txtPath {
+        try? fm.removeItem(atPath: live)
+        try? fm.createSymbolicLink(atPath: live, withDestinationPath: newTxt)
+    }
+    return fm.fileExists(atPath: newTxt) ? newTxt : nil
+}
+
+/// Display name for a transcript path: timestamp prefix stripped, slug
+/// prettified — same rule everywhere a meeting is shown.
+func meetingDisplayName(_ txtPath: String) -> String {
+    var name = ((txtPath as NSString).lastPathComponent as NSString).deletingPathExtension
+    if let r = name.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
+                          options: .regularExpression) {
+        name.removeSubrange(r)
+    }
+    name = name.replacingOccurrences(of: "-", with: " ")
+        .replacingOccurrences(of: "_", with: " ")
+        .trimmingCharacters(in: .whitespaces)
+    return name.isEmpty ? "(untitled)" : name
+}
+
 // MARK: - Transcript model
 
 struct TranscriptLine {
@@ -344,9 +408,12 @@ final class DropContainerView: NSView {
 // MARK: - Transcript page (live or archived)
 
 final class TranscriptViewController: NSViewController, NSTextViewDelegate,
-                                      NSTableViewDataSource, NSTableViewDelegate {
+                                      NSTableViewDataSource, NSTableViewDelegate,
+                                      NSTextFieldDelegate {
     private let textView = NSTextView()
     private let headerField = NSTextField(labelWithString: "")
+    private let titleField = NSTextField(string: "")
+    private var headerHeight: NSLayoutConstraint? = nil
     private let speakersTable = NSTableView()
     private var speakers: [(name: String, fraction: Double)] = []
     private let statusDot = NSTextField(labelWithString: "●")
@@ -386,11 +453,30 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     override func loadView() {
         let content = NSView()
 
-        let header = NSStackView()
-        header.orientation = .horizontal
-        header.spacing = 8
+        // Two header rows for recordings: an editable title (Enter saves —
+        // renames the meeting's folder and files), then the status strip.
+        titleField.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        titleField.isBordered = false
+        titleField.drawsBackground = false
+        titleField.focusRingType = .none
+        titleField.placeholderString = "(untitled)"
+        titleField.delegate = self
+        titleField.lineBreakMode = .byTruncatingTail
+        titleField.isHidden = true
+        titleField.toolTip = "Click to rename this meeting (Enter saves)"
+
+        let strip = NSStackView()
+        strip.orientation = .horizontal
+        strip.spacing = 8
+
+        let header = NSStackView(views: [titleField, strip])
+        header.orientation = .vertical
+        header.alignment = .leading
+        header.spacing = 2
         header.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
         header.translatesAutoresizingMaskIntoConstraints = false
+        titleField.widthAnchor.constraint(equalTo: header.widthAnchor, constant: -24).isActive = true
+        strip.widthAnchor.constraint(equalTo: header.widthAnchor, constant: -24).isActive = true
 
         statusDot.font = NSFont.systemFont(ofSize: 12)
         headerField.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
@@ -416,12 +502,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         copyButton.target = self
         copyButton.action = #selector(copyAll)
 
-        header.addArrangedSubview(statusDot)
-        header.addArrangedSubview(headerField)
-        header.addArrangedSubview(NSView())
-        header.addArrangedSubview(reprocessButton)
-        header.addArrangedSubview(folderButton)
-        header.addArrangedSubview(copyButton)
+        strip.addArrangedSubview(statusDot)
+        strip.addArrangedSubview(headerField)
+        strip.addArrangedSubview(NSView())
+        strip.addArrangedSubview(reprocessButton)
+        strip.addArrangedSubview(folderButton)
+        strip.addArrangedSubview(copyButton)
 
         let divider = NSBox()
         divider.boxType = .separator
@@ -543,7 +629,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             header.topAnchor.constraint(equalTo: content.topAnchor),
             header.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            header.heightAnchor.constraint(equalToConstant: 32),
+            {
+                let h = header.heightAnchor.constraint(equalToConstant: 32)
+                self.headerHeight = h
+                return h
+            }(),
             divider.topAnchor.constraint(equalTo: header.bottomAnchor),
             divider.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: content.trailingAnchor),
@@ -636,6 +726,31 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func jumpToEnd() {
         textView.scrollToEndOfDocument(nil)
         jumpButton.isHidden = true
+    }
+
+    /// Enter in the title field renames the meeting on disk (folder +
+    /// same-basename siblings, live symlink retargeted) and re-points this
+    /// page at the new path.
+    func control(_ control: NSControl, textView: NSTextView,
+                 doCommandBy commandSelector: Selector) -> Bool {
+        guard control == titleField else { return false }
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            let newName = titleField.stringValue
+            if let newPath = renameMeeting(txtPath: lastResolvedPath, displayName: newName) {
+                if fixedPath != nil { fixedPath = newPath }
+                view.window?.makeFirstResponder(textView.superview)
+                refreshIfChanged(force: true)
+            } else {
+                titleField.stringValue = meetingDisplayName(lastResolvedPath)
+            }
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            titleField.stringValue = meetingDisplayName(lastResolvedPath)
+            view.window?.makeFirstResponder(nil)
+            return true
+        }
+        return false
     }
 
     /// Re-run the whole pipeline on this recording's kept audio (spools
@@ -832,6 +947,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         for v in playerBar.arrangedSubviews { v.isHidden = (audioPath == nil) }
         noAudioLabel.isHidden = !(archived && audioPath == nil)
         reprocessButton.isHidden = !(archived && audioPath != nil)
+        titleField.isHidden = !archived
+        headerHeight?.constant = archived ? 56 : 32
+        if archived, view.window?.firstResponder != titleField.currentEditor() {
+            titleField.stringValue = meetingDisplayName(lastResolvedPath)
+        }
         updatePlayerUI()
     }
 
@@ -1154,7 +1274,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
         parts.append("\(snapshot.lines.count) lines")
         if !recording && snapshot.endedAt != nil { parts.append("ended") }
-        if !recording, fixedPath == nil, let pp = postprocState() {
+        if !recording, let pp = postprocState() {
             parts.append("post-processing… \(pp)")
             statusDot.textColor = .systemOrange
         }
@@ -1220,54 +1340,8 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        var slug = field.stringValue.trimmingCharacters(in: .whitespaces)
-            .replacingOccurrences(of: "/", with: "-")
-        guard !slug.isEmpty else { return }
-        slug = slug.replacingOccurrences(of: " ", with: "-")
-        let fm = FileManager.default
-        let base = ((f.path as NSString).lastPathComponent as NSString).deletingPathExtension
-        // Keep the leading timestamp if present.
-        var prefix = ""
-        if let r = base.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
-                              options: .regularExpression) {
-            prefix = String(base[r])
-            if !prefix.hasSuffix("_") { prefix += "_" }
-        }
-        let newBase = prefix + slug
-        let dir = (f.path as NSString).deletingLastPathComponent
-        if (dir as NSString).lastPathComponent == base {
-            // Folder-style: rename folder, then same-basename inner files.
-            let parent = (dir as NSString).deletingLastPathComponent
-            let newDir = parent + "/" + newBase
-            guard !fm.fileExists(atPath: newDir),
-                  (try? fm.moveItem(atPath: dir, toPath: newDir)) != nil else { return }
-            for item in (try? fm.contentsOfDirectory(atPath: newDir)) ?? []
-            where item.hasPrefix(base + ".") {
-                let suffix = String(item.dropFirst(base.count))
-                try? fm.moveItem(atPath: newDir + "/" + item,
-                                 toPath: newDir + "/" + newBase + suffix)
-            }
-            retargetLiveIfNeeded(oldPath: f.path, newPath: newDir + "/" + newBase + ".txt")
-        } else {
-            for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? []
-            where item.hasPrefix(base + ".") {
-                let suffix = String(item.dropFirst(base.count))
-                try? fm.moveItem(atPath: dir + "/" + item,
-                                 toPath: dir + "/" + newBase + suffix)
-            }
-            retargetLiveIfNeeded(oldPath: f.path, newPath: dir + "/" + newBase + ".txt")
-        }
+        _ = renameMeeting(txtPath: f.path, displayName: field.stringValue)
         refresh()
-    }
-
-    private func retargetLiveIfNeeded(oldPath: String, newPath: String) {
-        let live = liveSymlinkPath()
-        if let t = try? FileManager.default.destinationOfSymbolicLink(atPath: live),
-           t == oldPath {
-            try? FileManager.default.removeItem(atPath: live)
-            try? FileManager.default.createSymbolicLink(atPath: live,
-                                                        withDestinationPath: newPath)
-        }
     }
 
     @objc private func deleteClicked() {
