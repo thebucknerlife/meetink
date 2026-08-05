@@ -250,6 +250,51 @@ func formatMeetingDate(_ date: Date) -> String {
     return df.string(from: date)
 }
 
+/// Meeting length from the transcript's own record: Ended minus Started
+/// when the footer exists; for a live meeting, now minus Started; for a
+/// session that died without a footer, the last line stamp. Reads only
+/// the file's head and tail — the meetings list calls this on a 2 s tick.
+func meetingDuration(_ txtPath: String, isLive: Bool) -> TimeInterval? {
+    guard let fh = FileHandle(forReadingAtPath: txtPath) else { return nil }
+    defer { try? fh.close() }
+    let head = String(data: fh.readData(ofLength: 500), encoding: .utf8) ?? ""
+    guard let sr = head.range(of: #"Started: ([0-9T:+.Z-]+)"#, options: .regularExpression),
+          let started = isoParser.date(from: String(head[sr]).replacingOccurrences(
+            of: "Started: ", with: "")) else { return nil }
+    if isLive { return max(0, Date().timeIntervalSince(started)) }
+    let size = (try? fh.seekToEnd()) ?? 0
+    let back: UInt64 = min(size, 4096)
+    try? fh.seek(toOffset: size - back)
+    let tail = String(data: fh.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    if let er = tail.range(of: #"Ended: ([0-9T:+.Z-]+)"#, options: .regularExpression),
+       let ended = isoParser.date(from: String(tail[er]).replacingOccurrences(
+            of: "Ended: ", with: "")) {
+        return max(0, ended.timeIntervalSince(started))
+    }
+    // No footer (crashed session): last line stamp minus Started, both as
+    // local seconds-of-day.
+    var lastStamp: (Int, Int, Int)? = nil
+    for line in tail.split(separator: "\n").reversed() {
+        if let m = line.range(of: #"^\[(\d{2}):(\d{2}):(\d{2})\]"#, options: .regularExpression) {
+            let p = line[m].dropFirst().dropLast().split(separator: ":").compactMap { Int($0) }
+            if p.count == 3 { lastStamp = (p[0], p[1], p[2]); break }
+        }
+    }
+    guard let (h, m, sec) = lastStamp else { return nil }
+    let c = Calendar.current.dateComponents([.hour, .minute, .second], from: started)
+    var d = TimeInterval((h - c.hour!) * 3600 + (m - c.minute!) * 60 + (sec - c.second!))
+    if d < -3600 { d += 86400 }
+    return max(0, d)
+}
+
+/// "8s" / "42m" / "1h 12m" — compact meeting-length spelling.
+func formatDuration(_ t: TimeInterval) -> String {
+    let s = Int(t)
+    if s < 60 { return "\(s)s" }
+    if s < 3600 { return "\(s / 60)m" }
+    return "\(s / 3600)h \((s % 3600) / 60)m"
+}
+
 /// Display name for a transcript path: timestamp prefix stripped, slug
 /// prettified — same rule everywhere a meeting is shown.
 func meetingDisplayName(_ txtPath: String) -> String {
@@ -1427,7 +1472,11 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
     /// Wired by MainWindowController to the reader: the txt path whose
     /// audio is currently playing (nil when paused/stopped).
     var playingProvider: (() -> String?)? = nil
-    private var files: [(path: String, name: String, date: Date, status: MeetingStatus)] = []
+    private var files: [(path: String, name: String, date: Date,
+                         status: MeetingStatus, duration: TimeInterval?)] = []
+    private var durCache: [String: (mtime: Date, dur: TimeInterval?)] = [:]
+    private var sortKey = "date"
+    private var sortAscending = false
     private var refreshTimer: Timer?
     var onOpen: ((String) -> Void)?
 
@@ -1441,12 +1490,23 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         let dateCol = NSTableColumn(identifier: .init("date"))
         dateCol.title = "Date"
         dateCol.width = 150
+        let durCol = NSTableColumn(identifier: .init("duration"))
+        durCol.title = "Length"
+        durCol.width = 70
         let statusCol = NSTableColumn(identifier: .init("status"))
         statusCol.title = "Status"
         statusCol.width = 130
         table.addTableColumn(nameCol)
         table.addTableColumn(dateCol)
+        table.addTableColumn(durCol)
         table.addTableColumn(statusCol)
+        // Click a header to sort; date descending is the default.
+        for col in table.tableColumns {
+            col.sortDescriptorPrototype = NSSortDescriptor(
+                key: col.identifier.rawValue,
+                ascending: col.identifier.rawValue == "name")
+        }
+        table.sortDescriptors = [NSSortDescriptor(key: "date", ascending: false)]
         table.dataSource = self
         table.delegate = self
         table.target = self
@@ -1570,16 +1630,47 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         let recording = recordingPID() != nil
         let processing = postprocPath()
         let playing = playingProvider?()
-        let stamped: [(String, String, Date, MeetingStatus)] = out.map {
+        let fm2 = FileManager.default
+        var stamped: [(String, String, Date, MeetingStatus, TimeInterval?)] = out.map {
             let st: MeetingStatus = (recording && $0.0 == liveTarget) ? .live
                 : ($0.0 == processing ? .processing
                    : ($0.0 == playing ? .playing : .ended))
-            return ($0.0, $0.1, $0.2, st)
+            // Durations are cached by mtime; the live row recomputes so it
+            // ticks.
+            var dur: TimeInterval? = nil
+            let mtime = ((try? fm2.attributesOfItem(atPath: $0.0))?[.modificationDate]
+                         as? Date) ?? .distantPast
+            if st != .live, let hit = durCache[$0.0], hit.mtime == mtime {
+                dur = hit.dur
+            } else {
+                dur = meetingDuration($0.0, isLive: st == .live)
+                if st != .live { durCache[$0.0] = (mtime, dur) }
+            }
+            return ($0.0, $0.1, $0.2, st, dur)
+        }
+        stamped.sort { a, b in
+            let r: Bool
+            switch sortKey {
+            case "name":     r = a.1.localizedCaseInsensitiveCompare(b.1) == .orderedAscending
+            case "duration": r = (a.4 ?? -1) < (b.4 ?? -1)
+            case "status":   r = "\(a.3)" < "\(b.3)"
+            default:         r = a.2 < b.2
+            }
+            return sortAscending ? r : !r
         }
         let changed = stamped.map(\.0) != files.map(\.path)
             || stamped.map(\.3) != files.map(\.status)
-        files = stamped.map { (path: $0.0, name: $0.1, date: $0.2, status: $0.3) }
+            || stamped.map { Int(($0.4 ?? 0) / 60) } != files.map { Int(($0.duration ?? 0) / 60) }
+        files = stamped.map { (path: $0.0, name: $0.1, date: $0.2, status: $0.3, duration: $0.4) }
         if changed { table.reloadData() }
+    }
+
+    func tableView(_ tableView: NSTableView,
+                   sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        guard let d = tableView.sortDescriptors.first, let key = d.key else { return }
+        sortKey = key
+        sortAscending = d.ascending
+        refresh()
     }
 
     @objc private func openSelected() {
@@ -1597,6 +1688,8 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         let text: String
         if id == "date" {
             text = formatMeetingDate(files[row].date)
+        } else if id == "duration" {
+            text = files[row].duration.map(formatDuration) ?? "—"
         } else if id == "status" {
             switch files[row].status {
             case .live:       text = "● live"
@@ -1625,7 +1718,7 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
             ])
         }
         cell.textField?.stringValue = text
-        if id == "date" {
+        if id == "date" || id == "duration" {
             cell.textField?.textColor = .secondaryLabelColor
             cell.textField?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         } else if id == "status" {
