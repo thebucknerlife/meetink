@@ -1242,6 +1242,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
     private func render(empty: Bool) {
         colorMap = speakerColorMap(snapshot)
+        // Hidden speakers read as annotations, not participants — dark
+        // gray in the transcript body, same treatment the sidebar's
+        // hidden section uses.
+        for name in colorMap.keys
+        where hiddenSpeakerNames().contains(name.uppercased()) {
+            colorMap[name] = .tertiaryLabelColor
+        }
         speakersTable.reloadData()
         lineRanges.removeAll()
         highlightedRange = nil
