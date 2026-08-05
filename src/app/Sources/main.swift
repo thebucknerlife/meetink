@@ -557,7 +557,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                                   height: CGFloat.greatestFiniteMagnitude)
-        textView.linkTextAttributes = [.cursor: NSCursor.pointingHand]
+        // No global link styling/cursor: body-text play-links keep the
+        // I-beam (they read as text and drag-select must feel normal);
+        // name/timestamp links carry their own hand cursor per-range.
+        // A plain click fires the link (play); click-drag selects text
+        // without firing — NSTextView's default link behavior.
+        textView.linkTextAttributes = [:]
         textView.delegate = self
         scroll.documentView = textView
 
@@ -1219,8 +1224,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     speakerAttrs[.link] = purl
                     speakerAttrs[.toolTip] = "Play from here"
                     speakerAttrs[.underlineStyle] = 0
+                    speakerAttrs[.cursor] = NSCursor.pointingHand
                     stampAttrs[.link] = purl
                     stampAttrs[.toolTip] = "Play from here"
+                    stampAttrs[.cursor] = NSCursor.pointingHand
                 }
                 out.append(NSAttributedString(string: block.speaker, attributes: speakerAttrs))
                 out.append(NSAttributedString(
@@ -1236,6 +1243,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     // Any word plays its segment. linkTextAttributes is
                     // overridden to just the hand cursor, so body text
                     // keeps its normal look.
+                    bodyAttrs[.cursor] = NSCursor.iBeam
                     if audioPath != nil,
                        let purl = URL(string: "meetink-play://\(part.line)") {
                         bodyAttrs[.link] = purl
