@@ -2384,9 +2384,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWC?.showWindow(nil)
         // Recover from any collapsed autosaved frame (see the constraint
         // floor in MainWindowController.buildUI).
-        if let w = mainWC?.window, w.frame.height < 450 {
-            w.setContentSize(NSSize(width: max(w.frame.width, 960), height: 680))
-            w.center()
+        // Sanitize the autosaved frame. A layout bug in a past session can
+        // persist its damage through frame autosave (field cases: collapsed
+        // to the 36pt status strip; ballooned to ~4000pt tall and squeezed
+        // narrow) — and the app then looks broken forever even after the
+        // bug is fixed, until the user deletes the saved frame by hand.
+        // Any degenerate frame — too small, larger than the screen, or
+        // substantially off-screen — resets to the default size instead.
+        if let w = mainWC?.window {
+            let screen = (w.screen ?? NSScreen.main)?.visibleFrame
+                ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let f = w.frame
+            let degenerate = f.height < 450 || f.width < 640
+                || f.height > screen.height + 100 || f.width > screen.width + 100
+                || !f.intersects(screen.insetBy(dx: -40, dy: -40))
+            if degenerate {
+                w.setFrame(NSRect(x: 0, y: 0, width: 960, height: 680), display: true)
+                w.center()
+            }
         }
         mainWC?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
