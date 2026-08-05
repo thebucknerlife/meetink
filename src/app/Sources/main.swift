@@ -2358,7 +2358,13 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         window.title = "Meetink"
         window.center()
         window.setFrameAutosaveName("MeetinkMainWindow")
-        window.minSize = NSSize(width: 640, height: 400)
+        // CONTENT minimum, not frame minimum: the layout floor below
+        // demands 640x400 of content, and a frame-based minSize includes
+        // the ~28pt title bar — dragging to the minimum made the two
+        // requirements unsatisfiable and Auto Layout broke a random
+        // constraint (field repro: quit, reopen, resize before opening a
+        // recording — the squeeze, again).
+        window.contentMinSize = NSSize(width: 640, height: 400)
         self.init(window: window)
         buildUI()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -2483,8 +2489,16 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             // not bind constraint-driven resizes — field case: squeezed to
             // 618 pt twice). With a required floor, a bad constraint now
             // breaks visibly in Console instead of crushing the window.
-            content.widthAnchor.constraint(greaterThanOrEqualToConstant: 640),
-            content.heightAnchor.constraint(greaterThanOrEqualToConstant: 400),
+            {
+                let c = content.widthAnchor.constraint(greaterThanOrEqualToConstant: 640)
+                c.priority = NSLayoutConstraint.Priority(999)
+                return c
+            }(),
+            {
+                let c = content.heightAnchor.constraint(greaterThanOrEqualToConstant: 400)
+                c.priority = NSLayoutConstraint.Priority(999)
+                return c
+            }(),
         ])
 
         meetingsVC.onOpen = { [weak self] path in
