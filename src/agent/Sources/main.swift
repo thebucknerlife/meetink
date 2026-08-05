@@ -338,6 +338,13 @@ func cmdNotify(args: [String]) -> Int32 {
     content.body = body
     content.categoryIdentifier = category
     content.sound = .default
+    // Time-sensitive so meeting warnings break through Focus modes —
+    // "your meeting starts in 1 minute" is useless after the meeting
+    // started. Needs the matching entitlement in the signature; macOS
+    // silently downgrades to the default level without it.
+    if #available(macOS 12.0, *) {
+        content.interruptionLevel = .timeSensitive
+    }
 
     let identifier = UUID().uuidString
     let request = UNNotificationRequest(

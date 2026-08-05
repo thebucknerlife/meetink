@@ -220,7 +220,11 @@ build_agent() {
     # mk_codesign_identity — ad-hoc signatures change every rebuild and
     # reset the TCC permission grants keyed to them).
     if command -v codesign >/dev/null 2>&1; then
-        codesign --force --sign "$(mk_codesign_identity)" "$app" 2>/dev/null || true
+        # Entitlements carry the time-sensitive notification grant — the
+        # 1-minute meeting warning must break through Focus modes.
+        codesign --force --sign "$(mk_codesign_identity)" \
+            --entitlements "$MK_ROOT/src/agent/Resources/entitlements.plist" \
+            "$app" 2>/dev/null || true
     fi
 
     print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$app${C[reset]}"
