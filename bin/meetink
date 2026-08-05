@@ -164,7 +164,8 @@ build_capture() {
     # permission prompt came back (build_app got this fix; this builder
     # was missed).
     if command -v codesign >/dev/null 2>&1; then
-        codesign --force --sign "$(mk_codesign_identity)" "$MK_HOME/bin/meetink-capture" 2>/dev/null || true
+        codesign --force --sign "$(mk_codesign_identity)" "$MK_HOME/bin/meetink-capture" || \
+            print -P "${C[yellow]}⚠${C[reset]} capture codesign failed — permissions will re-prompt"
     fi
     print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$MK_HOME/bin/meetink-capture${C[reset]}"
     cd - > /dev/null
@@ -222,9 +223,16 @@ build_agent() {
     if command -v codesign >/dev/null 2>&1; then
         # Entitlements carry the time-sensitive notification grant — the
         # 1-minute meeting warning must break through Focus modes.
+        # Strip extended attributes first: Finder info on any bundled
+        # file makes codesign fail ("resource fork ... detritus not
+        # allowed"), and a swallowed failure leaves the linker's AD-HOC
+        # signature — a new cdhash identity every build, endless
+        # permission re-prompts. Failures print now instead of hiding.
+        xattr -cr "$app" 2>/dev/null || true
         codesign --force --sign "$(mk_codesign_identity)" \
             --entitlements "$MK_ROOT/src/agent/Resources/entitlements.plist" \
-            "$app" 2>/dev/null || true
+            "$app" || \
+            print -P "${C[yellow]}⚠${C[reset]} agent codesign failed — notifications/calendar will re-prompt"
     fi
 
     print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$app${C[reset]}"
@@ -280,7 +288,9 @@ build_app() {
     # — the endless-permission-prompt failure. See mk_codesign_identity.
     if command -v codesign >/dev/null 2>&1; then
         local ident=$(mk_codesign_identity)
-        codesign --force --sign "$ident" "$app" 2>/dev/null || true
+        xattr -cr "$app" 2>/dev/null || true
+        codesign --force --sign "$ident" "$app" || \
+            print -P "${C[yellow]}⚠${C[reset]} app codesign failed — permissions will re-prompt (ad-hoc identity)"
         if [[ "$ident" == "-" ]]; then
             print -P "  ${C[yellow]}⚠${C[reset]} ${C[dim]}ad-hoc signed — mic/screen permissions will re-prompt after every rebuild.${C[reset]}"
             # Two distinct fix paths: the identity may be missing entirely,

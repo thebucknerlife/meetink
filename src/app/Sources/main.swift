@@ -1632,7 +1632,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
 // MARK: - Meetings list page
 
-final class MeetingsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+final class MeetingsViewController: NSViewController, NSTableViewDataSource,
+                                    NSTableViewDelegate, NSMenuDelegate {
     private let table = NSTableView()
     private enum MeetingStatus { case live, processing, playing, ended }
     /// Wired by MainWindowController to the reader: the txt path whose
@@ -1678,10 +1679,12 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         table.target = self
         table.doubleAction = #selector(openSelected)
         table.usesAlternatingRowBackgroundColors = true
+        table.allowsMultipleSelection = true
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Rename…", action: #selector(renameClicked), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Delete", action: #selector(deleteClicked), keyEquivalent: ""))
         for item in menu.items { item.target = self }
+        menu.delegate = self
         table.menu = menu
         scroll.documentView = table
         self.view = scroll
@@ -1691,6 +1694,21 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         let row = table.clickedRow
         guard row >= 0, row < files.count else { return nil }
         return (files[row].path, files[row].name)
+    }
+
+    /// Right-click target rows: the multi-selection when the click landed
+    /// inside it, else just the clicked row.
+    private func targetRows() -> [Int] {
+        let clicked = table.clickedRow
+        guard clicked >= 0 else { return Array(table.selectedRowIndexes) }
+        return table.selectedRowIndexes.contains(clicked)
+            ? Array(table.selectedRowIndexes) : [clicked]
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        // Rename is single-meeting-only.
+        menu.items.first { $0.action == #selector(renameClicked) }?
+            .isHidden = targetRows().count > 1
     }
 
     /// Rename a meeting: new display name → slug, stamped prefix kept.
@@ -1712,23 +1730,29 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
     }
 
     @objc private func deleteClicked() {
-        guard let f = clickedFile() else { return }
+        let rows = targetRows().filter { $0 < files.count }
+        guard !rows.isEmpty else { return }
         let alert = NSAlert()
-        alert.messageText = "Delete “\(f.name)”?"
-        alert.informativeText = "The meeting (transcript, summary, audio) moves to the Trash."
+        alert.messageText = rows.count == 1
+            ? "Delete “\(files[rows[0]].name)”?"
+            : "Delete \(rows.count) meetings?"
+        alert.informativeText = "Transcripts, summaries and audio move to the Trash."
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Move to Trash")
         guard alert.runModal() == .alertSecondButtonReturn else { return }
-        let dir = (f.path as NSString).deletingLastPathComponent
-        let base = ((f.path as NSString).lastPathComponent as NSString).deletingPathExtension
         let fm = FileManager.default
-        if (dir as NSString).lastPathComponent == base {
-            try? fm.trashItem(at: URL(fileURLWithPath: dir), resultingItemURL: nil)
-        } else {
-            for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? []
-            where item.hasPrefix(base + ".") {
-                try? fm.trashItem(at: URL(fileURLWithPath: dir + "/" + item),
-                                  resultingItemURL: nil)
+        for row in rows {
+            let path = files[row].path
+            let dir = (path as NSString).deletingLastPathComponent
+            let base = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+            if (dir as NSString).lastPathComponent == base {
+                try? fm.trashItem(at: URL(fileURLWithPath: dir), resultingItemURL: nil)
+            } else {
+                for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+                where item.hasPrefix(base + ".") {
+                    try? fm.trashItem(at: URL(fileURLWithPath: dir + "/" + item),
+                                      resultingItemURL: nil)
+                }
             }
         }
         refresh()
