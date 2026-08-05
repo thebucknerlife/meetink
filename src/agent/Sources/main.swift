@@ -56,6 +56,13 @@ func jsonString(_ v: Any) -> String {
 
 func cmdEvents(args: [String]) -> Int32 {
     var hours: Int = 8
+    // Explicit window (ISO8601) for querying around a PAST moment — the
+    // app's "link a calendar event to this recording" needs events near
+    // the recording's start, which may be days ago. --hours remains the
+    // forward-looking spelling the watcher uses.
+    var fromDate: Date? = nil
+    var toDate: Date? = nil
+    let isoIn = ISO8601DateFormatter()
     var i = 0
     while i < args.count {
         switch args[i] {
@@ -65,6 +72,22 @@ func cmdEvents(args: [String]) -> Int32 {
                 i += 2
             } else {
                 eprint("--hours expects an integer")
+                return 2
+            }
+        case "--from":
+            if i + 1 < args.count, let d = isoIn.date(from: args[i + 1]) {
+                fromDate = d
+                i += 2
+            } else {
+                eprint("--from expects an ISO8601 date")
+                return 2
+            }
+        case "--to":
+            if i + 1 < args.count, let d = isoIn.date(from: args[i + 1]) {
+                toDate = d
+                i += 2
+            } else {
+                eprint("--to expects an ISO8601 date")
                 return 2
             }
         default:
@@ -97,14 +120,17 @@ func cmdEvents(args: [String]) -> Int32 {
     }
 
     let now = Date()
-    let end = Calendar.current.date(byAdding: .hour, value: hours, to: now)
+    let end = toDate
+        ?? Calendar.current.date(byAdding: .hour, value: hours, to: now)
         ?? now.addingTimeInterval(Double(hours) * 3600)
+    let start = fromDate
+        ?? now.addingTimeInterval(-300)  // 5-min look-behind to catch
+                                         // ongoing meetings
 
     // EKEventStore.events(matching:) only takes predicates spanning ≤4 years.
     // We're well within that.
     let predicate = store.predicateForEvents(
-        withStart: now.addingTimeInterval(-300),  // 5-min look-behind to
-                                                    // catch ongoing meetings
+        withStart: start,
         end: end,
         calendars: nil  // all calendars
     )

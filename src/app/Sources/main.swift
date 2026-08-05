@@ -553,6 +553,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
     private let folderButton = NSButton(title: "Open Folder", target: nil, action: nil)
     private let reprocessButton = NSButton(title: "Reprocess", target: nil, action: nil)
+    private let eventButton = NSButton(title: "Link Event", target: nil, action: nil)
+    private var fetchedEvents: [[String: Any]] = []
     private let jumpButton = NSButton(title: "", target: nil, action: nil)
 
     private var pollTimer: Timer?
@@ -621,6 +623,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         folderButton.font = NSFont.systemFont(ofSize: 11)
         folderButton.target = self
         folderButton.action = #selector(openFolder)
+        eventButton.bezelStyle = .rounded
+        eventButton.controlSize = .small
+        eventButton.font = NSFont.systemFont(ofSize: 11)
+        eventButton.target = self
+        eventButton.action = #selector(linkEvent)
+        eventButton.toolTip = "Tie this recording to a calendar event — renames "
+            + "the meeting and records the attendees"
+        eventButton.isHidden = true
         reprocessButton.bezelStyle = .rounded
         reprocessButton.controlSize = .small
         reprocessButton.font = NSFont.systemFont(ofSize: 11)
@@ -638,6 +648,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         strip.addArrangedSubview(statusDot)
         strip.addArrangedSubview(headerField)
         strip.addArrangedSubview(NSView())
+        strip.addArrangedSubview(eventButton)
         strip.addArrangedSubview(reprocessButton)
         strip.addArrangedSubview(folderButton)
         strip.addArrangedSubview(copyButton)
@@ -892,6 +903,100 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         return false
     }
 
+    /// Calendar events around the recording's start (4 h before to 8 h
+    /// after), via the agent's --from/--to window. Selecting one renames
+    /// the meeting to the event title and records the attendees — in
+    /// meta.json and as the transcript's # attendees: header, the same
+    /// line the live tooling reads.
+    @objc private func linkEvent() {
+        guard !lastResolvedPath.isEmpty else { return }
+        let start = snapshot.startedAt ?? meetingRecordingDate(lastResolvedPath)
+        let agent = "\(mkHome)/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
+        guard FileManager.default.isExecutableFile(atPath: agent) else { return }
+        let iso = ISO8601DateFormatter()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: agent)
+        proc.arguments = ["events",
+                          "--from", iso.string(from: start.addingTimeInterval(-4 * 3600)),
+                          "--to", iso.string(from: start.addingTimeInterval(8 * 3600))]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        eventButton.isEnabled = false
+        DispatchQueue.global().async { [weak self] in
+            defer { DispatchQueue.main.async { self?.eventButton.isEnabled = true } }
+            do { try proc.run() } catch { return }
+            proc.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let events = (try? JSONSerialization.jsonObject(with: data)
+                          as? [[String: Any]]) ?? []
+            DispatchQueue.main.async { self?.showEventMenu(events, near: start) }
+        }
+    }
+
+    private func showEventMenu(_ events: [[String: Any]], near start: Date) {
+        fetchedEvents = events
+        let menu = NSMenu()
+        if events.isEmpty {
+            menu.addItem(NSMenuItem(
+                title: "No calendar events found (is calendar access granted?)",
+                action: nil, keyEquivalent: ""))
+        }
+        let iso = ISO8601DateFormatter()
+        let tf = DateFormatter()
+        tf.dateFormat = "h:mm a"
+        // Chronological list; the event nearest the recording start is
+        // checkmarked so the eye lands on it.
+        var nearest = -1
+        var best = Double.infinity
+        for (i, e) in events.enumerated() {
+            guard let d = iso.date(from: (e["start"] as? String) ?? "") else { continue }
+            let dist = abs(d.timeIntervalSince(start))
+            if dist < best { best = dist; nearest = i }
+        }
+        for (i, e) in events.enumerated() {
+            let when = iso.date(from: (e["start"] as? String) ?? "")
+            let item = NSMenuItem(
+                title: "\(when.map { tf.string(from: $0) } ?? "?")   \((e["title"] as? String) ?? "(untitled)")",
+                action: #selector(eventPicked(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = i
+            if i == nearest { item.state = .on }
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil,
+                   at: NSPoint(x: 0, y: eventButton.bounds.height + 4),
+                   in: eventButton)
+    }
+
+    @objc private func eventPicked(_ sender: NSMenuItem) {
+        guard sender.tag >= 0, sender.tag < fetchedEvents.count else { return }
+        let e = fetchedEvents[sender.tag]
+        let title = (e["title"] as? String) ?? ""
+        let names = ((e["attendees"] as? [[String: String]]) ?? [])
+            .compactMap { $0["name"]?.isEmpty == false ? $0["name"] : $0["email"] }
+        var path = lastResolvedPath
+        // Metadata first (exact title + event record), then the slug
+        // rename, then the attendees header line.
+        setMeetingMeta(path, "event", ["title": title,
+                                       "start": (e["start"] as? String) ?? "",
+                                       "attendees": names])
+        if !title.isEmpty, let newPath = renameMeeting(txtPath: path, displayName: title) {
+            if fixedPath != nil { fixedPath = newPath }
+            path = newPath
+        }
+        if !names.isEmpty, var text = try? String(contentsOfFile: path, encoding: .utf8) {
+            let line = "# attendees: " + names.joined(separator: ", ")
+            if let r = text.range(of: #"^# attendees:.*$"#,
+                                  options: [.regularExpression]) {
+                text.replaceSubrange(r, with: line)
+            } else if let r = text.range(of: "Started:") {
+                text.insert(contentsOf: line + "\n", at: r.lowerBound)
+            }
+            try? text.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+        refreshIfChanged(force: true)
+    }
+
     /// Re-run the whole pipeline on this recording's kept audio (spools
     /// preferred, m4a fallback — cmd_reprocess). The transcript reloads by
     /// itself through the file watcher as the refine rewrites it.
@@ -1088,6 +1193,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         for v in playerBar.arrangedSubviews { v.isHidden = (audioPath == nil) }
         noAudioLabel.isHidden = !(archived && audioPath == nil)
         reprocessButton.isHidden = !(archived && audioPath != nil)
+        eventButton.isHidden = !archived
         titleField.isHidden = !archived
         if archived, view.window?.firstResponder != titleField.currentEditor() {
             titleField.stringValue = meetingDisplayName(lastResolvedPath)
