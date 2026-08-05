@@ -878,6 +878,25 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         jumpButton.isHidden = true
     }
 
+    /// Clicking away from the title field commits the edit — Enter was
+    /// the only save path, so click-away silently discarded typing and
+    /// the next poll repopulated the old (event) title: 'my rename
+    /// reverted'.
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard (notification.object as? NSTextField) == titleField else { return }
+        commitTitleEdit()
+    }
+
+    private func commitTitleEdit() {
+        let newName = titleField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !newName.isEmpty, !lastResolvedPath.isEmpty,
+              newName != meetingDisplayName(lastResolvedPath) else { return }
+        if let newPath = renameMeeting(txtPath: lastResolvedPath, displayName: newName) {
+            if fixedPath != nil { fixedPath = newPath }
+            refreshIfChanged(force: true)
+        }
+    }
+
     /// Enter in the title field renames the meeting on disk (folder +
     /// same-basename siblings, live symlink retargeted) and re-points this
     /// page at the new path.
@@ -885,14 +904,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                  doCommandBy commandSelector: Selector) -> Bool {
         guard control == titleField else { return false }
         if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-            let newName = titleField.stringValue
-            if let newPath = renameMeeting(txtPath: lastResolvedPath, displayName: newName) {
-                if fixedPath != nil { fixedPath = newPath }
-                view.window?.makeFirstResponder(textView.superview)
-                refreshIfChanged(force: true)
-            } else {
-                titleField.stringValue = meetingDisplayName(lastResolvedPath)
-            }
+            commitTitleEdit()
+            view.window?.makeFirstResponder(textView.superview)
             return true
         }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
@@ -2469,6 +2482,9 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
     }
 }
 
+/// Top-anchored coordinates for scroll document views.
+final class FlippedView: NSView { override var isFlipped: Bool { true } }
+
 // MARK: - Settings page
 
 /// Checkbox settings, persisted as key=value lines in ~/.meetink/config —
@@ -2550,14 +2566,24 @@ final class SettingsViewController: NSViewController {
         stack.setCustomSpacing(24, after: calendarsStack)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        root.addSubview(stack)
+        // Scrollable: the calendars list grows past the window bottom.
+        let doc = FlippedView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(stack)
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.documentView = doc
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 24),
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: doc.topAnchor, constant: 24),
+            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: doc.trailingAnchor, constant: -24),
             stack.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
+            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            doc.bottomAnchor.constraint(equalTo: stack.bottomAnchor, constant: 24),
         ])
-        self.view = root
+        self.view = scroll
+        _ = root
     }
 
     override func viewWillAppear() {

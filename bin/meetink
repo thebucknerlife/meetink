@@ -212,6 +212,9 @@ build_agent() {
     # without CFBundleIdentifier; EventKit's Full Calendar Access prompt
     # uses the NSCalendarsFullAccessUsageDescription string.
     cp "$MK_ROOT/src/agent/Resources/Info.plist" "$app/Contents/Info.plist"
+    # Notification Center shows the agent's name and icon — without these
+    # the entry reads 'meetink-agent' with a placeholder glyph.
+    cp "$MK_ROOT/src/app/Resources/Meetink.icns" "$resources_dir/Meetink.icns" 2>/dev/null || true
 
     # Sign with the stable identity when available (see
     # mk_codesign_identity — ad-hoc signatures change every rebuild and
