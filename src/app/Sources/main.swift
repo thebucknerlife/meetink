@@ -1282,6 +1282,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             parts = ["not recording"]
         }
         headerField.stringValue = parts.joined(separator: "   ")
+        // Populate here, not only on render: the page polls while detached
+        // from the window, and an already-rendered transcript never
+        // re-renders on attach — the title stayed "(untitled)" (field bug).
+        if !titleField.isHidden, titleField.currentEditor() == nil,
+           !lastResolvedPath.isEmpty {
+            let name = meetingDisplayName(lastResolvedPath)
+            if titleField.stringValue != name { titleField.stringValue = name }
+        }
         updateSpeakersPanel()
     }
 }

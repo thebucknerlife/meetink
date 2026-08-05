@@ -131,11 +131,12 @@ def fdaf_cancel(ref: np.ndarray, sig: np.ndarray, delay: int,
     return out
 
 
-def cancel_direction(ref: np.ndarray, sig: np.ndarray, name: str) -> np.ndarray:
+def cancel_direction(ref: np.ndarray, sig: np.ndarray,
+                     name: str) -> tuple[np.ndarray, int]:
     delay = gcc_phat_delay(ref, sig)
     if delay < 0:
         log(f"{name}: no echo path detected — left untouched")
-        return sig
+        return sig, -1
     before = float(np.sqrt((sig ** 2).mean()))
     cleaned = fdaf_cancel(ref, sig, delay)
     after = float(np.sqrt((cleaned ** 2).mean()))
@@ -144,10 +145,55 @@ def cancel_direction(ref: np.ndarray, sig: np.ndarray, name: str) -> np.ndarray:
     if after > before * 1.02:
         log(f"{name}: cancellation diverged (rms {before:.4f} -> {after:.4f}) "
             f"— left untouched")
-        return sig
+        return sig, delay
     log(f"{name}: echo path at {delay / RATE * 1000:.0f} ms, "
         f"rms {before:.4f} -> {after:.4f}")
-    return cleaned
+    return cleaned, delay
+
+
+def residual_echo_gate(mic: np.ndarray, sys_: np.ndarray, delay: int,
+                       floor: float = 0.12) -> np.ndarray:
+    """Post-AEC safety net for the user's remote echo.
+
+    The linear filter assumes a fixed echo path, but conferencing echo
+    drifts (jitter buffers re-time it), so slap-back residue survives.
+    And the mix-time ducking can't catch it either: the echo lands
+    ~delay ms AFTER the user spoke, when their mic is quiet again and
+    the duck has released. This gate ducks sys blocks where the
+    DELAY-SHIFTED mic envelope is active and sys is no louder than a
+    plausible echo of it — genuinely remote speech is independent of
+    the user's (usually louder than a decayed echo, or present while
+    the shifted mic is silent) and passes through untouched."""
+    B = RATE // 20   # 50 ms blocks
+    n = len(sys_)
+    if delay > 0:
+        micd = np.concatenate([np.zeros(delay, dtype=np.float32), mic])
+    else:
+        micd = mic
+    micd = micd[:n]
+    if len(micd) < n:
+        micd = np.pad(micd, (0, n - len(micd)))
+    nb = n // B
+    if nb < 4:
+        return sys_
+    me = np.sqrt((micd[: nb * B].reshape(nb, B) ** 2).mean(axis=1))
+    se = np.sqrt((sys_[: nb * B].reshape(nb, B) ** 2).mean(axis=1))
+    echoish = (me > 0.008) & (se < 1.2 * me)
+    # Dilate one block each side: echo tails smear past the envelope.
+    d = echoish.copy()
+    d[1:] |= echoish[:-1]
+    d[:-1] |= echoish[1:]
+    gains = np.where(d, floor, 1.0).astype(np.float32)
+    # Smooth the gain curve (~3 blocks) so ducking doesn't click.
+    kernel = np.ones(3, dtype=np.float32) / 3
+    gains = np.convolve(gains, kernel, mode="same")
+    out = sys_.copy()
+    out[: nb * B] *= np.repeat(gains, B)
+    ducked = int(d.sum())
+    if ducked:
+        log(f"sys: residual echo gate ducked {ducked * B / RATE:.0f}s "
+            f"of {nb * B / RATE:.0f}s")
+    return out
 
 
 # --- Stage 2: DeepFilterNet (optional) ---
@@ -202,8 +248,10 @@ def main() -> int:
 
     # The user's remote echo inside sys (mic is the reference), then
     # speaker/headphone bleed inside mic (sys is the reference).
-    clean_sys = cancel_direction(mic, sys_, "sys")
-    clean_mic = cancel_direction(sys_, mic, "mic")
+    clean_sys, sys_delay = cancel_direction(mic, sys_, "sys")
+    clean_mic, _ = cancel_direction(sys_, mic, "mic")
+    if sys_delay >= 0:
+        clean_sys = residual_echo_gate(mic, clean_sys, sys_delay)
 
     if not args.no_deepfilter and deepfilter_available():
         clean_sys = deepfilter(clean_sys, "sys")
