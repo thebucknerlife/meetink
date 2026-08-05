@@ -901,3 +901,49 @@ class WatchManager:
 
 def get_manager() -> WatchManager:
     return WatchManager.get()
+
+
+# --- Headless daemon mode (app-owned watch) ---
+
+def daemon_main() -> int:
+    """Run the watcher as a standalone process — `meetink watch-daemon`.
+
+    Meetink.app spawns this on launch (when watch_enabled is set) so
+    auto-recording works without a REPL open. Two guards:
+      - a pid file refuses double-watching (a REPL watcher and the app
+        daemon would both fire /start at meeting time);
+      - MEETINK_WATCH_OWNER_PID ties the daemon's life to the app — if
+        the owner dies we exit instead of orphaning (the same watchdog
+        pattern the diarize server uses for its owner).
+    """
+    pidfile = Path("/tmp/meetink-watch.pid")
+    if pidfile.is_file():
+        try:
+            other = int(pidfile.read_text().strip())
+            os.kill(other, 0)
+            print(f"[watch-daemon] already running (pid {other})", file=sys.stderr)
+            return 1
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass  # stale
+    pidfile.write_text(str(os.getpid()))
+
+    owner = int(os.environ.get("MEETINK_WATCH_OWNER_PID", "0") or "0")
+    mgr = WatchManager.get()
+    mgr.start()
+    print(f"[watch-daemon] running (owner pid {owner or 'none'})", file=sys.stderr)
+    try:
+        while True:
+            time.sleep(10)
+            if owner:
+                try:
+                    os.kill(owner, 0)
+                except ProcessLookupError:
+                    print("[watch-daemon] owner gone — exiting", file=sys.stderr)
+                    break
+    finally:
+        mgr.stop()
+        try:
+            pidfile.unlink()
+        except OSError:
+            pass
+    return 0

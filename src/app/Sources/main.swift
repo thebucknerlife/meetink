@@ -352,6 +352,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let statusDot = NSTextField(labelWithString: "●")
     private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
     private let folderButton = NSButton(title: "Open Folder", target: nil, action: nil)
+    private let reprocessButton = NSButton(title: "Reprocess", target: nil, action: nil)
     private let jumpButton = NSButton(title: "", target: nil, action: nil)
 
     private var pollTimer: Timer?
@@ -401,6 +402,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         folderButton.font = NSFont.systemFont(ofSize: 11)
         folderButton.target = self
         folderButton.action = #selector(openFolder)
+        reprocessButton.bezelStyle = .rounded
+        reprocessButton.controlSize = .small
+        reprocessButton.font = NSFont.systemFont(ofSize: 11)
+        reprocessButton.target = self
+        reprocessButton.action = #selector(reprocess)
+        reprocessButton.toolTip = "Re-run transcription, diarization and audio "
+            + "enhancement on this meeting's kept audio"
+        reprocessButton.isHidden = true
         copyButton.bezelStyle = .rounded
         copyButton.controlSize = .small
         copyButton.font = NSFont.systemFont(ofSize: 11)
@@ -410,6 +419,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         header.addArrangedSubview(statusDot)
         header.addArrangedSubview(headerField)
         header.addArrangedSubview(NSView())
+        header.addArrangedSubview(reprocessButton)
         header.addArrangedSubview(folderButton)
         header.addArrangedSubview(copyButton)
 
@@ -628,6 +638,41 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         jumpButton.isHidden = true
     }
 
+    /// Re-run the whole pipeline on this recording's kept audio (spools
+    /// preferred, m4a fallback — cmd_reprocess). The transcript reloads by
+    /// itself through the file watcher as the refine rewrites it.
+    @objc private func reprocess() {
+        guard let launcher = launcherPath(), !lastResolvedPath.isEmpty else { return }
+        reprocessButton.isEnabled = false
+        reprocessButton.title = "Reprocessing…"
+        let path = lastResolvedPath
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["reprocess", path]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        DispatchQueue.global().async { [weak self] in
+            do { try proc.run() } catch { return }
+            proc.waitUntilExit()
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                             encoding: .utf8) ?? ""
+            DispatchQueue.main.async {
+                self?.reprocessButton.isEnabled = true
+                self?.reprocessButton.title = "Reprocess"
+                self?.refreshIfChanged(force: true)
+                if proc.terminationStatus != 0 || out.lowercased().contains("error") {
+                    let alert = NSAlert()
+                    alert.messageText = "Reprocess failed"
+                    alert.informativeText = out.replacingOccurrences(
+                        of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
     @objc private func openFolder() {
         guard !lastResolvedPath.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting(
@@ -786,6 +831,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             ? NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12) : NSEdgeInsets()
         for v in playerBar.arrangedSubviews { v.isHidden = (audioPath == nil) }
         noAudioLabel.isHidden = !(archived && audioPath == nil)
+        reprocessButton.isHidden = !(archived && audioPath != nil)
         updatePlayerUI()
     }
 
@@ -1914,6 +1960,8 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
 final class SettingsViewController: NSViewController {
     private let keepSpoolsBox = NSButton(
         checkboxWithTitle: "Keep audio spools", target: nil, action: nil)
+    private let watchBox = NSButton(
+        checkboxWithTitle: "Auto-record meetings", target: nil, action: nil)
     private let keepAudioBox = NSButton(
         checkboxWithTitle: "Keep audio recording", target: nil, action: nil)
 
@@ -1927,6 +1975,8 @@ final class SettingsViewController: NSViewController {
         keepAudioBox.action = #selector(toggled(_:))
         keepSpoolsBox.target = self
         keepSpoolsBox.action = #selector(toggled(_:))
+        watchBox.target = self
+        watchBox.action = #selector(toggled(_:))
 
         func caption(_ text: String) -> NSTextField {
             let f = NSTextField(wrappingLabelWithString: text)
@@ -1941,12 +1991,17 @@ final class SettingsViewController: NSViewController {
         let spoolsCaption = caption(
             "Keep the raw microphone and system-audio streams as two separate "
             + "wav files — replayable end-to-end with `meetink simulate`.")
+        let watchCaption = caption(
+            "Watch the calendar and running meeting apps; start recording "
+            + "automatically (1-minute warning for scheduled meetings). Runs "
+            + "whenever Meetink is running — no REPL needed.")
         let footnote = caption(
             "Applies from the next recording. Stored in ~/.meetink/config "
-            + "(keep_audio, keep_spools).")
+            + "(keep_audio, keep_spools, watch_enabled).")
 
         let stack = NSStackView(views: [
             title,
+            watchBox, watchCaption,
             keepAudioBox, audioCaption,
             keepSpoolsBox, spoolsCaption,
             footnote,
@@ -1955,6 +2010,8 @@ final class SettingsViewController: NSViewController {
         stack.alignment = .leading
         stack.spacing = 8
         stack.setCustomSpacing(20, after: title)
+        stack.setCustomSpacing(2, after: watchBox)
+        stack.setCustomSpacing(18, after: watchCaption)
         stack.setCustomSpacing(2, after: keepAudioBox)
         stack.setCustomSpacing(18, after: audioCaption)
         stack.setCustomSpacing(2, after: keepSpoolsBox)
@@ -1975,10 +2032,12 @@ final class SettingsViewController: NSViewController {
         super.viewWillAppear()
         keepAudioBox.state = configBool("keep_audio") ? .on : .off
         keepSpoolsBox.state = configBool("keep_spools") ? .on : .off
+        watchBox.state = configBool("watch_enabled") ? .on : .off
     }
 
     @objc private func toggled(_ sender: NSButton) {
-        let key = sender == keepAudioBox ? "keep_audio" : "keep_spools"
+        let key = sender == keepAudioBox ? "keep_audio"
+            : sender == keepSpoolsBox ? "keep_spools" : "watch_enabled"
         configSetValue(key, sender.state == .on ? "true" : "false")
     }
 }
@@ -2138,6 +2197,13 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             // and the frame autosave then faithfully preserves the collapse
             // forever (field case: "I only see the status bar").
             detailContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 360),
+            // Hard floor on the whole content: Auto Layout resolves
+            // conflicts by resizing the WINDOW when it can (minSize does
+            // not bind constraint-driven resizes — field case: squeezed to
+            // 618 pt twice). With a required floor, a bad constraint now
+            // breaks visibly in Console instead of crushing the window.
+            content.widthAnchor.constraint(greaterThanOrEqualToConstant: 640),
+            content.heightAnchor.constraint(greaterThanOrEqualToConstant: 400),
         ])
 
         meetingsVC.onOpen = { [weak self] path in
@@ -2265,6 +2331,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastRecording = false
     private var reallyQuit = false
 
+    // --- Watch daemon (app-owned auto-record) ---
+    // The watcher used to live only inside the REPL process; now the app
+    // reconciles it against the watch_enabled config key on every state
+    // poll: spawn when enabled, terminate when disabled or on quit. The
+    // daemon also carries MEETINK_WATCH_OWNER_PID so it exits by itself
+    // if the app dies uncleanly (no orphaned recordings).
+    private var watchProcess: Process? = nil
+
+    private func reconcileWatchDaemon() {
+        let wants = configBool("watch_enabled")
+        let running = watchProcess?.isRunning == true
+        if wants && !running {
+            guard let launcher = launcherPath() else { return }
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: launcher)
+            proc.arguments = ["watch-daemon"]
+            var env = ProcessInfo.processInfo.environment
+            env["MEETINK_WATCH_OWNER_PID"] = String(ProcessInfo.processInfo.processIdentifier)
+            proc.environment = env
+            let logPath = "/tmp/meetink-watch.log"
+            if !FileManager.default.fileExists(atPath: logPath) {
+                FileManager.default.createFile(atPath: logPath, contents: nil)
+            }
+            if let h = FileHandle(forWritingAtPath: logPath) {
+                h.seekToEndOfFile()
+                proc.standardOutput = h
+                proc.standardError = h
+            }
+            try? proc.run()
+            watchProcess = proc
+        } else if !wants && running {
+            watchProcess?.terminate()
+            watchProcess = nil
+        }
+    }
+
+    private func stopWatchDaemon() {
+        watchProcess?.terminate()
+        watchProcess = nil
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if reallyQuit {
             // Quit Completely — but warn when quitting would strand work.
@@ -2311,6 +2418,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func quitCompletely() {
         reallyQuit = true
         NSApp.terminate(nil)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        stopWatchDaemon()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -2405,6 +2516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func pollState() {
+        reconcileWatchDaemon()
         let recording = recordingPID() != nil
         if recording != lastRecording {
             lastRecording = recording

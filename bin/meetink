@@ -1157,6 +1157,9 @@ case "${1:-}" in
     simulate|sim)      shift 2>/dev/null; cmd_simulate "$@" ;;
     migrate)           cmd_migrate ;;
     reprocess)         shift 2>/dev/null; cmd_reprocess "$@" ;;
+    watch-daemon)      # Headless watcher (spawned by Meetink.app; see watch.daemon_main)
+                       MEETINK_HOME="$MK_HOME" PYTHONPATH="$MK_ROOT/src" \
+                           exec "$MK_PY_VENV/bin/python" -c "import watch; watch.daemon_main()" ;;
     enhance)           case "$2" in install) cmd_enhance_install ;; *) print -P "usage: meetink enhance install" ;; esac ;;
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
