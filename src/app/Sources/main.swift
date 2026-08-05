@@ -44,6 +44,17 @@ func configValue(_ key: String) -> String? {
     return nil
 }
 
+/// Speakers hidden from the sidebar and excluded from talk-share math —
+/// recurring non-participants like Zoom's "recording in progress"
+/// announcer. hidden_speakers in ~/.meetink/config (CSV) overrides the
+/// default. Their transcript lines stay; only the accounting hides.
+func hiddenSpeakerNames() -> Set<String> {
+    let raw = configValue("hidden_speakers") ?? "Zoom"
+    return Set(raw.split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespaces).uppercased() }
+        .filter { !$0.isEmpty })
+}
+
 /// Truthy spelling matches the launcher's mk_config_bool: true/on/1.
 func configBool(_ key: String) -> Bool {
     guard let v = configValue(key) else { return false }
@@ -415,7 +426,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let titleField = NSTextField(string: "")
     private var headerHeight: NSLayoutConstraint? = nil
     private let speakersTable = NSTableView()
+    private enum PanelRow {
+        case speaker(name: String, fraction: Double, hidden: Bool)
+        case toggle(count: Int)
+    }
+    private var panelRows: [PanelRow] = []
     private var speakers: [(name: String, fraction: Double)] = []
+    private var showHiddenSpeakers = false
     private let statusDot = NSTextField(labelWithString: "●")
     private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
     private let folderButton = NSButton(title: "Open Folder", target: nil, action: nil)
@@ -1076,27 +1093,57 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         if fresh.map(\.name) != speakers.map(\.name)
             || fresh.map({ Int($0.fraction * 100) }) != speakers.map({ Int($0.fraction * 100) }) {
             speakers = fresh
-            speakersTable.reloadData()
+            rebuildPanelRows()
         }
+    }
+
+    /// Visible speakers first (shares renormalized WITHOUT the hidden
+    /// ones — the Zoom announcer shouldn't own 4% of a meeting), then a
+    /// collapsible "Hidden (n)" section.
+    private func rebuildPanelRows() {
+        let hiddenNames = hiddenSpeakerNames()
+        let visible = speakers.filter { !hiddenNames.contains($0.name.uppercased()) }
+        let hidden = speakers.filter { hiddenNames.contains($0.name.uppercased()) }
+        let vTotal = max(visible.reduce(0) { $0 + $1.fraction }, 0.0001)
+        var rows: [PanelRow] = visible.map {
+            .speaker(name: $0.name, fraction: $0.fraction / vTotal, hidden: false)
+        }
+        if !hidden.isEmpty {
+            rows.append(.toggle(count: hidden.count))
+            if showHiddenSpeakers {
+                rows += hidden.map {
+                    .speaker(name: $0.name, fraction: $0.fraction, hidden: true)
+                }
+            }
+        }
+        panelRows = rows
+        speakersTable.reloadData()
     }
 
     @objc private func speakerRowClicked() {
         let row = speakersTable.clickedRow
-        guard row >= 0, row < speakers.count else { return }
-        // With audio: clicking a name hops to their next segment after the
-        // playhead. Renaming is the pencil button. Without audio the click
-        // falls back to renaming (nothing to play).
-        if audioPath != nil {
-            playNextSegment(of: speakers[row].name)
-        } else {
-            promptForName(label: speakers[row].name)
+        guard row >= 0, row < panelRows.count else { return }
+        switch panelRows[row] {
+        case .toggle:
+            showHiddenSpeakers.toggle()
+            rebuildPanelRows()
+        case .speaker(let name, _, _):
+            // With audio: clicking a name hops to their next segment after
+            // the playhead. Renaming is the pencil button. Without audio
+            // the click falls back to renaming (nothing to play).
+            if audioPath != nil {
+                playNextSegment(of: name)
+            } else {
+                promptForName(label: name)
+            }
         }
     }
 
     @objc private func pencilClicked(_ sender: NSButton) {
         let row = speakersTable.row(for: sender)
-        guard row >= 0, row < speakers.count else { return }
-        promptForName(label: speakers[row].name)
+        guard row >= 0, row < panelRows.count,
+              case .speaker(let name, _, _) = panelRows[row] else { return }
+        promptForName(label: name)
     }
 
     /// Speaker whose sample should start playing once the player is ready
@@ -1125,7 +1172,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     }
 
     // Speakers panel table.
-    func numberOfRows(in tableView: NSTableView) -> Int { speakers.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { panelRows.count }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?,
                    row: Int) -> NSView? {
@@ -1172,12 +1219,24 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 pencil.widthAnchor.constraint(equalToConstant: 18),
             ])
         }
-        let sp = speakers[row]
-        nameField.stringValue = sp.name
-        nameField.textColor = color(for: sp.name)
-        nameField.toolTip = audioPath != nil
-            ? "Click to play their next segment" : "Click to name this speaker"
-        pctField.stringValue = "\(Int((sp.fraction * 100).rounded()))%"
+        guard row < panelRows.count else { return cell }
+        switch panelRows[row] {
+        case .toggle(let count):
+            nameField.stringValue = (showHiddenSpeakers ? "▾ Hidden" : "▸ Hidden")
+                + " (\(count))"
+            nameField.textColor = .tertiaryLabelColor
+            nameField.toolTip = "Non-participants (e.g. the Zoom recording "
+                + "announcer) — click to show"
+            pctField.stringValue = ""
+            cell.subviews.last?.isHidden = true   // no pencil on the toggle
+        case .speaker(let name, let fraction, let hidden):
+            nameField.stringValue = name
+            nameField.textColor = hidden ? .tertiaryLabelColor : color(for: name)
+            nameField.toolTip = audioPath != nil
+                ? "Click to play their next segment" : "Click to name this speaker"
+            pctField.stringValue = "\(Int((fraction * 100).rounded()))%"
+            cell.subviews.last?.isHidden = false
+        }
         return cell
     }
 
