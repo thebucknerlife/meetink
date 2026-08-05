@@ -1157,6 +1157,7 @@ case "${1:-}" in
     simulate|sim)      shift 2>/dev/null; cmd_simulate "$@" ;;
     migrate)           cmd_migrate ;;
     reprocess)         shift 2>/dev/null; cmd_reprocess "$@" ;;
+    enhance)           case "$2" in install) cmd_enhance_install ;; *) print -P "usage: meetink enhance install" ;; esac ;;
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
     _build_capture)    build_capture ;;

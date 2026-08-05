@@ -108,6 +108,24 @@ func recordingPID() -> Int32? {
     return kill(pid, 0) == 0 ? pid : nil
 }
 
+/// Keeps the assignment combo's dropdown open and filtered while the
+/// user types — NSComboBox's built-in completion is inline-only, so
+/// without this the list has to be opened by hand every time.
+final class ComboAutoOpen: NSObject, NSComboBoxDelegate {
+    static let shared = ComboAutoOpen()
+
+    func controlTextDidChange(_ n: Notification) {
+        guard let combo = n.object as? NSComboBox else { return }
+        let typed = combo.stringValue.lowercased()
+        let all = enrolledProfiles()
+        let matches = typed.isEmpty ? all
+            : all.filter { $0.lowercased().contains(typed) }
+        combo.removeAllItems()
+        combo.addItems(withObjectValues: matches.isEmpty ? all : matches)
+        (combo.cell as? NSComboBoxCell)?.perform(Selector(("popUp:")))
+    }
+}
+
 /// Enrolled profile names, for the assignment dialog's suggestions.
 func enrolledProfiles() -> [String] {
     let dir = "\(mkHome)/profiles"
@@ -551,10 +569,38 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         self.view = content
     }
 
+    private var keyMonitor: Any? = nil
+
     override func viewDidLoad() {
         super.viewDidLoad()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.refreshIfChanged()
+        }
+        // Transport keys while a recording with audio is on screen:
+        // space = play/pause, left/right arrow = -/+15 s. Never while the
+        // user is actually typing somewhere (field editors are editable
+        // NSTextViews; our transcript view is not).
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] ev in
+            guard let self,
+                  self.audioPath != nil,
+                  self.view.window != nil,
+                  self.view.window?.isKeyWindow == true,
+                  ev.window == self.view.window else { return ev }
+            if let editor = self.view.window?.firstResponder as? NSTextView,
+               editor.isEditable { return ev }
+            switch ev.keyCode {
+            case 49:   // space
+                self.togglePlay()
+                return nil
+            case 123:  // left arrow
+                self.seek(to: (self.player?.currentTime ?? 0) - 15, andPlay: false)
+                return nil
+            case 124:  // right arrow
+                self.seek(to: (self.player?.currentTime ?? 0) + 15, andPlay: false)
+                return nil
+            default:
+                return ev
+            }
         }
         refreshIfChanged(force: true)
     }
@@ -632,6 +678,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         combo.addItems(withObjectValues: enrolledProfiles())
         combo.placeholderString = "Name"
         combo.completes = true
+        combo.numberOfVisibleItems = 16
+        combo.delegate = ComboAutoOpen.shared
         alert.accessoryView = combo
         alert.window.initialFirstResponder = combo
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -860,7 +908,33 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func speakerRowClicked() {
         let row = speakersTable.clickedRow
         guard row >= 0, row < speakers.count else { return }
+        // With audio: clicking a name hops to their next segment after the
+        // playhead. Renaming is the pencil button. Without audio the click
+        // falls back to renaming (nothing to play).
+        if audioPath != nil {
+            playNextSegment(of: speakers[row].name)
+        } else {
+            promptForName(label: speakers[row].name)
+        }
+    }
+
+    @objc private func pencilClicked(_ sender: NSButton) {
+        let row = speakersTable.row(for: sender)
+        guard row >= 0, row < speakers.count else { return }
         promptForName(label: speakers[row].name)
+    }
+
+    /// Jump to this speaker's next segment after the current playhead
+    /// (wrapping to their first segment past the end).
+    private func playNextSegment(of speaker: String) {
+        guard player != nil, !lineOffsets.isEmpty else { return }
+        let t = player?.currentTime ?? 0
+        let idxs = snapshot.lines.indices.filter {
+            snapshot.lines[$0].speaker == speaker && $0 < lineOffsets.count
+        }
+        guard let first = idxs.first else { return }
+        let next = idxs.first { lineOffsets[$0] > t + 0.5 } ?? first
+        seek(to: lineOffsets[next], andPlay: true)
     }
 
     // Speakers panel table.
@@ -873,7 +947,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let nameField: NSTextField
         let pctField: NSTextField
         if let reused = tableView.makeView(withIdentifier: cellID, owner: self) as? NSTableCellView,
-           reused.subviews.count >= 2,
+           reused.subviews.count >= 3,
            let n = reused.subviews[0] as? NSTextField,
            let p = reused.subviews[1] as? NSTextField {
             cell = reused; nameField = n; pctField = p
@@ -889,22 +963,33 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             pctField.textColor = .secondaryLabelColor
             pctField.alignment = .right
             pctField.translatesAutoresizingMaskIntoConstraints = false
+            let pencil = NSButton(title: "", target: self, action: #selector(pencilClicked(_:)))
+            pencil.image = NSImage(systemSymbolName: "pencil",
+                                   accessibilityDescription: "Rename speaker")
+            pencil.isBordered = false
+            pencil.contentTintColor = .tertiaryLabelColor
+            pencil.toolTip = "Assign / reassign this speaker"
+            pencil.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(nameField)
             cell.addSubview(pctField)
+            cell.addSubview(pencil)
             NSLayoutConstraint.activate([
                 nameField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 12),
                 nameField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
                 pctField.leadingAnchor.constraint(greaterThanOrEqualTo: nameField.trailingAnchor, constant: 6),
-                pctField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -12),
                 pctField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                pctField.widthAnchor.constraint(equalToConstant: 38),
+                pctField.widthAnchor.constraint(equalToConstant: 34),
+                pencil.leadingAnchor.constraint(equalTo: pctField.trailingAnchor, constant: 2),
+                pencil.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
+                pencil.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                pencil.widthAnchor.constraint(equalToConstant: 18),
             ])
         }
         let sp = speakers[row]
         nameField.stringValue = sp.name
         nameField.textColor = color(for: sp.name)
-        nameField.toolTip = unknownSpeakerNumber(sp.name) != nil
-            ? "Click to name this speaker" : "Click to reassign this speaker"
+        nameField.toolTip = audioPath != nil
+            ? "Click to play their next segment" : "Click to name this speaker"
         pctField.stringValue = "\(Int((sp.fraction * 100).rounded()))%"
         return cell
     }
@@ -961,11 +1046,20 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 for (pi, part) in block.parts.enumerated() {
                     let runStart = out.length
                     let sep = pi == block.parts.count - 1 ? "\n" : " "
-                    out.append(NSAttributedString(
-                        string: part.text + sep,
-                        attributes: [.font: bodyFont,
-                                     .foregroundColor: NSColor.labelColor,
-                                     .paragraphStyle: bodyPara]))
+                    var bodyAttrs: [NSAttributedString.Key: Any] = [
+                        .font: bodyFont,
+                        .foregroundColor: NSColor.labelColor,
+                        .paragraphStyle: bodyPara,
+                    ]
+                    // Any word plays its segment. linkTextAttributes is
+                    // overridden to just the hand cursor, so body text
+                    // keeps its normal look.
+                    if audioPath != nil,
+                       let purl = URL(string: "meetink-play://\(part.line)") {
+                        bodyAttrs[.link] = purl
+                    }
+                    out.append(NSAttributedString(string: part.text + sep,
+                                                  attributes: bodyAttrs))
                     lineRanges[part.line] = NSRange(location: runStart,
                                                     length: (part.text as NSString).length)
                 }

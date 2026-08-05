@@ -141,6 +141,62 @@ refine_session() {
     fi
 }
 
+# --- Audio enhancement (echo cancellation + optional DeepFilterNet) ---
+# enhance.py cross-cancels each stream's echo of the other (numpy NLMS —
+# always available, the parakeet venv has numpy) and, when the enhance
+# venv is installed, runs DeepFilterNet3 denoise/de-reverb per stream.
+# Disable with enhance=off in config or MEETINK_ENHANCE=off.
+enhance_enabled() {
+    [[ "$MEETINK_ENHANCE" == "off" ]] && return 1
+    local v=$(grep '^enhance=' "$MK_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+    [[ "$v" != "off" && "$v" != "false" ]]
+}
+
+# Mix two raw spools into a listenable m4a: enhance (best-effort), then
+# cross-duck so whoever is speaking is heard from their clean stream.
+#   $1 = mic.raw  $2 = sys.raw  $3 = out.m4a
+_mix_enhanced_m4a() {
+    local mic="$1" sys="$2" out="$3"
+    local -a raw=(-f s16le -ar 16000 -ac 1)
+    local ed=""
+    if enhance_enabled && [[ -x "$MK_PARAKEET_VENV/bin/python" ]]; then
+        ed=$(mktemp -d -t meetink-enhance)
+        if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/enhance.py" \
+                --mic "$mic" --sys "$sys" \
+                --out-mic "$ed/mic.raw" --out-sys "$ed/sys.raw" \
+                2>>/tmp/meetink-refine.log; then
+            mic="$ed/mic.raw"
+            sys="$ed/sys.raw"
+        fi
+    fi
+    local rc=0
+    ffmpeg -v error -y "${raw[@]}" -i "$mic" "${raw[@]}" -i "$sys" \
+        -filter_complex "[0:a]asplit=2[m1][m2];[1:a]asplit=2[s1][s2];[s1][m1]sidechaincompress=threshold=0.02:ratio=8:attack=10:release=400[sd];[m2][s2]sidechaincompress=threshold=0.02:ratio=8:attack=10:release=400[md];[md][sd]amix=inputs=2:duration=longest:normalize=0" \
+        -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || rc=$?
+    [[ -n "$ed" ]] && rm -rf "$ed"
+    return $rc
+}
+
+# Install the DeepFilterNet venv (torch — a large download; opt-in).
+cmd_enhance_install() {
+    local venv="$MK_HOME/enhance-venv"
+    if [[ -x "$venv/bin/deepFilter" ]]; then
+        print -P "${C[green]}✓${C[reset]} DeepFilterNet already installed ${C[dim]}($venv)${C[reset]}"
+        return 0
+    fi
+    print -P "${C[bright_yellow]}▸${C[reset]} Installing DeepFilterNet ${C[dim]}(torch — several hundred MB)...${C[reset]}"
+    if command -v uv >/dev/null 2>&1; then
+        # Python 3.10 + torch 2.0: deepfilterlib has no wheels for newer
+        # pythons, and DFN 0.5.x imports the torchaudio.backend API that
+        # torchaudio >= 2.1 removed. Both skews field-debugged.
+        uv venv "$venv" --python 3.10 && \
+        uv pip install --python "$venv/bin/python" deepfilternet "torch==2.0.1" "torchaudio==2.0.2" || return 1
+    else
+        python3 -m venv "$venv" && "$venv/bin/pip" install deepfilternet "torch==2.0.1" "torchaudio==2.0.2" || return 1
+    fi
+    print -P "${C[green]}✓${C[reset]} DeepFilterNet installed — future recordings (and reprocess) use it automatically"
+}
+
 # Archive the just-stopped session's audio next to its transcript (i.e.
 # into the per-session folder). Two independent knobs from $MK_HOME/config:
 #   keep_audio  → <base>.m4a  — mic+sys mixed into one listenable file
@@ -171,15 +227,10 @@ audio_archive_session() {
     if (( keep_audio )); then
         local rc=0
         if [[ -s "$mic" && -s "$sys" ]]; then
-            # Cross-ducked mix, not a plain sum. A naive amix reproduces the
-            # echo the transcript pipeline suppresses: while the user talks,
-            # sys carries their delayed remote echo (audible slap-back); while
-            # others talk, headphone bleed into the mic comb-filters the sum
-            # (the "tin can" hollowness). Ducking each stream by the other
-            # keeps whoever is actually speaking clean.
-            ffmpeg -v error -y "${raw[@]}" -i "$mic" "${raw[@]}" -i "$sys" \
-                -filter_complex "[0:a]asplit=2[m1][m2];[1:a]asplit=2[s1][s2];[s1][m1]sidechaincompress=threshold=0.02:ratio=8:attack=10:release=400[sd];[m2][s2]sidechaincompress=threshold=0.02:ratio=8:attack=10:release=400[md];[md][sd]amix=inputs=2:duration=longest:normalize=0" \
-                -c:a aac -b:a 96k "${base}.m4a" 2>>/tmp/meetink-refine.log || rc=$?
+            # Enhanced mix: echo-cancel the streams against each other
+            # (plus DeepFilterNet when installed), then cross-duck. See
+            # _mix_enhanced_m4a / enhance.py.
+            _mix_enhanced_m4a "$mic" "$sys" "${base}.m4a" || rc=$?
         else
             local only="$mic"
             [[ -s "$sys" ]] && only="$sys"
@@ -256,6 +307,12 @@ cmd_reprocess() {
         [[ -f "$tmpdir/out.txt.timing.json" ]] && mv "$tmpdir/out.txt.timing.json" "${base}.timing.json"
         local n=$(grep -cE '^\[[0-9:]{8}\]' "$actual")
         print -P "${C[green]}✓${C[reset]} Reprocessed: ${n} lines ${C[dim]}(previous kept: ${base:t}.pre-reprocess.txt)${C[reset]}"
+        # Rebuild the listenable m4a too — reprocess exists to pick up
+        # pipeline improvements, and the audio pipeline is part of that.
+        if [[ -s "$tmpdir/mic.raw" && -s "$tmpdir/sys.raw" ]]; then
+            _mix_enhanced_m4a "$tmpdir/mic.raw" "$tmpdir/sys.raw" "${base}.m4a" && \
+                print -P "${C[green]}✓${C[reset]} Audio rebuilt: ${C[dim]}${base:t}.m4a (enhanced)${C[reset]}"
+        fi
     else
         print -P "${C[red]}error:${C[reset]} reprocess failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
     fi
