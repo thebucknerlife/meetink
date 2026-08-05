@@ -181,10 +181,17 @@ func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> N
 /// siblings), and retarget live.txt if it pointed at the old path. Returns
 /// the transcript's new path, or nil when nothing moved.
 func renameMeeting(txtPath: String, displayName: String) -> String? {
-    var slug = displayName.trimmingCharacters(in: .whitespaces)
-        .replacingOccurrences(of: "/", with: "-")
-        .replacingOccurrences(of: " ", with: "-")
-    guard !slug.isEmpty else { return nil }
+    let title = displayName.trimmingCharacters(in: .whitespaces)
+    guard !title.isEmpty else { return nil }
+    // The exact title (dashes, punctuation, anything) goes to metadata
+    // FIRST — it travels with the same-basename rename below. The slug is
+    // just the folder's readable spelling.
+    setMeetingMeta(txtPath, "title", title)
+    var slug = String(title.map { c in
+        c.isLetter || c.isNumber ? c : "-"
+    }).replacingOccurrences(of: "--+", with: "-", options: .regularExpression)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    if slug.isEmpty { slug = "meeting" }
     let fm = FileManager.default
     let base = ((txtPath as NSString).lastPathComponent as NSString).deletingPathExtension
     var prefix = ""
@@ -224,6 +231,31 @@ func renameMeeting(txtPath: String, displayName: String) -> String? {
         try? fm.createSymbolicLink(atPath: live, withDestinationPath: newTxt)
     }
     return fm.fileExists(atPath: newTxt) ? newTxt : nil
+}
+
+/// Per-meeting metadata (<base>.meta.json, moved by the same-basename
+/// rename rule like every other sidecar). The filename stays a readable
+/// slug; anything a slug can't hold — exact titles with dashes and
+/// punctuation first — lives here. One small JSON per meeting instead of
+/// using the filesystem as the database.
+func meetingMetaPath(_ txtPath: String) -> String {
+    (txtPath as NSString).deletingPathExtension + ".meta.json"
+}
+
+func meetingMeta(_ txtPath: String) -> [String: Any] {
+    guard let data = FileManager.default.contents(atPath: meetingMetaPath(txtPath)),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return [:] }
+    return obj
+}
+
+func setMeetingMeta(_ txtPath: String, _ key: String, _ value: Any) {
+    var meta = meetingMeta(txtPath)
+    meta[key] = value
+    if let data = try? JSONSerialization.data(withJSONObject: meta,
+                                              options: [.sortedKeys]) {
+        try? data.write(to: URL(fileURLWithPath: meetingMetaPath(txtPath)))
+    }
 }
 
 /// A meeting's RECORDING date, from the filename's timestamp — the one
@@ -298,6 +330,12 @@ func formatDuration(_ t: TimeInterval) -> String {
 /// Display name for a transcript path: timestamp prefix stripped, slug
 /// prettified — same rule everywhere a meeting is shown.
 func meetingDisplayName(_ txtPath: String) -> String {
+    // Exact title from metadata wins; the filename slug is the fallback
+    // (it can't hold dashes or punctuation — they round-trip to spaces).
+    if let t = meetingMeta(txtPath)["title"] as? String,
+       !t.trimmingCharacters(in: .whitespaces).isEmpty {
+        return t
+    }
     var name = ((txtPath as NSString).lastPathComponent as NSString).deletingPathExtension
     if let r = name.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
                           options: .regularExpression) {
@@ -1612,17 +1650,8 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
             // Recording date (filename stamp), never mtime — reprocess and
             // label edits touch the file constantly.
             let date = meetingRecordingDate(path)
-            // Display name: strip the timestamp prefix, prettify the slug.
-            var name = base
-            if let r = name.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
-                                  options: .regularExpression) {
-                name.removeSubrange(r)
-            }
-            name = name.replacingOccurrences(of: "-", with: " ")
-                .replacingOccurrences(of: "_", with: " ")
-                .trimmingCharacters(in: .whitespaces)
-            if name.isEmpty { name = "(untitled)" }
-            out.append((path, name, date))
+            _ = base
+            out.append((path, meetingDisplayName(path), date))
         }
         out.sort { $0.2 > $1.2 }
         // Per-row status: red live, orange while its post-process runs.
