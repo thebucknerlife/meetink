@@ -2538,7 +2538,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for other in NSRunningApplication.runningApplications(
             withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.meetink.app")
         where other.processIdentifier != me.processIdentifier {
+            // Polite quit first — but OUR OWN applicationShouldTerminate
+            // intercepts it (Quit-to-menu-bar), so a stale instance
+            // politely REFUSES the takeover and lives on, re-saving its
+            // broken state (field case: pre-fix build kept resurrecting a
+            // squeezed window frame for days). Escalate to force after a
+            // grace second; the old instance's child daemons exit on their
+            // own via owner-pid watchdogs.
             other.terminate()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                if !other.isTerminated { other.forceTerminate() }
+            }
         }
 
         buildMainMenu()
