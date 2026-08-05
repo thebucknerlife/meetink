@@ -46,6 +46,19 @@ def log(msg: str) -> None:
     print(f"enhance: {msg}", file=sys.stderr, flush=True)
 
 
+PROGRESS_FILE: str | None = None
+
+
+def progress(msg: str) -> None:
+    """Narrate into the app's post-processing state file — the enhance
+    stage runs minutes on long meetings and looked hung without it."""
+    if PROGRESS_FILE:
+        try:
+            Path(PROGRESS_FILE).write_text(f"enhancing audio — {msg} (step 3/3)\n")
+        except OSError:
+            pass
+
+
 def load_raw(path: str) -> np.ndarray:
     data = np.fromfile(path, dtype=np.int16)
     return data.astype(np.float32) / 32768.0
@@ -85,7 +98,8 @@ def gcc_phat_delay(ref: np.ndarray, sig: np.ndarray, max_delay_s: float = 1.5) -
 
 
 def fdaf_cancel(ref: np.ndarray, sig: np.ndarray, delay: int,
-                taps: int = 4096, mu: float = 0.5) -> np.ndarray:
+                taps: int = 4096, mu: float = 0.5,
+                progress_label: str = "echo cancel") -> np.ndarray:
     """Subtract ref's echo from sig: partitioned block-frequency NLMS.
 
     Overlap-save with block size B; `taps` total filter length split into
@@ -106,7 +120,10 @@ def fdaf_cancel(ref: np.ndarray, sig: np.ndarray, delay: int,
     eps = 1e-6
 
     blocks = (n - F) // B
+    step = max(1, blocks // 10)
     for k in range(max(0, blocks)):
+        if k % step == 0:
+            progress(f"{progress_label} {int(100 * k / max(1, blocks))}%")
         i = k * B
         xb = ref[i:i + F]
         X = np.roll(X, 1, axis=0)
@@ -138,7 +155,7 @@ def cancel_direction(ref: np.ndarray, sig: np.ndarray,
         log(f"{name}: no echo path detected — left untouched")
         return sig, -1
     before = float(np.sqrt((sig ** 2).mean()))
-    cleaned = fdaf_cancel(ref, sig, delay)
+    cleaned = fdaf_cancel(ref, sig, delay, progress_label=f"{name} echo cancel")
     after = float(np.sqrt((cleaned ** 2).mean()))
     # An echo canceller can only remove energy; growth means the "echo
     # path" was a spurious correlation. Keep the original.
@@ -232,6 +249,7 @@ def deepfilter(x: np.ndarray, name: str) -> np.ndarray:
     """Run one stream through DeepFilterNet3 via its CLI (own venv)."""
     import wave
 
+    progress(f"DeepFilterNet {name} — takes a while on long meetings")
     with tempfile.TemporaryDirectory(prefix="meetink-dfn") as td:
         src = os.path.join(td, "in.wav")
         with wave.open(src, "wb") as w:
@@ -264,7 +282,11 @@ def main() -> int:
     ap.add_argument("--out-mic", required=True)
     ap.add_argument("--out-sys", required=True)
     ap.add_argument("--no-deepfilter", action="store_true")
+    ap.add_argument("--progress-state",
+                    help="file to narrate progress into (app status bar)")
     args = ap.parse_args()
+    global PROGRESS_FILE
+    PROGRESS_FILE = args.progress_state
 
     mic = load_raw(args.mic)
     sys_ = load_raw(args.sys_)

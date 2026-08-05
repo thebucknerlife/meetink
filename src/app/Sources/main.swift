@@ -226,6 +226,30 @@ func renameMeeting(txtPath: String, displayName: String) -> String? {
     return fm.fileExists(atPath: newTxt) ? newTxt : nil
 }
 
+/// A meeting's RECORDING date, from the filename's timestamp — the one
+/// thing post-processing can't touch (mtime moves on every reprocess).
+/// Falls back to filesystem creation date, then mtime.
+func meetingRecordingDate(_ txtPath: String) -> Date {
+    let base = ((txtPath as NSString).lastPathComponent as NSString).deletingPathExtension
+    let df = DateFormatter()
+    for fmt in ["yyyy-MM-dd_HH-mm-ss", "yyyy-MM-dd_HH-mm"] {
+        df.dateFormat = fmt
+        if let d = df.date(from: String(base.prefix(fmt.count))) { return d }
+    }
+    let attrs = (try? FileManager.default.attributesOfItem(atPath: txtPath)) ?? [:]
+    return (attrs[.creationDate] as? Date)
+        ?? (attrs[.modificationDate] as? Date) ?? .distantPast
+}
+
+/// "Aug 8 at 3:04 PM" this year; the year appears only for older meetings.
+func formatMeetingDate(_ date: Date) -> String {
+    let df = DateFormatter()
+    let cal = Calendar.current
+    df.dateFormat = cal.component(.year, from: date) == cal.component(.year, from: Date())
+        ? "MMM d 'at' h:mm a" : "MMM d, yyyy 'at' h:mm a"
+    return df.string(from: date)
+}
+
 /// Display name for a transcript path: timestamp prefix stripped, slug
 /// prettified — same rule everywhere a meeting is shown.
 func meetingDisplayName(_ txtPath: String) -> String {
@@ -808,9 +832,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 self?.reprocessButton.isEnabled = true
                 self?.reprocessButton.title = "Reprocess"
                 self?.refreshIfChanged(force: true)
-                if proc.terminationStatus != 0 || out.lowercased().contains("error") {
+                // Exit code only — substring-matching 'error' false-positived
+                // on successful runs.
+                if proc.terminationStatus != 0 {
                     let alert = NSAlert()
-                    alert.messageText = "Reprocess failed"
+                    alert.messageText = "Reprocess failed (exit \(proc.terminationStatus))"
                     alert.informativeText = out.replacingOccurrences(
                         of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
                         .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1160,6 +1186,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// (set by the Profiles page's listen-through before audio loads).
     private var pendingSampleSpeaker: String? = nil
 
+    /// The transcript whose audio is audibly playing right now — the
+    /// meetings page marks its row green so leaving the page doesn't lose
+    /// track of what's making sound.
+    var playingTranscriptPath: String? {
+        guard player?.isPlaying == true, let audioPath else { return nil }
+        return (audioPath as NSString).deletingPathExtension + ".txt"
+    }
+
     func playSpeakerSample(_ speaker: String) {
         pendingSampleSpeaker = speaker
         if audioPath != nil {
@@ -1349,6 +1383,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         statusDot.textColor = recording ? .systemRed : .tertiaryLabelColor
 
         var parts: [String] = []
+        if !lastResolvedPath.isEmpty {
+            parts.append(formatMeetingDate(
+                snapshot.startedAt ?? meetingRecordingDate(lastResolvedPath)))
+        }
         if let started = snapshot.startedAt {
             let end: Date? = snapshot.endedAt ?? (recording ? Date() : nil)
             if let end {
@@ -1386,7 +1424,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
 final class MeetingsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     private let table = NSTableView()
-    private enum MeetingStatus { case live, processing, ended }
+    private enum MeetingStatus { case live, processing, playing, ended }
+    /// Wired by MainWindowController to the reader: the txt path whose
+    /// audio is currently playing (nil when paused/stopped).
+    var playingProvider: (() -> String?)? = nil
     private var files: [(path: String, name: String, date: Date, status: MeetingStatus)] = []
     private var refreshTimer: Timer?
     var onOpen: ((String) -> Void)?
@@ -1509,8 +1550,9 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
                       !item.hasSuffix(".live-raw.txt") else { continue }
                 base = String(item.dropLast(4))
             }
-            let attrs = (try? fm.attributesOfItem(atPath: path)) ?? [:]
-            let date = (attrs[.modificationDate] as? Date) ?? .distantPast
+            // Recording date (filename stamp), never mtime — reprocess and
+            // label edits touch the file constantly.
+            let date = meetingRecordingDate(path)
             // Display name: strip the timestamp prefix, prettify the slug.
             var name = base
             if let r = name.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
@@ -1528,9 +1570,11 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         let liveTarget = (try? fm.destinationOfSymbolicLink(atPath: liveSymlinkPath()))
         let recording = recordingPID() != nil
         let processing = postprocPath()
+        let playing = playingProvider?()
         let stamped: [(String, String, Date, MeetingStatus)] = out.map {
             let st: MeetingStatus = (recording && $0.0 == liveTarget) ? .live
-                : ($0.0 == processing ? .processing : .ended)
+                : ($0.0 == processing ? .processing
+                   : ($0.0 == playing ? .playing : .ended))
             return ($0.0, $0.1, $0.2, st)
         }
         let changed = stamped.map(\.0) != files.map(\.path)
@@ -1553,18 +1597,12 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         let cellID = NSUserInterfaceItemIdentifier("cell-\(id)")
         let text: String
         if id == "date" {
-            // "Aug 8 at 3:04 PM" for this year; the year appears only for
-            // older meetings.
-            let df = DateFormatter()
-            let cal = Calendar.current
-            df.dateFormat = cal.component(.year, from: files[row].date)
-                == cal.component(.year, from: Date())
-                ? "MMM d 'at' h:mm a" : "MMM d, yyyy 'at' h:mm a"
-            text = df.string(from: files[row].date)
+            text = formatMeetingDate(files[row].date)
         } else if id == "status" {
             switch files[row].status {
             case .live:       text = "● live"
             case .processing: text = "● processing"
+            case .playing:    text = "● playing"
             case .ended:      text = "● ended"
             }
         } else {
@@ -1597,6 +1635,7 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
             switch files[row].status {
             case .live:       dotColor = .systemRed
             case .processing: dotColor = .systemOrange
+            case .playing:    dotColor = .systemGreen
             case .ended:      dotColor = .tertiaryLabelColor
             }
             let attr = NSMutableAttributedString(string: text)
@@ -2453,6 +2492,9 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
         uploadVC.onOpenTranscript = { [weak self] path in
             self?.openTranscript(path)
+        }
+        meetingsVC.playingProvider = { [weak self] in
+            self?.readerVC.playingTranscriptPath
         }
         profilesVC.onListen = { [weak self] path, speaker in
             self?.openTranscript(path)

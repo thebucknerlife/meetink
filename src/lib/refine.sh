@@ -165,6 +165,7 @@ _mix_enhanced_m4a() {
         if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/enhance.py" \
                 --mic "$mic" --sys "$sys" \
                 --out-mic "$ed/mic.raw" --out-sys "$ed/sys.raw" \
+                --progress-state /tmp/meetink-postproc.state \
                 2>>/tmp/meetink-refine.log; then
             mic="$ed/mic.raw"
             sys="$ed/sys.raw"
