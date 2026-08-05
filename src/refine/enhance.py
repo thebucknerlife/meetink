@@ -152,7 +152,7 @@ def cancel_direction(ref: np.ndarray, sig: np.ndarray,
 
 
 def residual_echo_gate(mic: np.ndarray, sys_: np.ndarray, delay: int,
-                       floor: float = 0.12) -> np.ndarray:
+                       floor: float = 0.03) -> np.ndarray:
     """Post-AEC safety net for the user's remote echo.
 
     The linear filter assumes a fixed echo path, but conferencing echo
@@ -166,19 +166,45 @@ def residual_echo_gate(mic: np.ndarray, sys_: np.ndarray, delay: int,
     the shifted mic is silent) and passes through untouched."""
     B = RATE // 20   # 50 ms blocks
     n = len(sys_)
-    if delay > 0:
-        micd = np.concatenate([np.zeros(delay, dtype=np.float32), mic])
-    else:
-        micd = mic
-    micd = micd[:n]
-    if len(micd) < n:
-        micd = np.pad(micd, (0, n - len(micd)))
     nb = n // B
     if nb < 4:
         return sys_
-    me = np.sqrt((micd[: nb * B].reshape(nb, B) ** 2).mean(axis=1))
+    mic = mic[:n]
+    if len(mic) < n:
+        mic = np.pad(mic, (0, n - len(mic)))
+
+    # Conferencing delay DRIFTS (jitter buffers re-time the echo), so one
+    # start-of-call measurement misses later echo. Re-measure per minute,
+    # falling back to the previous chunk's delay when a chunk has no
+    # usable correlation (silence, remote-only speech).
+    CHUNK = 60 * RATE
+    delays = []
+    d_prev = delay
+    for c0 in range(0, n, CHUNK):
+        c1 = min(n, c0 + CHUNK)
+        d = gcc_phat_delay(mic[c0:c1], sys_[c0:c1]) if c1 - c0 > 5 * RATE else -1
+        if d < 0:
+            d = d_prev
+        delays.append(d)
+        d_prev = d
+
+    me_raw = np.sqrt((mic[: nb * B].reshape(nb, B) ** 2).mean(axis=1))
     se = np.sqrt((sys_[: nb * B].reshape(nb, B) ** 2).mean(axis=1))
-    echoish = (me > 0.008) & (se < 1.2 * me)
+
+    # Per block: the STRONGEST mic activity across a tolerance window
+    # around that minute's delay (-150 ms .. +350 ms) — a point test on a
+    # drifted delay is exactly how residue slipped through before.
+    me = np.zeros(nb, dtype=np.float32)
+    lo_off, hi_off = int(-0.15 * RATE / B), int(0.35 * RATE / B)
+    for k in range(nb):
+        d = delays[min(k * B // CHUNK, len(delays) - 1)]
+        center = k - d // B
+        a = max(0, center - hi_off)
+        b_ = min(nb, center - lo_off + 1)
+        if a < b_:
+            me[k] = me_raw[a:b_].max()
+
+    echoish = (me > 0.006) & (se < 1.5 * me)
     # Dilate one block each side: echo tails smear past the envelope.
     d = echoish.copy()
     d[1:] |= echoish[:-1]
