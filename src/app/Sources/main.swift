@@ -768,6 +768,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             player = try? AVAudioPlayer(contentsOf: URL(fileURLWithPath: candidate))
             player?.prepareToPlay()
             buildLineOffsets(base: base)
+            if let pending = pendingSampleSpeaker {
+                pendingSampleSpeaker = nil
+                DispatchQueue.main.async { [weak self] in self?.playNextSegment(of: pending) }
+            }
             refreshIfChanged(force: true)   // re-render so links become play-links
         } else if !available && audioPath != nil {
             audioPath = nil
@@ -922,6 +926,18 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let row = speakersTable.row(for: sender)
         guard row >= 0, row < speakers.count else { return }
         promptForName(label: speakers[row].name)
+    }
+
+    /// Speaker whose sample should start playing once the player is ready
+    /// (set by the Profiles page's listen-through before audio loads).
+    private var pendingSampleSpeaker: String? = nil
+
+    func playSpeakerSample(_ speaker: String) {
+        pendingSampleSpeaker = speaker
+        if audioPath != nil {
+            playNextSegment(of: speaker)
+            pendingSampleSpeaker = nil
+        }
     }
 
     /// Jump to this speaker's next segment after the current playhead
@@ -1700,8 +1716,15 @@ final class UploadViewController: NSViewController, NSTableViewDataSource, NSTab
 /// Voice profiles: rename, delete, and see which meetings a person was in.
 final class ProfilesViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     private let table = NSTableView()
+    private let meetingsTable = NSTableView()
     private let detail = NSTextField(wrappingLabelWithString: "")
     private var profiles: [(name: String, samples: Int)] = []
+    private var meetings: [(name: String, path: String)] = []   // for the selected profile
+    /// Wired by MainWindowController: open this transcript and play the
+    /// given speaker's first segment — "listen to a sample" to confirm a
+    /// profile is who you think it is.
+    var onListen: ((String, String) -> Void)?
+    private var selectedProfile: String? = nil
 
     override func loadView() {
         let root = NSView()
@@ -1719,19 +1742,40 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         for i in menu.items { i.target = self }
         table.menu = menu
         scroll.documentView = table
+
+        // Meetings this voice was heard in; double-click one to open it
+        // and hear the person speak (confirms the profile is who you
+        // think it is — we store embeddings, not audio, so the meetings
+        // themselves are the samples).
+        let meetScroll = NSScrollView()
+        meetScroll.hasVerticalScroller = true
+        meetScroll.translatesAutoresizingMaskIntoConstraints = false
+        let meetCol = NSTableColumn(identifier: .init("meeting"))
+        meetCol.title = "Heard in (double-click to listen)"
+        meetCol.width = 420
+        meetingsTable.addTableColumn(meetCol)
+        meetingsTable.dataSource = self
+        meetingsTable.delegate = self
+        meetingsTable.target = self
+        meetingsTable.doubleAction = #selector(listenToMeeting)
+        meetScroll.documentView = meetingsTable
         detail.font = NSFont.systemFont(ofSize: 11)
         detail.textColor = .secondaryLabelColor
         detail.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(scroll); root.addSubview(detail)
+        root.addSubview(scroll); root.addSubview(meetScroll); root.addSubview(detail)
         NSLayoutConstraint.activate([
             scroll.topAnchor.constraint(equalTo: root.topAnchor),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: detail.topAnchor, constant: -8),
+            scroll.heightAnchor.constraint(equalTo: root.heightAnchor, multiplier: 0.55),
+            meetScroll.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
+            meetScroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            meetScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            meetScroll.bottomAnchor.constraint(equalTo: detail.topAnchor, constant: -8),
             detail.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
             detail.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
             detail.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
-            detail.heightAnchor.constraint(greaterThanOrEqualToConstant: 40),
+            detail.heightAnchor.constraint(greaterThanOrEqualToConstant: 24),
         ])
         self.view = root
     }
@@ -1759,8 +1803,20 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         }.resume()
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { profiles.count }
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        tableView == meetingsTable ? meetings.count : profiles.count
+    }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableView == meetingsTable {
+            let cell = NSTableCellView()
+            let f = NSTextField(labelWithString: meetings[row].name)
+            f.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(f); cell.textField = f
+            NSLayoutConstraint.activate([
+                f.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+                f.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
+            return cell
+        }
         let id = tableColumn?.identifier.rawValue ?? "name"
         let cell = NSTableCellView()
         let f = NSTextField(labelWithString: id == "name" ? profiles[row].name : "\(profiles[row].samples)")
@@ -1773,28 +1829,39 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        guard (notification.object as? NSTableView) != meetingsTable else { return }
         let row = table.selectedRow
         guard row >= 0, row < profiles.count else { return }
         let name = profiles[row].name.uppercased()
+        selectedProfile = name
         DispatchQueue.global().async { [weak self] in
             // Which recent meetings does this voice appear in?
             let dir = transcriptsDir()
             let fm = FileManager.default
-            var hits: [String] = []
+            var hits: [(String, String)] = []
             let folders = ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).sorted(by: >)
-            for item in folders.prefix(40) {
+            for item in folders.prefix(60) {
                 let tx = dir + "/" + item + "/" + item + ".txt"
                 guard fm.fileExists(atPath: tx),
                       let txt = try? String(contentsOfFile: tx, encoding: .utf8) else { continue }
-                if txt.contains("] \(name):") { hits.append(item) }
-                if hits.count >= 8 { break }
+                if txt.contains("] \(name):") { hits.append((item, tx)) }
+                if hits.count >= 15 { break }
             }
             DispatchQueue.main.async {
-                self?.detail.stringValue = hits.isEmpty
-                    ? "\(name): not seen in recent meetings."
-                    : "\(name) heard in: " + hits.joined(separator: ", ")
+                guard let self, self.selectedProfile == name else { return }
+                self.meetings = hits.map { (name: $0.0, path: $0.1) }
+                self.meetingsTable.reloadData()
+                self.detail.stringValue = hits.isEmpty
+                    ? "\(name): not heard in recent meetings."
+                    : "Double-click a meeting to open it and play \(name)'s first segment."
             }
         }
+    }
+
+    @objc private func listenToMeeting() {
+        let row = meetingsTable.clickedRow >= 0 ? meetingsTable.clickedRow : meetingsTable.selectedRow
+        guard row >= 0, row < meetings.count, let speaker = selectedProfile else { return }
+        onListen?(meetings[row].path, speaker)
     }
 
     private func clickedName() -> String? {
@@ -2078,6 +2145,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
         uploadVC.onOpenTranscript = { [weak self] path in
             self?.openTranscript(path)
+        }
+        profilesVC.onListen = { [weak self] path, speaker in
+            self?.openTranscript(path)
+            self?.readerVC.playSpeakerSample(speaker)
         }
 
         sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
