@@ -171,8 +171,14 @@ audio_archive_session() {
     if (( keep_audio )); then
         local rc=0
         if [[ -s "$mic" && -s "$sys" ]]; then
+            # Cross-ducked mix, not a plain sum. A naive amix reproduces the
+            # echo the transcript pipeline suppresses: while the user talks,
+            # sys carries their delayed remote echo (audible slap-back); while
+            # others talk, headphone bleed into the mic comb-filters the sum
+            # (the "tin can" hollowness). Ducking each stream by the other
+            # keeps whoever is actually speaking clean.
             ffmpeg -v error -y "${raw[@]}" -i "$mic" "${raw[@]}" -i "$sys" \
-                -filter_complex "amix=inputs=2:duration=longest:normalize=0" \
+                -filter_complex "[0:a]asplit=2[m1][m2];[1:a]asplit=2[s1][s2];[s1][m1]sidechaincompress=threshold=0.02:ratio=8:attack=10:release=400[sd];[m2][s2]sidechaincompress=threshold=0.02:ratio=8:attack=10:release=400[md];[md][sd]amix=inputs=2:duration=longest:normalize=0" \
                 -c:a aac -b:a 96k "${base}.m4a" 2>>/tmp/meetink-refine.log || rc=$?
         else
             local only="$mic"
