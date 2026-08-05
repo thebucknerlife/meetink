@@ -571,7 +571,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     }
 
     private func updateJumpButton() {
-        jumpButton.isHidden = pinnedToBottom
+        // Only meaningful while text is streaming in — an archived
+        // recording has no "live" to jump to.
+        let live = fixedPath == nil && recordingPID() != nil
+        jumpButton.isHidden = pinnedToBottom || !live
     }
 
     @objc private func jumpToEnd() {
