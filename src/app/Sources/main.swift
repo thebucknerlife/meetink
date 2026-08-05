@@ -535,7 +535,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             playerBar.trailingAnchor.constraint(equalTo: panelDivider.leadingAnchor),
             playerBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             jumpButton.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
-            jumpButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            // Anchor to the transcript scroll, not the window bottom — the
+            // player bar lives below the scroll now and the button was
+            // floating on top of it.
+            jumpButton.bottomAnchor.constraint(equalTo: scroll.bottomAnchor, constant: -16),
         ])
 
         scroll.contentView.postsBoundsChangedNotifications = true
