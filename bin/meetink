@@ -158,6 +158,14 @@ build_capture() {
         }
     mkdir -p "$MK_HOME/bin"
     cp meetink-capture "$MK_HOME/bin/meetink-capture"
+    # Stable signature, same as the app and agent: TCC keys the Screen &
+    # System Audio grant to the signature, and the ad-hoc default is a
+    # content hash — every rebuild minted a new identity and the
+    # permission prompt came back (build_app got this fix; this builder
+    # was missed).
+    if command -v codesign >/dev/null 2>&1; then
+        codesign --force --sign "$(mk_codesign_identity)" "$MK_HOME/bin/meetink-capture" 2>/dev/null || true
+    fi
     print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$MK_HOME/bin/meetink-capture${C[reset]}"
     cd - > /dev/null
 }
