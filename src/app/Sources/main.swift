@@ -925,8 +925,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         DispatchQueue.global().async { [weak self] in
             defer { DispatchQueue.main.async { self?.eventButton.isEnabled = true } }
             do { try proc.run() } catch { return }
-            proc.waitUntilExit()
+            // Read to EOF BEFORE waitUntilExit — a day's events with
+            // attendees overflows the 64 KB pipe buffer, the agent blocks
+            // mid-write, and waiting first deadlocks both processes (field
+            // case: button stuck disabled forever after the permission
+            // prompt resolved).
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
             let events = (try? JSONSerialization.jsonObject(with: data)
                           as? [[String: Any]]) ?? []
             DispatchQueue.main.async { self?.showEventMenu(events, near: start) }
