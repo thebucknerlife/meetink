@@ -494,7 +494,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         playerBar.addArrangedSubview(scrubber)
         playerBar.addArrangedSubview(timeLabel)
         playerBar.isHidden = true
+        playerBar.edgeInsets = NSEdgeInsets()
         playerBarHeight = playerBar.heightAnchor.constraint(equalToConstant: 0)
+        // 999, not required: a collapsed bar whose insets/content want more
+        // than 0pt must lose gracefully — a REQUIRED conflict makes AppKit
+        // break arbitrary constraints every layout pass (field symptom: the
+        // window resists resizing edge by edge, and the transcript column
+        // can collapse to zero width so a live meeting renders nothing).
+        playerBarHeight?.priority = NSLayoutConstraint.Priority(999)
         playerBarHeight?.isActive = true
 
         content.addSubview(header)
@@ -717,6 +724,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let archived = !liveRecording && !lastResolvedPath.isEmpty && !snapshot.lines.isEmpty
         playerBar.isHidden = !archived
         playerBarHeight?.constant = archived ? 34 : 0
+        playerBar.edgeInsets = archived
+            ? NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12) : NSEdgeInsets()
         for v in playerBar.arrangedSubviews { v.isHidden = (audioPath == nil) }
         noAudioLabel.isHidden = !(archived && audioPath == nil)
         updatePlayerUI()
