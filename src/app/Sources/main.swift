@@ -1285,6 +1285,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         // Populate here, not only on render: the page polls while detached
         // from the window, and an already-rendered transcript never
         // re-renders on attach — the title stayed "(untitled)" (field bug).
+        // No renaming while a post-process/reprocess is running — the
+        // pipeline holds paths open and a mid-run rename races it (it
+        // recovers by inode now, but there's no reason to invite it).
+        titleField.isEnabled = postprocState() == nil
         if !titleField.isHidden, titleField.currentEditor() == nil,
            !lastResolvedPath.isEmpty {
             let name = meetingDisplayName(lastResolvedPath)

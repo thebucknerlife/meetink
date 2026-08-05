@@ -277,6 +277,7 @@ cmd_reprocess() {
         return 1
     fi
     local base="${actual%.txt}"
+    local ino=$(stat -f %i "$actual" 2>/dev/null)
     local started=$(grep '^Started:' "$actual" 2>/dev/null | head -1 | sed 's/^Started: //')
     local me=$(me_name_get 2>/dev/null)
     local tmpdir=$(mktemp -d -t meetink-reproc)
@@ -318,8 +319,19 @@ cmd_reprocess() {
         done
     rc=${pipestatus[1]}
     _refine_unlock
-    if (( rc == 0 )) && grep -qE '^\[' "$tmpdir/out.txt"; then
-        cp "$actual" "${base}.pre-reprocess.txt" 2>/dev/null
+    # Re-resolve by inode: a rename during the run moved the folder and
+    # every file in it — mv preserves inodes, so find our transcript
+    # wherever it lives now (same trick cmd_refine uses for titling).
+    if [[ -n "$ino" && ! -f "$actual" ]]; then
+        local by_ino=$(find "$MK_TRANSCRIPTS_DIR" -maxdepth 2 -name '*.txt' -inum "$ino" 2>/dev/null | head -1)
+        if [[ -n "$by_ino" && -f "$by_ino" ]]; then
+            print -P "  ${C[dim]}(meeting was renamed mid-run — following it to ${by_ino:t})${C[reset]}"
+            actual="$by_ino"
+            base="${actual%.txt}"
+        fi
+    fi
+    if (( rc == 0 )) && [[ -f "$actual" ]] && grep -qE '^\[' "$tmpdir/out.txt"; then
+        cp "$actual" "${base}.pre-reprocess.txt" 2>/dev/null || true
         cat "$tmpdir/out.txt" > "$actual"
         [[ -f "$tmpdir/out.txt.timing.json" ]] && mv "$tmpdir/out.txt.timing.json" "${base}.timing.json"
         local n=$(grep -cE '^\[[0-9:]{8}\]' "$actual")
@@ -332,7 +344,10 @@ cmd_reprocess() {
                 print -P "${C[green]}✓${C[reset]} Audio rebuilt: ${C[dim]}${base:t}.m4a (enhanced)${C[reset]}"
         fi
     else
+        rm -rf "$tmpdir"
+        rm -f /tmp/meetink-postproc.state
         print -P "${C[red]}error:${C[reset]} reprocess failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
+        return 1
     fi
     rm -rf "$tmpdir"
     rm -f /tmp/meetink-postproc.state
