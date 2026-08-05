@@ -229,9 +229,12 @@ build_agent() {
         # signature — a new cdhash identity every build, endless
         # permission re-prompts. Failures print now instead of hiding.
         xattr -cr "$app" 2>/dev/null || true
-        codesign --force --sign "$(mk_codesign_identity)" \
-            --entitlements "$MK_ROOT/src/agent/Resources/entitlements.plist" \
-            "$app" || \
+        # NO entitlements here: time-sensitive notifications need an
+        # Apple-issued provisioning profile — a self-signed cert carrying
+        # the restricted entitlement gets the binary SIGKILLed by AMFI at
+        # launch (field case: `zsh: killed` on every agent invocation).
+        # The interruptionLevel hint in the code is harmless without it.
+        codesign --force --sign "$(mk_codesign_identity)" "$app" || \
             print -P "${C[yellow]}⚠${C[reset]} agent codesign failed — notifications/calendar will re-prompt"
     fi
 
