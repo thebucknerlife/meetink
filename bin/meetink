@@ -1003,7 +1003,7 @@ cmd_stop() {
         [[ -n "$actual" && -f "$actual" ]] && title_session_file "$actual"
     fi
 
-    rm -f /tmp/meetink-postproc.state
+    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
 
     if [[ -f "$MK_TRANSCRIPT" ]]; then
         local lines=$(wc -l < "$MK_TRANSCRIPT" | tr -d ' ')

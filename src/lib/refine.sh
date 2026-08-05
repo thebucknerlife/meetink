@@ -95,6 +95,7 @@ refine_session() {
     [[ -s "$sys" ]] && args+=(--sys "$sys")
 
     _refine_lock
+    print -- "$actual" > /tmp/meetink-postproc.path
     # Stream progress into the postproc state file so the app's status bar
     # can narrate ("post-processing… identifying speakers 43% (step 2/3)").
     # rc comes from pipestatus[1] — the pipeline's last command is the
@@ -306,6 +307,7 @@ cmd_reprocess() {
     # bar shows "post-processing… <phase> (step N/3)" while this runs.
     local state=/tmp/meetink-postproc.state
     print -- "starting (step 1/3)" > "$state"
+    print -- "$actual" > /tmp/meetink-postproc.path
     local rc=0
     "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log | \
         while IFS= read -r line; do
@@ -348,12 +350,12 @@ cmd_reprocess() {
         fi
     else
         rm -rf "$tmpdir"
-        rm -f /tmp/meetink-postproc.state
+        rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
         print -P "${C[red]}error:${C[reset]} reprocess failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
         return 1
     fi
     rm -rf "$tmpdir"
-    rm -f /tmp/meetink-postproc.state
+    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
 }
 
 # Import an audio file as a transcript: decode → parakeet → diarize →

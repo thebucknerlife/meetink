@@ -358,6 +358,16 @@ func postprocState() -> String? {
     return line.isEmpty ? nil : line
 }
 
+/// The transcript currently being post-processed (written alongside the
+/// state file), so per-meeting UI can mark the right row.
+func postprocPath() -> String? {
+    let path = "/tmp/meetink-postproc.path"
+    guard postprocState() != nil,
+          let txt = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+    let line = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+    return line.isEmpty ? nil : line
+}
+
 func speakerColor(_ speaker: String) -> NSColor {
     var h = 0
     for u in speaker.unicodeScalars { h = (h &* 31 &+ Int(u.value)) & 0x7fffffff }
@@ -1376,7 +1386,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
 final class MeetingsViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     private let table = NSTableView()
-    private var files: [(path: String, name: String, date: Date)] = []
+    private enum MeetingStatus { case live, processing, ended }
+    private var files: [(path: String, name: String, date: Date, status: MeetingStatus)] = []
     private var refreshTimer: Timer?
     var onOpen: ((String) -> Void)?
 
@@ -1390,8 +1401,12 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         let dateCol = NSTableColumn(identifier: .init("date"))
         dateCol.title = "Date"
         dateCol.width = 150
+        let statusCol = NSTableColumn(identifier: .init("status"))
+        statusCol.title = "Status"
+        statusCol.width = 130
         table.addTableColumn(nameCol)
         table.addTableColumn(dateCol)
+        table.addTableColumn(statusCol)
         table.dataSource = self
         table.delegate = self
         table.target = self
@@ -1456,7 +1471,7 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
     override func viewDidLoad() {
         super.viewDidLoad()
         refresh()
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
     }
@@ -1509,8 +1524,18 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
             out.append((path, name, date))
         }
         out.sort { $0.2 > $1.2 }
-        let changed = out.map(\.0) != files.map(\.path)
-        files = out.map { (path: $0.0, name: $0.1, date: $0.2) }
+        // Per-row status: red live, orange while its post-process runs.
+        let liveTarget = (try? fm.destinationOfSymbolicLink(atPath: liveSymlinkPath()))
+        let recording = recordingPID() != nil
+        let processing = postprocPath()
+        let stamped: [(String, String, Date, MeetingStatus)] = out.map {
+            let st: MeetingStatus = (recording && $0.0 == liveTarget) ? .live
+                : ($0.0 == processing ? .processing : .ended)
+            return ($0.0, $0.1, $0.2, st)
+        }
+        let changed = stamped.map(\.0) != files.map(\.path)
+            || stamped.map(\.3) != files.map(\.status)
+        files = stamped.map { (path: $0.0, name: $0.1, date: $0.2, status: $0.3) }
         if changed { table.reloadData() }
     }
 
@@ -1528,10 +1553,20 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         let cellID = NSUserInterfaceItemIdentifier("cell-\(id)")
         let text: String
         if id == "date" {
+            // "Aug 8 at 3:04 PM" for this year; the year appears only for
+            // older meetings.
             let df = DateFormatter()
-            df.dateStyle = .medium
-            df.timeStyle = .short
+            let cal = Calendar.current
+            df.dateFormat = cal.component(.year, from: files[row].date)
+                == cal.component(.year, from: Date())
+                ? "MMM d 'at' h:mm a" : "MMM d, yyyy 'at' h:mm a"
             text = df.string(from: files[row].date)
+        } else if id == "status" {
+            switch files[row].status {
+            case .live:       text = "● live"
+            case .processing: text = "● processing"
+            case .ended:      text = "● ended"
+            }
         } else {
             text = files[row].name
         }
@@ -1556,6 +1591,20 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource, NST
         if id == "date" {
             cell.textField?.textColor = .secondaryLabelColor
             cell.textField?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        } else if id == "status" {
+            cell.textField?.font = NSFont.systemFont(ofSize: 12)
+            let dotColor: NSColor
+            switch files[row].status {
+            case .live:       dotColor = .systemRed
+            case .processing: dotColor = .systemOrange
+            case .ended:      dotColor = .tertiaryLabelColor
+            }
+            let attr = NSMutableAttributedString(string: text)
+            attr.addAttribute(.foregroundColor, value: dotColor,
+                              range: NSRange(location: 0, length: 1))
+            attr.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor,
+                              range: NSRange(location: 1, length: attr.length - 1))
+            cell.textField?.attributedStringValue = attr
         }
         return cell
     }
