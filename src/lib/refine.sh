@@ -80,8 +80,14 @@ refine_session() {
     [[ -L "$file" ]] && actual=$(readlink "$file" 2>/dev/null)
     [[ -f "$actual" ]] || return 0
 
-    local mic="$MK_SPOOL_DIR/session-mic.raw"
-    local sys="$MK_SPOOL_DIR/session-sys.raw"
+    # Spools live in the session's folder now; the shared dir is the
+    # legacy fallback for sessions started by an older build.
+    local mic="${actual:h}/session-mic.raw"
+    local sys="${actual:h}/session-sys.raw"
+    if [[ ! -s "$mic" && ! -s "$sys" ]]; then
+        mic="$MK_SPOOL_DIR/session-mic.raw"
+        sys="$MK_SPOOL_DIR/session-sys.raw"
+    fi
     [[ -s "$mic" || -s "$sys" ]] || return 0
 
     local started=$(grep '^Started:' "$actual" 2>/dev/null | head -1 | sed 's/^Started: //')
@@ -220,8 +226,12 @@ audio_archive_session() {
     local actual="$1"
     [[ -L "$actual" ]] && actual=$(readlink "$actual" 2>/dev/null)
     [[ -f "$actual" ]] || return 0
-    local mic="$MK_SPOOL_DIR/session-mic.raw"
-    local sys="$MK_SPOOL_DIR/session-sys.raw"
+    local mic="${actual:h}/session-mic.raw"
+    local sys="${actual:h}/session-sys.raw"
+    if [[ ! -s "$mic" && ! -s "$sys" ]]; then
+        mic="$MK_SPOOL_DIR/session-mic.raw"
+        sys="$MK_SPOOL_DIR/session-sys.raw"
+    fi
     [[ -s "$mic" || -s "$sys" ]] || return 0
 
     local base="${actual%.txt}"

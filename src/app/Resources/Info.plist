@@ -35,6 +35,10 @@
 	<true/>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Meetink links recordings to your calendar events and auto-records scheduled meetings.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Meetink links recordings to your calendar events and auto-records scheduled meetings.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Meetink records your microphone to transcribe your meetings when you start a recording from the menu bar.</string>
 </dict>

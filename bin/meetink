@@ -892,11 +892,14 @@ cmd_start() {
     # Spool when refine needs it OR when the user wants the audio kept
     # (Settings → keep audio / keep audio spools) — archiving at /stop
     # reads the same spool files.
+    # Spool INTO the session's own folder. The old shared ~/.meetink/spool
+    # let overlapping sessions clobber each other: session B's start wiped
+    # the spool A was writing, A's stop archived B's seconds-old audio, and
+    # A's refine deleted the spool out from under B (field case: a meeting
+    # split into p1 with 15 s of audio and p2 with none).
     local spool_env=""
     if refine_enabled 2>/dev/null || mk_config_bool keep_audio || mk_config_bool keep_spools; then
-        refine_clear_spool
-        mkdir -p "$MK_SPOOL_DIR"
-        spool_env="$MK_SPOOL_DIR"
+        spool_env="$session_dir"
     fi
 
     MEETINK_MODEL="$MK_MODEL" \
