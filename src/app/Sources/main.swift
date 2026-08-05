@@ -2425,6 +2425,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Single instance, enforced at runtime. The app is reachable via
+        // several path identities (~/.meetink/bin, an /Applications
+        // symlink, direct binary exec from a terminal) and LaunchServices
+        // will happily run them side by side. Two instances share
+        // NSUserDefaults, so a stale instance from before a fix keeps
+        // rewriting state (field case: a fixed layout bug kept 'coming
+        // back' because an old build was still running and squeezing the
+        // saved window frame). Newest launch wins; older instances are
+        // asked to quit.
+        let me = NSRunningApplication.current
+        for other in NSRunningApplication.runningApplications(
+            withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.meetink.app")
+        where other.processIdentifier != me.processIdentifier {
+            other.terminate()
+        }
+
         buildMainMenu()
         NSApp.applicationIconImage = mWaveformImage(
             size: 512,
