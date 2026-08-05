@@ -458,7 +458,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let textView = NSTextView()
     private let headerField = NSTextField(labelWithString: "")
     private let titleField = NSTextField(string: "")
-    private var headerHeight: NSLayoutConstraint? = nil
     private let speakersTable = NSTableView()
     private enum PanelRow {
         case speaker(name: String, fraction: Double, hidden: Bool)
@@ -685,11 +684,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             header.topAnchor.constraint(equalTo: content.topAnchor),
             header.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            {
-                let h = header.heightAnchor.constraint(equalToConstant: 32)
-                self.headerHeight = h
-                return h
-            }(),
+            // No pinned header height: the stack's insets + rows already
+            // define it EXACTLY (required internal constraints), and a
+            // hard 32/56pt pin disagreed with that fitting size by 1-2pt —
+            // an unsatisfiable system on every reader layout pass, with a
+            // randomly chosen constraint broken each time (the shape-
+            // shifting 'narrow window' bug's last root).
             divider.topAnchor.constraint(equalTo: header.bottomAnchor),
             divider.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: content.trailingAnchor),
@@ -1006,7 +1006,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         noAudioLabel.isHidden = !(archived && audioPath == nil)
         reprocessButton.isHidden = !(archived && audioPath != nil)
         titleField.isHidden = !archived
-        headerHeight?.constant = archived ? 56 : 32
         if archived, view.window?.firstResponder != titleField.currentEditor() {
             titleField.stringValue = meetingDisplayName(lastResolvedPath)
         }
