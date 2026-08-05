@@ -1919,6 +1919,8 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
     private let detail = NSTextField(wrappingLabelWithString: "")
     private var profiles: [(name: String, samples: Int)] = []
     private var meetings: [(name: String, path: String)] = []   // for the selected profile
+    private let hiddenBox = NSButton(
+        checkboxWithTitle: "Hidden (not counted as a participant)", target: nil, action: nil)
     /// Wired by MainWindowController: open this transcript and play the
     /// given speaker's first segment — "listen to a sample" to confirm a
     /// profile is who you think it is.
@@ -1961,7 +1963,15 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         detail.font = NSFont.systemFont(ofSize: 11)
         detail.textColor = .secondaryLabelColor
         detail.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(scroll); root.addSubview(meetScroll); root.addSubview(detail)
+        hiddenBox.font = NSFont.systemFont(ofSize: 11)
+        hiddenBox.target = self
+        hiddenBox.action = #selector(hiddenToggled)
+        hiddenBox.isHidden = true
+        hiddenBox.toolTip = "Hidden speakers collapse in the transcript sidebar "
+            + "and don't count toward talk share (e.g. the Zoom announcer)"
+        hiddenBox.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(scroll); root.addSubview(meetScroll)
+        root.addSubview(hiddenBox); root.addSubview(detail)
         NSLayoutConstraint.activate([
             scroll.topAnchor.constraint(equalTo: root.topAnchor),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
@@ -1970,7 +1980,9 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
             meetScroll.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
             meetScroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             meetScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            meetScroll.bottomAnchor.constraint(equalTo: detail.topAnchor, constant: -8),
+            meetScroll.bottomAnchor.constraint(equalTo: hiddenBox.topAnchor, constant: -8),
+            hiddenBox.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            hiddenBox.bottomAnchor.constraint(equalTo: detail.topAnchor, constant: -6),
             detail.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
             detail.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
             detail.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
@@ -2033,6 +2045,8 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         guard row >= 0, row < profiles.count else { return }
         let name = profiles[row].name.uppercased()
         selectedProfile = name
+        hiddenBox.isHidden = false
+        hiddenBox.state = hiddenSpeakerNames().contains(name) ? .on : .off
         DispatchQueue.global().async { [weak self] in
             // Which recent meetings does this voice appear in?
             let dir = transcriptsDir()
@@ -2055,6 +2069,19 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
                     : "Double-click a meeting to open it and play \(name)'s first segment."
             }
         }
+    }
+
+    /// Toggle the selected profile's membership in hidden_speakers —
+    /// same config key the transcript sidebar reads.
+    @objc private func hiddenToggled() {
+        guard let name = selectedProfile else { return }
+        var names = (configValue("hidden_speakers") ?? "Zoom")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        names.removeAll { $0.uppercased() == name }
+        if hiddenBox.state == .on { names.append(name.capitalized) }
+        configSetValue("hidden_speakers", names.joined(separator: ","))
     }
 
     @objc private func listenToMeeting() {

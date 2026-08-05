@@ -281,7 +281,10 @@ cmd_reprocess() {
     local started=$(grep '^Started:' "$actual" 2>/dev/null | head -1 | sed 's/^Started: //')
     local me=$(me_name_get 2>/dev/null)
     local tmpdir=$(mktemp -d -t meetink-reproc)
-    local -a args=(--out "$tmpdir/out.txt" --me "${me:-ME}" --header-from "$actual")
+    # The current transcript's labels seed the new diarization — manual
+    # speaker corrections survive the reprocess instead of re-deriving
+    # from voiceprints alone.
+    local -a args=(--out "$tmpdir/out.txt" --me "${me:-ME}" --header-from "$actual" --prior "$actual")
     [[ -n "$started" ]] && args+=(--started "$started")
 
     if [[ -s "$base.mic.wav" || -s "$base.sys.wav" ]]; then

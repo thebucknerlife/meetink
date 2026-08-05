@@ -193,8 +193,50 @@ def _wav_bytes(raw: bytes, a: int, b: int) -> bytes:
     return bytes(wav)
 
 
+def parse_label_priors(txt_path: str) -> list[tuple[float, float, str]]:
+    """User-blessed (start_s, end_s, LABEL) spans from an existing
+    transcript — the supervision a reprocess must not throw away. Only
+    proper names count (Speaker N / THEM carry no user intent). Offsets
+    come from the line stamps minus the Started header; the ±1 s slop of
+    wall-clock stamps is fine for overlap voting."""
+    try:
+        lines = Path(txt_path).read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    started = None
+    for ln in lines:
+        if ln.startswith("Started:"):
+            try:
+                started = dt.datetime.fromisoformat(
+                    ln.split(":", 1)[1].strip().replace("Z", "+00:00")).astimezone()
+            except ValueError:
+                pass
+            break
+    if started is None:
+        return []
+    day0 = started.hour * 3600 + started.minute * 60 + started.second
+    stamped: list[tuple[float, str]] = []
+    for ln in lines:
+        m = re.match(r"^\[(\d{2}):(\d{2}):(\d{2})\] ([^:]+):", ln)
+        if not m:
+            continue
+        t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) - day0
+        if t < -3600:
+            t += 86400
+        stamped.append((max(0.0, t), m.group(4).strip().upper()))
+    spans = []
+    for i, (t, lab) in enumerate(stamped):
+        if lab == "THEM" or re.match(r"^SPEAKER \S+$", lab):
+            continue
+        end = stamped[i + 1][0] if i + 1 < len(stamped) else t + 5.0
+        if end > t:
+            spans.append((t, end, lab))
+    return spans
+
+
 def offline_diarize_multi(streams: list[dict], port: int,
-                          me_label: str | None = None) -> list[dict] | None:
+                          me_label: str | None = None,
+                          priors: list[tuple[float, float, str]] | None = None) -> list[dict] | None:
     """Joint offline diarization over one or more streams.
 
     streams: [{"raw": bytes, "segs": [...], "origin": "mic"|"sys"|"import"}]
@@ -315,10 +357,37 @@ def offline_diarize_multi(streams: list[dict], port: int,
     def mic_seconds(g: list[int]) -> float:
         return origin_seconds(g, "mic")
 
-    # 3. Cluster -> name via enrolled profiles (same gate ladder /identify
-    # uses), then resolve the user's cluster, then Speaker N the rest.
+    # 3a. User-blessed priors first: on a reprocess, a cluster whose
+    # windows spend most of their time inside spans the user already
+    # labeled inherits that label — direct supervision outranks the
+    # voiceprint gates below (which is exactly how manual corrections
+    # used to get lost on reprocess).
     names: list = [None] * len(groups)
+    if priors:
+        for gi, g in enumerate(groups):
+            votes: dict[str, float] = {}
+            total = 0.0
+            for k in g:
+                _, _, t0, t1 = windows[k]
+                total += t1 - t0
+                for (p0, p1, lab) in priors:
+                    ov = min(t1, p1) - max(t0, p0)
+                    if ov > 0:
+                        votes[lab] = votes.get(lab, 0.0) + ov
+            if total > 0 and votes:
+                best = max(votes, key=lambda k2: votes[k2])
+                if votes[best] >= 0.6 * total:
+                    names[gi] = best
+        n_prior = sum(1 for nm in names if nm is not None)
+        if n_prior:
+            log(f"label priors matched {n_prior} cluster(s) from the "
+                f"existing transcript")
+
+    # 3b. Cluster -> name via enrolled profiles (same gate ladder /identify
+    # uses), then resolve the user's cluster, then Speaker N the rest.
     for gi, c in enumerate(cents):
+        if names[gi] is not None:
+            continue
         best_name, best_sim, runner = None, -1.0, -1.0
         for name, cent_rows in profiles.items():
             sim = float(np.max(cent_rows @ c)) if len(cent_rows) else -1.0
@@ -505,6 +574,7 @@ def main() -> int:
     ap.add_argument("--me", default="ME", help="label for the mic stream")
     ap.add_argument("--header-from", help="copy header lines from this transcript")
     ap.add_argument("--started", help="session start (ISO8601) for wall-clock stamps")
+    ap.add_argument("--prior", help="existing transcript whose labels seed the reprocess")
     ap.add_argument("--diarize-port", type=int, default=8179)
     args = ap.parse_args()
 
@@ -561,8 +631,9 @@ def main() -> int:
         # assumed to be only the user — in-person guests, speakerphone
         # calls and hybrid meetings all label correctly, anchored by the
         # user's enrolled profile (or the dominant mic voice as fallback).
-        labeled = offline_diarize_multi(streams, args.diarize_port,
-                                        me_label=args.me)
+        labeled = offline_diarize_multi(
+            streams, args.diarize_port, me_label=args.me,
+            priors=parse_label_priors(args.prior) if args.prior else None)
         if labeled is not None:
             for seg in labeled:
                 entries.append((seg["start"], seg["label"], seg["text"],
