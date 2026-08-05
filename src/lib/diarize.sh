@@ -1148,6 +1148,52 @@ except Exception:
 }
 
 # Promote a cluster to a real profile and rewrite the live transcript.
+# Rename a profile everywhere: the server merges the voice data (into an
+# existing profile if the name is taken) AND every transcript's speaker
+# labels get rewritten — the app's "heard in" list scans transcript
+# labels, so a server-only rename left the old meetings orphaned under
+# the dead name (field case: bad profile renamed into Judd, Judd's
+# details missing that profile's meetings). Tolerates a missing source
+# profile so a label-only sweep after a past server rename still works.
+profile_rename() {
+    local old="$1" new="$2"
+    if [[ -z "$old" || -z "$new" ]]; then
+        print -P "${C[red]}usage:${C[reset]} /profile rename <old> <new>"
+        return 1
+    fi
+    if [[ "$new" == *.* || "$new" == */* ]]; then
+        print -P "${C[red]}error:${C[reset]} no slashes or dots in names"
+        return 1
+    fi
+
+    if diarize_running; then
+        local resp=$(curl -s -X POST \
+            "http://127.0.0.1:$MK_DIARIZE_PORT/session/rename?from=$(_mk_urlq "$old")&to=$(_mk_urlq "$new")")
+        if _resp_ok "$resp"; then
+            local merged=$(print -- "$resp" | grep -o '"merged": *true')
+            print -P "${C[green]}✓${C[reset]} Profile ${C[bold]}$old${C[reset]} → ${C[bold]}$new${C[reset]}${merged:+ ${C[dim]}(merged into existing)${C[reset]}}"
+        else
+            print -P "${C[yellow]}⚠${C[reset]} No profile ${C[bold]}$old${C[reset]} on the server ${C[dim]}— rewriting transcript labels only${C[reset]}"
+        fi
+    fi
+
+    # Sweep every transcript (flat + per-session folders) for the old label.
+    setopt local_options null_glob
+    local up_old=$(print -n -- "$old" | tr '[:lower:]' '[:upper:]')
+    local up_new=$(print -n -- "$new" | tr '[:lower:]' '[:upper:]')
+    local f rewritten=0
+    for f in "$MK_TRANSCRIPTS_DIR"/*.txt(.N) "$MK_TRANSCRIPTS_DIR"/*/*.txt(.N); do
+        [[ "${f:t}" == live.txt || "${f:t}" == *.live-raw.txt ]] && continue
+        grep -q "] ${up_old}:" "$f" 2>/dev/null || continue
+        if _rewrite_transcript_label "$f" "$up_old" "$up_new"; then
+            rewritten=$(( rewritten + 1 ))
+        fi
+    done
+    if (( rewritten > 0 )); then
+        print -P "${C[green]}✓${C[reset]} Relabeled ${C[bold]}${up_old}${C[reset]} → ${C[bold]}${up_new}${C[reset]} in $rewritten transcript(s)"
+    fi
+}
+
 profile_assign() {
     local ref="$1" name="$2"
     if [[ -z "$ref" || -z "$name" ]]; then
@@ -1464,6 +1510,7 @@ cmd_profile() {
         diagnose|diag|inspect|why) profile_diagnose "$2"      ;;
         clusters|cluster)      profile_clusters          ;;
         assign)                profile_assign  "$2" "$3" ;;
+        rename)                profile_rename  "$2" "$3" ;;
         merge)                 profile_merge   "$2" "$3" ;;
         rename|mv)             profile_rename  "$2" "$3" ;;
         undo|pop)              profile_undo    "$2" "$3" ;;

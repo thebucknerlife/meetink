@@ -2014,12 +2014,18 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let new = field.stringValue.trimmingCharacters(in: .whitespaces)
         guard !new.isEmpty, new != old else { return }
-        var comps = URLComponents(string: "http://127.0.0.1:8179/session/rename")!
-        comps.queryItems = [.init(name: "from", value: old), .init(name: "to", value: new)]
-        var req = URLRequest(url: comps.url!); req.httpMethod = "POST"
-        URLSession.shared.dataTask(with: req) { [weak self] _, _, _ in
+        // Through the launcher, not the server directly: profile_rename
+        // also rewrites the old label across every transcript, which is
+        // what keeps the "heard in" list intact after a rename/merge.
+        guard let launcher = launcherPath() else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["profile", "rename", old, new]
+        DispatchQueue.global().async { [weak self] in
+            do { try proc.run() } catch { return }
+            proc.waitUntilExit()
             DispatchQueue.main.async { self?.refresh() }
-        }.resume()
+        }
     }
 
     @objc private func deleteProfile() {
