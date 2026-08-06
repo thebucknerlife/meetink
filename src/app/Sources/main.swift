@@ -475,6 +475,24 @@ func postprocPath() -> String? {
     return line.isEmpty ? nil : line
 }
 
+/// Kill an in-flight post-process when a deletion orphans it. Exact
+/// path comparison misses: the pipeline records its target at START and
+/// titling renames mid-run. Folder-level match catches the rename case;
+/// the target-no-longer-exists check (call AFTER trashing) catches
+/// everything else — whatever the job thinks it's writing, it's gone.
+func killPostprocIfOrphaned(deletedPath: String) {
+    guard let pp = postprocPath(), let launcher = launcherPath() else { return }
+    let sameFolder = (pp as NSString).deletingLastPathComponent
+        == (deletedPath as NSString).deletingLastPathComponent
+    let orphaned = !FileManager.default.fileExists(atPath: pp)
+    guard pp == deletedPath || sameFolder || orphaned else { return }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: launcher)
+    proc.arguments = ["postproc-kill"]
+    try? proc.run()
+    proc.waitUntilExit()
+}
+
 func speakerColor(_ speaker: String) -> NSColor {
     var h = 0
     for u in speaker.unicodeScalars { h = (h &* 31 &+ Int(u.value)) & 0x7fffffff }
@@ -978,16 +996,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         alert.addButton(withTitle: "Move to Trash")
         guard alert.runModal() == .alertSecondButtonReturn else { return }
         stopPlayback()
-        // If a post-process/reprocess is chewing on THIS meeting, kill it —
-        // deleting the files under a running refine strands a multi-hour
-        // job writing into the Trash.
-        if postprocPath() == path, let launcher = launcherPath() {
-            let killer = Process()
-            killer.executableURL = URL(fileURLWithPath: launcher)
-            killer.arguments = ["postproc-kill"]
-            try? killer.run()
-            killer.waitUntilExit()
-        }
         let fm = FileManager.default
         let dir = (path as NSString).deletingLastPathComponent
         let base = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
@@ -1000,6 +1008,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                                   resultingItemURL: nil)
             }
         }
+        killPostprocIfOrphaned(deletedPath: path)
         onMeetingDeleted?()
     }
 
@@ -1847,6 +1856,7 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
                                       resultingItemURL: nil)
                 }
             }
+            killPostprocIfOrphaned(deletedPath: path)
         }
         refresh()
     }
