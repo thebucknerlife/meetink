@@ -567,6 +567,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var panelRows: [PanelRow] = []
     private var speakers: [(name: String, fraction: Double)] = []
     private var showHiddenSpeakers = false
+    private var speakersWidthConstraint: NSLayoutConstraint? = nil
+    private var currentSpeakingName: String? = nil
     private let statusDot = NSTextField(labelWithString: "●")
     private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
     private let folderButton = NSButton(title: "Open Folder", target: nil, action: nil)
@@ -697,9 +699,15 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         speakersTable.action = #selector(speakerRowClicked)
         speakersScroll.documentView = speakersTable
 
-        let panelDivider = NSBox()
-        panelDivider.boxType = .separator
+        let panelDivider = PanelDividerView()
         panelDivider.translatesAutoresizingMaskIntoConstraints = false
+        panelDivider.onDrag = { [weak self] dx in
+            guard let self, let c = self.speakersWidthConstraint else { return }
+            // Divider sits LEFT of the panel: dragging right shrinks it.
+            let w = min(400, max(120, c.constant - dx))
+            c.constant = w
+            UserDefaults.standard.set(Double(w), forKey: "speakersPanelWidth")
+        }
 
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
@@ -811,10 +819,17 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             scroll.bottomAnchor.constraint(equalTo: playerBar.topAnchor),
             panelDivider.topAnchor.constraint(equalTo: divider.bottomAnchor),
             panelDivider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            panelDivider.widthAnchor.constraint(equalToConstant: 1),
+            panelDivider.widthAnchor.constraint(equalToConstant: 7),
             speakersScroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
             speakersScroll.leadingAnchor.constraint(equalTo: panelDivider.trailingAnchor),
-            speakersScroll.widthAnchor.constraint(equalToConstant: 170),
+            {
+                let saved = UserDefaults.standard.double(forKey: "speakersPanelWidth")
+                let c = speakersScroll.widthAnchor.constraint(
+                    equalToConstant: saved >= 120 ? saved : 170)
+                c.priority = NSLayoutConstraint.Priority(999)
+                self.speakersWidthConstraint = c
+                return c
+            }(),
             speakersScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             speakersScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             playerBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -1208,7 +1223,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         alert.window.initialFirstResponder = combo
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let name = combo.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, !name.contains("."), !name.contains("/") else { return }
+        // Only path-hostile input is rejected — "Greg (AE)", "Jean-Luc"
+        // and "J.R." are all legitimate names.
+        guard !name.isEmpty, !name.contains("/"), !name.hasPrefix(".") else { return }
         runAssign(label: label, name: name)
     }
 
@@ -1383,6 +1400,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         player?.stop()
         player = nil
         playTimer?.invalidate()
+        if currentSpeakingName != nil {
+            currentSpeakingName = nil
+            speakersTable.reloadData()
+        }
         if let r = highlightedRange {
             textView.layoutManager?.removeTemporaryAttribute(.backgroundColor, forCharacterRange: r)
             highlightedRange = nil
@@ -1433,6 +1454,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             forCharacterRange: range)
         highlightedRange = range
         if scrollTo { textView.scrollRangeToVisible(range) }
+        // Mirror who's talking into the speakers panel (subtle row tint).
+        let name = idx < snapshot.lines.count ? snapshot.lines[idx].speaker : nil
+        if name != currentSpeakingName {
+            currentSpeakingName = name
+            speakersTable.reloadData()
+        }
     }
 
     private func updateSpeakersPanel() {
@@ -1588,6 +1615,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         case .speaker(let name, let fraction, let hidden):
             nameField.stringValue = name
             nameField.textColor = hidden ? .tertiaryLabelColor : color(for: name)
+            cell.wantsLayer = true
+            cell.layer?.cornerRadius = 5
+            cell.layer?.backgroundColor = name == currentSpeakingName
+                ? color(for: name).withAlphaComponent(0.13).cgColor
+                : NSColor.clear.cgColor
             nameField.toolTip = audioPath != nil
                 ? "Click to play their next segment" : "Click to name this speaker"
             pctField.stringValue = "\(Int((fraction * 100).rounded()))%"
@@ -2611,6 +2643,23 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
 
 /// Top-anchored coordinates for scroll document views.
 final class FlippedView: NSView { override var isFlipped: Bool { true } }
+
+/// A hairline divider with a grabbable hit area — dragging resizes the
+/// speakers panel (width persisted across launches).
+final class PanelDividerView: NSView {
+    var onDrag: ((CGFloat) -> Void)? = nil
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.separatorColor.setFill()
+        NSRect(x: bounds.midX, y: 0, width: 1, height: bounds.height).fill()
+    }
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .resizeLeftRight)
+    }
+    override func mouseDragged(with event: NSEvent) {
+        onDrag?(event.deltaX)
+    }
+}
 
 // MARK: - Settings page
 

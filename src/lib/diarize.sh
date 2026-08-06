@@ -659,8 +659,8 @@ profile_add() {
         print -P "${C[red]}usage:${C[reset]} /profile add <name>"
         return 1
     fi
-    if [[ "$name" == *.* || "$name" == */* ]]; then
-        print -P "${C[red]}error:${C[reset]} no slashes or dots in names"
+    if [[ "$name" == */* || "$name" == .* ]]; then
+        print -P "${C[red]}error:${C[reset]} no slashes or leading dots in names"
         return 1
     fi
     if ! diarize_running; then
@@ -1161,8 +1161,8 @@ profile_rename() {
         print -P "${C[red]}usage:${C[reset]} /profile rename <old> <new>"
         return 1
     fi
-    if [[ "$new" == *.* || "$new" == */* ]]; then
-        print -P "${C[red]}error:${C[reset]} no slashes or dots in names"
+    if [[ "$new" == */* || "$new" == .* ]]; then
+        print -P "${C[red]}error:${C[reset]} no slashes or leading dots in names"
         return 1
     fi
 
@@ -1201,8 +1201,8 @@ profile_assign() {
         print -P "  ${C[dim]}<speaker> is a number (3), a label (\"Speaker 3\"), or an assigned name (\"GREG\") — reassignment works.${C[reset]}"
         return 1
     fi
-    if [[ "$name" == *.* || "$name" == */* ]]; then
-        print -P "${C[red]}error:${C[reset]} no slashes or dots in names"
+    if [[ "$name" == */* || "$name" == .* ]]; then
+        print -P "${C[red]}error:${C[reset]} no slashes or leading dots in names"
         return 1
     fi
     if ! diarize_running; then
@@ -1424,8 +1424,8 @@ profile_rename() {
         print -P "${C[red]}usage:${C[reset]} /profile rename <old> <new>"
         return 1
     fi
-    if [[ "$to" == *.* || "$to" == */* ]]; then
-        print -P "${C[red]}error:${C[reset]} no slashes or dots in names"
+    if [[ "$to" == */* || "$to" == .* ]]; then
+        print -P "${C[red]}error:${C[reset]} no slashes or leading dots in names"
         return 1
     fi
     if ! diarize_running; then

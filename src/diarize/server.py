@@ -1629,7 +1629,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not name:
                     self._json(400, {"error": "need ?name=Mike"})
                     return
-                if any(c in name for c in "/\\.."):
+                if "/" in name or "\\" in name or name.startswith("."):
                     self._json(400, {"error": "invalid name (no slashes or dots)"})
                     return
                 now = time.time()
@@ -1718,7 +1718,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not letter or not name:
                     self._json(400, {"error": "need ?cluster=A&name=Alice"})
                     return
-                if any(c in name for c in "/\\.."):
+                if "/" in name or "\\" in name or name.startswith("."):
                     self._json(400, {"error": "invalid name (no slashes or dots)"})
                     return
                 # Accept a bare id, "Speaker 3", or a refine-assigned
@@ -2048,7 +2048,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not name:
                     self._json(400, {"error": "missing ?name=..."})
                     return
-                if any(c in name for c in "/\\.."):
+                if "/" in name or "\\" in name or name.startswith("."):
                     self._json(400, {"error": "invalid name (no slashes or dots)"})
                     return
                 samples = parse_wav(body)
