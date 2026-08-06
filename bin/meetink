@@ -1044,6 +1044,47 @@ cmd_stop() {
     fi
 }
 
+# --- Discard the live recording ---
+# Stop WITHOUT the post-processing pipeline and delete the session — for
+# recordings that are garbage (the forgotten 14-hour capture). kill -9 on
+# purpose: a graceful stop flushes buffers and cmd_stop would hand the
+# whole thing to refine.
+cmd_discard() {
+    if [[ ! -f "$PID_FILE" ]] || ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        print -P "${C[dim]}Not recording — nothing to discard.${C[reset]}"
+        return 1
+    fi
+    local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
+    if [[ -t 0 ]]; then
+        print -Pn "${C[yellow]}Discard the live recording${C[reset]} ${C[dim]}(${actual:t}, deleted permanently)${C[reset]}? [y/N] "
+        local answer; read -r answer
+        [[ "$answer" == [yY]* ]] || { print -P "${C[dim]}Kept.${C[reset]}"; return 1 }
+    fi
+    kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true
+    rm -f "$PID_FILE"
+    stop_whisper_server
+    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+    # Folder-style session: the whole directory (transcript + spools) goes.
+    if [[ -n "$actual" && -f "$actual" ]]; then
+        local dir="${actual:h}"
+        if [[ "${dir:t}" == "${actual:t:r}"* ]]; then
+            rm -rf "$dir"
+        else
+            rm -f "$actual"
+        fi
+    fi
+    # Re-point live.txt at the newest remaining meeting.
+    setopt local_options null_glob
+    local -a rest=("$MK_TRANSCRIPTS_DIR"/*/*.txt(.N.om))
+    local f
+    for f in "${rest[@]}"; do
+        [[ "${f:t}" == *.live-raw.txt || "${f:t}" == *.pre-reprocess.txt ]] && continue
+        ln -sfn "$f" "$MK_TRANSCRIPT"
+        break
+    done
+    print -P "${C[green]}✓${C[reset]} Recording discarded."
+}
+
 # --- Status command ---
 cmd_status() {
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
@@ -1129,6 +1170,7 @@ cmd_help() {
     bullet "simulate " "test harness: feed an audio file through the real pipeline (--mic/--sys/--rate)"
     bullet "migrate  " "move flat-layout transcripts into per-session folders (runs on start too)"
     bullet "reprocess" "re-run the refine pipeline on an old meeting's kept audio"
+    bullet "discard  " "kill the live recording and delete it (skips all post-processing)"
     bullet "prompt   " "edit the custom vocabulary (names/jargon whisper should know)"
     bullet "help     " "show this help"
     print -P ""
@@ -1187,6 +1229,7 @@ case "${1:-}" in
     upload)            cmd_upload ;;
     simulate|sim)      shift 2>/dev/null; cmd_simulate "$@" ;;
     migrate)           cmd_migrate ;;
+    discard)           cmd_discard ;;
     reprocess)         shift 2>/dev/null; cmd_reprocess "$@" ;;
     watch-daemon)      # Headless watcher (spawned by Meetink.app; see watch.daemon_main)
                        MEETINK_HOME="$MK_HOME" PYTHONPATH="$MK_ROOT/src" \

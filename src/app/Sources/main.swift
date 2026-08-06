@@ -553,8 +553,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
     private let folderButton = NSButton(title: "Open Folder", target: nil, action: nil)
     private let reprocessButton = NSButton(title: "Reprocess", target: nil, action: nil)
-    private let eventButton = NSButton(title: "Link Event", target: nil, action: nil)
+    private let menuButton = NSButton(title: "", target: nil, action: nil)
     private var fetchedEvents: [[String: Any]] = []
+    /// Wired by MainWindowController: after Delete, go back to Meetings.
+    var onMeetingDeleted: (() -> Void)? = nil
     private let jumpButton = NSButton(title: "", target: nil, action: nil)
 
     private var pollTimer: Timer?
@@ -623,14 +625,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         folderButton.font = NSFont.systemFont(ofSize: 11)
         folderButton.target = self
         folderButton.action = #selector(openFolder)
-        eventButton.bezelStyle = .rounded
-        eventButton.controlSize = .small
-        eventButton.font = NSFont.systemFont(ofSize: 11)
-        eventButton.target = self
-        eventButton.action = #selector(linkEvent)
-        eventButton.toolTip = "Tie this recording to a calendar event — renames "
-            + "the meeting and records the attendees"
-        eventButton.isHidden = true
+        menuButton.bezelStyle = .rounded
+        menuButton.controlSize = .small
+        menuButton.image = NSImage(systemSymbolName: "ellipsis.circle",
+                                   accessibilityDescription: "More actions")
+        menuButton.target = self
+        menuButton.action = #selector(showActionsMenu)
         reprocessButton.bezelStyle = .rounded
         reprocessButton.controlSize = .small
         reprocessButton.font = NSFont.systemFont(ofSize: 11)
@@ -648,10 +648,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         strip.addArrangedSubview(statusDot)
         strip.addArrangedSubview(headerField)
         strip.addArrangedSubview(NSView())
-        strip.addArrangedSubview(eventButton)
         strip.addArrangedSubview(reprocessButton)
         strip.addArrangedSubview(folderButton)
         strip.addArrangedSubview(copyButton)
+        strip.addArrangedSubview(menuButton)
 
         let divider = NSBox()
         divider.boxType = .separator
@@ -916,6 +916,79 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         return false
     }
 
+    /// The … menu: contextual actions for the current page — Link Event
+    /// and Delete on recordings, Discard on the live view (the forgotten
+    /// 14-hour capture must die WITHOUT a trip through post-processing).
+    @objc private func showActionsMenu() {
+        let menu = NSMenu()
+        let liveRecording = fixedPath == nil && recordingPID() != nil
+        if liveRecording {
+            let discard = NSMenuItem(title: "Discard Recording…",
+                                     action: #selector(discardRecording), keyEquivalent: "")
+            discard.target = self
+            menu.addItem(discard)
+        } else if !lastResolvedPath.isEmpty, !snapshot.lines.isEmpty {
+            let link = NSMenuItem(title: "Link Event…",
+                                  action: #selector(linkEvent), keyEquivalent: "")
+            link.target = self
+            menu.addItem(link)
+            menu.addItem(.separator())
+            let del = NSMenuItem(title: "Delete Meeting…",
+                                 action: #selector(deleteMeeting), keyEquivalent: "")
+            del.target = self
+            menu.addItem(del)
+        }
+        guard !menu.items.isEmpty else { return }
+        menu.popUp(positioning: nil,
+                   at: NSPoint(x: 0, y: menuButton.bounds.height + 4),
+                   in: menuButton)
+    }
+
+    @objc private func discardRecording() {
+        let alert = NSAlert()
+        alert.messageText = "Discard this recording?"
+        alert.informativeText = "Stops recording immediately and deletes the "
+            + "transcript and audio. No post-processing runs. This cannot be undone."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Discard")
+        guard alert.runModal() == .alertSecondButtonReturn,
+              let launcher = launcherPath() else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["discard"]
+        DispatchQueue.global().async { [weak self] in
+            try? proc.run()
+            proc.waitUntilExit()
+            DispatchQueue.main.async { self?.refreshIfChanged(force: true) }
+        }
+    }
+
+    @objc private func deleteMeeting() {
+        let path = lastResolvedPath
+        guard !path.isEmpty else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete “\(meetingDisplayName(path))”?"
+        alert.informativeText = "The meeting (transcript, summary, audio) moves to the Trash."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Move to Trash")
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        stopPlayback()
+        let fm = FileManager.default
+        let dir = (path as NSString).deletingLastPathComponent
+        let base = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+        if (dir as NSString).lastPathComponent == base {
+            try? fm.trashItem(at: URL(fileURLWithPath: dir), resultingItemURL: nil)
+        } else {
+            for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+            where item.hasPrefix(base + ".") {
+                try? fm.trashItem(at: URL(fileURLWithPath: dir + "/" + item),
+                                  resultingItemURL: nil)
+            }
+        }
+        onMeetingDeleted?()
+    }
+
     /// Calendar events around the recording's start (4 h before to 8 h
     /// after), via the agent's --from/--to window. Selecting one renames
     /// the meeting to the event title and records the attendees — in
@@ -938,9 +1011,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         proc.arguments = eventArgs
         let pipe = Pipe()
         proc.standardOutput = pipe
-        eventButton.isEnabled = false
+        menuButton.isEnabled = false
         DispatchQueue.global().async { [weak self] in
-            defer { DispatchQueue.main.async { self?.eventButton.isEnabled = true } }
+            defer { DispatchQueue.main.async { self?.menuButton.isEnabled = true } }
             do { try proc.run() } catch { return }
             // Read to EOF BEFORE waitUntilExit — a day's events with
             // attendees overflows the 64 KB pipe buffer, the agent blocks
@@ -986,8 +1059,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             menu.addItem(item)
         }
         menu.popUp(positioning: nil,
-                   at: NSPoint(x: 0, y: eventButton.bounds.height + 4),
-                   in: eventButton)
+                   at: NSPoint(x: 0, y: menuButton.bounds.height + 4),
+                   in: menuButton)
     }
 
     @objc private func eventPicked(_ sender: NSMenuItem) {
@@ -1215,7 +1288,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         for v in playerBar.arrangedSubviews { v.isHidden = (audioPath == nil) }
         noAudioLabel.isHidden = !(archived && audioPath == nil)
         reprocessButton.isHidden = !(archived && audioPath != nil)
-        eventButton.isHidden = !archived
         titleField.isHidden = !archived
         if archived, view.window?.firstResponder != titleField.currentEditor() {
             titleField.stringValue = meetingDisplayName(lastResolvedPath)
@@ -2858,6 +2930,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
         uploadVC.onOpenTranscript = { [weak self] path in
             self?.openTranscript(path)
+        }
+        readerVC.onMeetingDeleted = { [weak self] in
+            self?.showPage(0)
+            self?.sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            self?.meetingsVC.refresh()
         }
         meetingsVC.playingProvider = { [weak self] in
             self?.readerVC.playingTranscriptPath
