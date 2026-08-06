@@ -417,13 +417,42 @@ cmd_refine() {
     mkdir -p "$sess_dir"
     local out="$sess_dir/$sess.txt"
 
+    # Placeholder transcript so the meeting appears in the app's Meetings
+    # list the moment the upload starts (the real content lands when the
+    # refine finishes and overwrites this file in place).
+    {
+        print -- "# Meeting Transcript (importing audio)"
+        print -- "# source: ${input:t}"
+        print -- "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$out"
+
     print -P "${C[bright_yellow]}▸${C[reset]} Transcribing ${C[bold]}${input:t}${C[reset]} ${C[dim]}(parakeet)...${C[reset]}"
     _refine_lock
+    # Same narration files the stop pipeline uses — the Meetings page
+    # marks THIS row orange while the import works.
+    local state=/tmp/meetink-postproc.state
+    print -- "starting (step 1/3)" > "$state"
+    print -- "$out" > /tmp/meetink-postproc.path
     local rc=0
     "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" \
-            --input "$input" --out "$out" 2>/tmp/meetink-refine.log || rc=$?
+            --input "$input" --out "$out" 2>/tmp/meetink-refine.log | \
+        while IFS= read -r line; do
+            print -- "$line"
+            case "$line" in
+                "refine: progress diarize "*)
+                    print -- "identifying speakers ${line##* }% (step 2/3)" > "$state" ;;
+                "refine: progress "*)
+                    local -a w=(${=line})
+                    print -- "transcribing ${w[3]} ${w[4]}% (step 1/3)" > "$state" ;;
+                "refine: status "*)
+                    print -- "${line#refine: status } (step 2/3)" > "$state" ;;
+            esac
+        done
+    rc=${pipestatus[1]}
     _refine_unlock
     if (( rc != 0 )); then
+        rm -rf "$sess_dir"   # no ghost meeting from a failed import
+        rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
         print -P "${C[red]}error:${C[reset]} transcription failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
         return 1
     fi
@@ -455,6 +484,7 @@ cmd_refine() {
         title_session_file "$out"
     fi
 
+    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
     # Machine-readable final location (titling may have renamed the file).
     # Tracked by INODE, not via live.txt: with two imports in flight the
     # symlink points wherever the later one left it — mv preserves the
