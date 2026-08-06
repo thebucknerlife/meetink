@@ -592,13 +592,46 @@ _resolve_idx_collision() {
 # Rename a session file with an AI slug. Best-effort — leaves the file alone
 # if anything fails. Updates the live.txt symlink if it pointed at the old name.
 # Args: $1 = absolute path to the session file (e.g. /…/2026-05-07_14-32-08.txt)
+# Exact display titles live in <base>.meta.json (the app reads it before
+# falling back to the filename slug). Best-effort — a missing python3
+# just means slug-only naming.
+_meta_set_title() {
+    local txt="$1" title="$2"
+    python3 - "${txt%.txt}.meta.json" "$title" <<'PYEOF2' 2>/dev/null || true
+import json, os, sys
+p, title = sys.argv[1], sys.argv[2]
+d = {}
+if os.path.exists(p):
+    try:
+        d = json.load(open(p))
+    except Exception:
+        d = {}
+d["title"] = title
+json.dump(d, open(p, "w"), sort_keys=True)
+PYEOF2
+}
+
 title_session_file() {
     local file="$1"
     [[ -f "$file" ]] || return 0
-    llm_available || return 0
 
-    print -P "${C[dim]}Generating title...${C[reset]}"
-    local slug=$(generate_title "$file" 2>/dev/null)
+    # A meeting the watcher started from a calendar event already HAS its
+    # name — the '# event:' header the capture binary wrote. Use it (slug
+    # for the folder, exact title into meta.json) and skip the LLM guess.
+    # Instant detections write '(instant meeting)' and fall through.
+    local event_title=$(grep '^# event: ' "$file" 2>/dev/null | head -1 | sed 's/^# event: //')
+    local slug=""
+    if [[ -n "$event_title" && "$event_title" != "(instant meeting)" ]]; then
+        slug=$(print -rn -- "$event_title" | tr -c 'A-Za-z0-9' '-' \
+            | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-60)
+        [[ -n "$slug" ]] && print -P "${C[dim]}Naming from calendar event: ${event_title}${C[reset]}"
+    fi
+    if [[ -z "$slug" ]]; then
+        event_title=""
+        llm_available || return 0
+        print -P "${C[dim]}Generating title...${C[reset]}"
+        slug=$(generate_title "$file" 2>/dev/null)
+    fi
     if [[ -z "$slug" ]]; then
         print -P "${C[dim]}  (titling skipped)${C[reset]}"
         return 0
@@ -639,6 +672,7 @@ title_session_file() {
             mv "$inner" "$newdir/${newbase}${suffix}" 2>/dev/null || true
         done
         local new="$newdir/${newbase}.txt"
+        [[ -n "$event_title" ]] && _meta_set_title "$new" "$event_title"
 
         # Update live.txt if it pointed at the old path.
         local live="$MK_TRANSCRIPTS_DIR/live.txt"
@@ -684,6 +718,8 @@ title_session_file() {
         print -P "${C[dim]}  (rename failed)${C[reset]}"
         return 0
     fi
+
+    [[ -n "$event_title" ]] && _meta_set_title "$new" "$event_title"
 
     # Move the .idx sidecar in lockstep so the index stays paired with
     # the renamed transcript. Two failure modes the previous code hit:
