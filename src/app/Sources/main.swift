@@ -1740,7 +1740,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
         parts.append("\(snapshot.lines.count) lines")
         if !recording && snapshot.endedAt != nil { parts.append("ended") }
-        if !recording, let pp = postprocState() {
+        // Scoped to THIS meeting: another meeting's post-processing must
+        // not take over every page (field report: in a new live meeting
+        // while an old one processed, the live header said 'processing').
+        if let pp = postprocState(), let target = postprocPath(),
+           !lastResolvedPath.isEmpty,
+           target == lastResolvedPath
+           || (target as NSString).deletingLastPathComponent
+              == (lastResolvedPath as NSString).deletingLastPathComponent {
             parts.append("post-processing… \(pp)")
             statusDot.textColor = .systemOrange
         }
@@ -3109,10 +3116,6 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         let recording = recordingPID() != nil
         stripDot.textColor = recording ? .systemRed : .tertiaryLabelColor
         stripLabel.stringValue = recording ? "Recording" : "Not recording"
-        if !recording, let pp = postprocState() {
-            stripDot.textColor = .systemOrange
-            stripLabel.stringValue = "Post-processing… \(pp)"
-        }
         recordButton.title = recording ? "Stop Recording" : "Start Recording"
         recordButton.isEnabled = true
         liveButton.title = recording ? "Open Live Transcript" : "Open Latest Transcript"
