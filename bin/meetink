@@ -986,6 +986,14 @@ cmd_stop() {
         print -P "${C[dim]}Not recording.${C[reset]}"
         exit 0
     fi
+    # Resolve the session ONCE, up front. Every stage below used to
+    # re-resolve the live symlink independently — so a NEW recording
+    # started mid-pipeline retargets live.txt and the rest of THIS stop
+    # hijacks the new session (field case: refined and titled a
+    # 15-second-old recording that was still being written, deleting its
+    # spools — 'my recording died after 15 seconds, no audio').
+    local stop_target="$MK_TRANSCRIPT"
+    [[ -L "$stop_target" ]] && stop_target=$(readlink "$stop_target" 2>/dev/null)
     local pid=$(cat "$PID_FILE")
     if kill -0 "$pid" 2>/dev/null; then
         print -P "${C[dim]}Stopping recording...${C[reset]}"
@@ -1016,7 +1024,7 @@ cmd_stop() {
     # "Speaker <x>" labels on lines written before the merge. See
     # diarize_consolidate_transcript in src/lib/diarize.sh.
     if typeset -f diarize_consolidate_transcript >/dev/null 2>&1; then
-        diarize_consolidate_transcript "$MK_TRANSCRIPT"
+        diarize_consolidate_transcript "$stop_target"
     fi
 
     # Archive the session audio into the meeting folder when the user asked
@@ -1024,7 +1032,7 @@ cmd_stop() {
     # the two raw streams as wavs, replayable via `meetink simulate`). Must
     # run BEFORE refine_session — refine deletes the spools on success.
     if typeset -f audio_archive_session >/dev/null 2>&1; then
-        audio_archive_session "$MK_TRANSCRIPT"
+        audio_archive_session "$stop_target"
     fi
 
     # Re-transcribe the whole session with full acoustic context (parakeet)
@@ -1033,7 +1041,7 @@ cmd_stop() {
     # sentence-level /identify calls have already populated the session
     # clusters that inference checks.
     if typeset -f refine_session >/dev/null 2>&1; then
-        refine_session "$MK_TRANSCRIPT"
+        refine_session "$stop_target"
     fi
 
     # Infer real names for the surviving Speaker-N labels from the
@@ -1043,26 +1051,30 @@ cmd_stop() {
     # MEETINK_INFER_NAMES=off or infer_names=false in config.
     print -- "generating names, title and summary (step 3/3)" > /tmp/meetink-postproc.state
     if typeset -f infer_speaker_names >/dev/null 2>&1; then
-        infer_speaker_names "$MK_TRANSCRIPT"
+        infer_speaker_names "$stop_target"
     fi
 
     # Run AI titling on the just-finished session (no-op if llama.cpp + the
     # tiny LLM aren't installed). title_session_file may rename the file and
     # update the live.txt symlink target.
-    if [[ -L "$MK_TRANSCRIPT" ]]; then
-        local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
-        [[ -n "$actual" && -f "$actual" ]] && title_session_file "$actual"
+    # Track OUR session by inode across titling's rename — never via the
+    # live symlink, which a newer recording may already own.
+    local stop_ino=""
+    if [[ -n "$stop_target" && -f "$stop_target" ]]; then
+        stop_ino=$(stat -f %i "$stop_target" 2>/dev/null)
+        title_session_file "$stop_target"
+        if [[ ! -f "$stop_target" && -n "$stop_ino" ]]; then
+            local by_ino=$(find "$MK_TRANSCRIPTS_DIR" -maxdepth 2 -name '*.txt' -inum "$stop_ino" 2>/dev/null | head -1)
+            [[ -n "$by_ino" && -f "$by_ino" ]] && stop_target="$by_ino"
+        fi
     fi
 
     rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
-    local done_name=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
-    mk_notify "Meeting ready" "${${done_name:t}:r} — transcript and audio processed"
+    mk_notify "Meeting ready" "${${stop_target:t}:r} — transcript and audio processed"
 
-    if [[ -f "$MK_TRANSCRIPT" ]]; then
-        local lines=$(wc -l < "$MK_TRANSCRIPT" | tr -d ' ')
-        local final=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
-        [[ -z "$final" ]] && final="$MK_TRANSCRIPT"
-        print -P "  Transcript: ${C[bright_cyan]}${final/$HOME/~}${C[reset]} ${C[dim]}($lines lines)${C[reset]}"
+    if [[ -f "$stop_target" ]]; then
+        local lines=$(wc -l < "$stop_target" | tr -d ' ')
+        print -P "  Transcript: ${C[bright_cyan]}${stop_target/$HOME/~}${C[reset]} ${C[dim]}($lines lines)${C[reset]}"
     fi
 }
 
