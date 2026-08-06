@@ -50,6 +50,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import re
 import sys
 import threading
 import time
@@ -150,6 +151,28 @@ class WatchedEvent:
         # events should beat solo focus blocks.
         s += min(50, len(self.attendees))
         return s
+
+
+def _wlog(msg: str) -> None:
+    """Timestamped decision log — lands in /tmp/meetink-watch.log via the
+    app's pipe. Every start/stop/skip should say WHY, or field debugging
+    is guesswork."""
+    print(f"[watch {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+_MEETING_URL_RE = re.compile(
+    r"zoom\.us|meet\.google|teams\.microsoft|webex\.com|whereby\.com"
+    r"|meet\.jit\.si|gather\.town", re.IGNORECASE)
+
+
+def _looks_like_solo_block(raw: dict) -> bool:
+    """A calendar entry with no other participants and no conference
+    link is a time-block ('Driving', 'Maker'), not a meeting — recording
+    those was the 'it records at random times' field report."""
+    if len(raw.get("attendees") or []) > 1:
+        return False
+    blob = f"{raw.get('location', '')} {raw.get('notes', '')} {raw.get('url', '')}"
+    return not _MEETING_URL_RE.search(blob)
 
 
 def _parse_iso(s: str) -> datetime:
@@ -323,8 +346,8 @@ def _start_recording_subprocess(env_extras: dict[str, str]) -> bool:
         check=False, capture_output=True, env=env, text=True,
     )
     if proc.returncode != 0:
-        print(f"[watch] /start failed: {proc.stderr.strip()}",
-              file=sys.stderr)
+        _wlog("/start failed: "
+              + (proc.stdout.strip() or proc.stderr.strip() or "(no output)"))
         return False
     return True
 
@@ -357,6 +380,13 @@ class WatchManager:
         self._events: dict[str, WatchedEvent] = {}
         self._currently_recording: Optional[str] = None
         self._inactive_streak: int = 0
+        # End-detection arms only after the meeting app has been SEEN
+        # active during the current recording. Without this, a recording
+        # whose app the agent can't detect (phone call, unrecognized
+        # browser tab) is born with an inactive streak and auto-stops in
+        # ~40 s (30 s slow poll + 2 fast confirms — the field report's
+        # '43 seconds').
+        self._seen_active_this_recording: bool = False
         self._last_calendar_poll: float = 0.0
         self._last_active_poll: float = 0.0
         # Instant detection state. _instant_streak counts consecutive
@@ -541,6 +571,8 @@ class WatchManager:
             if result.get("active"):
                 self._inactive_streak = 0
                 self._instant_streak += 1
+                if self._currently_recording is not None:
+                    self._seen_active_this_recording = True
             else:
                 self._inactive_streak += 1
                 self._instant_streak = 0
@@ -568,6 +600,10 @@ class WatchManager:
                     e.location = raw.get("location", "")
                     e.notes = raw.get("notes", "")
                     e.calendar_title = raw.get("calendarTitle", "")
+                elif _looks_like_solo_block(raw):
+                    _wlog(f"skipping '{raw['title']}' — solo calendar block "
+                          f"(no other attendees, no meeting link)")
+                    continue
                 else:
                     self._events[eid] = WatchedEvent(
                         id=eid,
@@ -714,6 +750,8 @@ class WatchManager:
                 chosen.status = EventStatus.RECORDING
                 chosen.recorded_at = _now()
                 self._currently_recording = chosen.id
+                self._seen_active_this_recording = False
+                _wlog(f"recording started for event '{chosen.title}'")
                 self._inactive_streak = 0
                 self._last_active_poll = time.time()
             else:
@@ -757,9 +795,13 @@ class WatchManager:
         absent for MEETING_END_QUIET_TICKS consecutive polls; cadence
         drops to FAST_END_POLL_S once we've seen the first inactive)."""
         with self._lock:
+            if not self._seen_active_this_recording:
+                return   # never saw the meeting app — run to the event end
             if self._inactive_streak < MEETING_END_QUIET_TICKS:
                 return
             recording_id = self._currently_recording
+        _wlog(f"stopping recording ({recording_id or 'instant'}): meeting app "
+              f"inactive for {MEETING_END_QUIET_TICKS} consecutive polls")
 
         # Drop the lock to shell out /stop
         _stop_recording_subprocess()
@@ -886,6 +928,9 @@ class WatchManager:
                     ev.status = EventStatus.RECORDING
                     ev.recorded_at = _now()
                     self._currently_recording = ev.id
+                    # Instant detection fires FROM activity — armed at birth.
+                    self._seen_active_this_recording = True
+                    _wlog(f"instant recording started ({ev.title})")
                     self._inactive_streak = 0
                 else:
                     ev.status = EventStatus.EXPIRED
