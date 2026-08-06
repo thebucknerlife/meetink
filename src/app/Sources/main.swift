@@ -3079,6 +3079,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // daemon also carries MEETINK_WATCH_OWNER_PID so it exits by itself
     // if the app dies uncleanly (no orphaned recordings).
     private var watchProcess: Process? = nil
+    // Dead-air detector state: which live session we've already warned
+    // about, and a coarse once-a-minute cadence on the 2 s poll.
+    private var deadAirWarnedPath: String? = nil
+    private var deadAirTick = 0
 
     private func reconcileWatchDaemon() {
         let wants = configBool("watch_enabled")
@@ -3282,9 +3286,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = main
     }
 
+    /// A recording that has run 10+ minutes with almost no transcript is
+    /// usually a phantom (forgotten instant-detection, muted mic, dead
+    /// sys stream). One notification per session; checked once a minute.
+    private func checkDeadAir(recording: Bool) {
+        deadAirTick += 1
+        guard recording, deadAirTick % 30 == 0 else {
+            if !recording { deadAirWarnedPath = nil }
+            return
+        }
+        let live = liveSymlinkPath()
+        guard let target = try? FileManager.default.destinationOfSymbolicLink(atPath: live),
+              target != deadAirWarnedPath,
+              let dur = meetingDuration(target, isLive: true), dur > 600,
+              let text = try? String(contentsOfFile: target, encoding: .utf8) else { return }
+        var lines = 0
+        for l in text.split(separator: "\n") where l.hasPrefix("[") {
+            lines += 1
+            if lines > 3 { return }   // real speech — all good
+        }
+        deadAirWarnedPath = target
+        guard let agent = agentPathIfPresent() else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: agent)
+        proc.arguments = ["notify", "--title", "Still recording — hearing anything?",
+                          "--body", "\(Int(dur / 60)) minutes with almost no speech. "
+                          + "Discard from the transcript's ⋯ menu if this is a phantom."]
+        try? proc.run()
+    }
+
+    private func agentPathIfPresent() -> String? {
+        let p = "\(mkHome)/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
+        return FileManager.default.isExecutableFile(atPath: p) ? p : nil
+    }
+
     private func pollState() {
         reconcileWatchDaemon()
         let recording = recordingPID() != nil
+        checkDeadAir(recording: recording)
         if recording != lastRecording {
             lastRecording = recording
             updateStatusIcon(recording: recording)

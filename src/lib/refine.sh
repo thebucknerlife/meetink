@@ -381,6 +381,8 @@ cmd_reprocess() {
     fi
     rm -rf "$tmpdir"
     rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+    typeset -f mk_notify >/dev/null 2>&1 && \
+        mk_notify "Reprocess done" "${${actual:t}:r}"
 }
 
 # Import an audio file as a transcript: decode → parakeet → diarize →

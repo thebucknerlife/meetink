@@ -77,6 +77,17 @@ mk_config_bool() {
     [[ "$v" == "true" || "$v" == "on" || "$v" == "1" ]]
 }
 
+# Fire a system notification via the agent — best-effort and async so a
+# missing/broken agent never blocks the pipeline. Lifecycle notifications
+# (started / stopped / post-processing done) keep the user oriented when
+# recordings run in the background.
+mk_notify() {
+    local agent="$MK_HOME/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
+    [[ -x "$agent" ]] || return 0
+    "$agent" notify --title "$1" --body "$2" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
 # Code-signing identity for the app bundles. TCC (mic / screen recording)
 # keys grants to the SIGNATURE, and an ad-hoc signature is a content hash —
 # every rebuild mints a new identity and silently invalidates every grant
@@ -937,6 +948,8 @@ cmd_start() {
     echo $! > "$PID_FILE"
     disown 2>/dev/null || true
 
+    mk_notify "Recording started" "${session_stamp} — live transcript is filling in"
+
     print -P ""
     print -P "${C[green]}${C[bold]}● Recording started${C[reset]}  (PID $(cat "$PID_FILE"))"
     print -P "  Transcript: ${C[bright_cyan]}${session_file/$HOME/~}${C[reset]}"
@@ -996,6 +1009,7 @@ cmd_stop() {
     window_close_tail
 
     print -P "${C[green]}✓${C[reset]} Stopped."
+    mk_notify "Recording stopped" "Post-processing…"
 
     # Heal splintered speaker labels before titling/summary read the file:
     # clusters the diarize-server merged mid-session leave stale
@@ -1041,6 +1055,8 @@ cmd_stop() {
     fi
 
     rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+    local done_name=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
+    mk_notify "Meeting ready" "${${done_name:t}:r} — transcript and audio processed"
 
     if [[ -f "$MK_TRANSCRIPT" ]]; then
         local lines=$(wc -l < "$MK_TRANSCRIPT" | tr -d ' ')
