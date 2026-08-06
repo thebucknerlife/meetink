@@ -401,9 +401,13 @@ import AVFoundation
 // can't be a signal. We pick patterns that are more strongly
 // associated with an *active call*, even if not perfect.
 let kConferencingProcesses: [(label: String, patterns: [String])] = [
-    // Zoom: CptHost is spawned only during a call; the main app stays
-    // running but CptHost is a hard "in call" signal.
-    ("zoom",  ["CptHost", "zoom.us"]),
+    // Zoom: CptHost is spawned ONLY during a call — the one hard "in
+    // call" signal. The main zoom.us process must NOT be a pattern: it
+    // idles in the dock all day, and matching it started phantom
+    // recordings whenever Zoom launched ahead of a meeting (field case:
+    // 'a recording just started out of the blue', 6 min before the
+    // event, meeting-active already false again by inspection).
+    ("zoom",  ["CptHost"]),
     // Teams: MSTeams is the main process; we'd ideally distinguish
     // call-active from "Teams open in tray", but Teams doesn't make
     // that easy without private APIs. Accept the false-positive risk
