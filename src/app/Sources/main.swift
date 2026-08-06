@@ -1273,7 +1273,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// Never for the in-flight live recording.
     private func updatePlayerAvailability() {
         let base = (lastResolvedPath as NSString).deletingPathExtension
-        let candidate = base + ".m4a"
+        // Recordings archive .m4a; imports keep the SOURCE's extension —
+        // probe everything AVAudioPlayer handles ('no audio' on an import
+        // whose .mp3 sat right there was this list being one item long).
+        var candidate = base + ".m4a"
+        for ext in ["m4a", "mp3", "wav", "aiff", "aac", "caf", "mp4"] {
+            let p = base + "." + ext
+            if FileManager.default.fileExists(atPath: p) { candidate = p; break }
+        }
         let liveRecording = fixedPath == nil && recordingPID() != nil
         let available = !liveRecording && !lastResolvedPath.isEmpty
             && FileManager.default.fileExists(atPath: candidate)

@@ -199,6 +199,36 @@ postproc_kill() {
     rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
 }
 
+# Listening copy for an IMPORT: single stream, so no echo cancellation
+# is possible (nothing to use as a reference) — but DeepFilterNet
+# denoise/de-reverb applies fine, and loudness normalization helps the
+# quiet-recording case. Falls back to a plain normalized transcode when
+# the enhance venv isn't installed.
+#   $1 = source audio file  $2 = out.m4a
+_import_enhanced_m4a() {
+    local input="$1" out="$2"
+    local dfn="$MK_HOME/enhance-venv/bin/deepFilter"
+    local td=$(mktemp -d -t meetink-import-enh)
+    local rc=1
+    if enhance_enabled && [[ -x "$dfn" ]]; then
+        print -- "enhancing audio — DeepFilterNet (step 3/3)" > /tmp/meetink-postproc.state
+        if ffmpeg -v error -y -i "$input" -vn -ar 48000 -ac 1 "$td/in.wav" 2>>/tmp/meetink-refine.log && \
+           "$dfn" "$td/in.wav" -o "$td" >>/tmp/meetink-refine.log 2>&1 && \
+           [[ -f "$td/in_DeepFilterNet3.wav" ]] && \
+           ffmpeg -v error -y -i "$td/in_DeepFilterNet3.wav" -af loudnorm=I=-18 \
+               -c:a aac -b:a 128k "$out" 2>>/tmp/meetink-refine.log; then
+            rc=0
+        fi
+    fi
+    if (( rc != 0 )); then
+        ffmpeg -v error -y -i "$input" -vn -af loudnorm=I=-18 \
+            -c:a aac -b:a 128k "$out" 2>>/tmp/meetink-refine.log || rc=$?
+        [[ -f "$out" ]] && rc=0
+    fi
+    rm -rf "$td"
+    return $rc
+}
+
 # Install the DeepFilterNet venv (torch — a large download; opt-in).
 cmd_enhance_install() {
     local venv="$MK_HOME/enhance-venv"
@@ -460,11 +490,20 @@ cmd_refine() {
     [[ -f "$out.timing.json" ]] && mv "$out.timing.json" "${out%.txt}.timing.json"
     print -P "${C[green]}✓${C[reset]} Transcribed: ${C[bright_cyan]}${out/$HOME/~}${C[reset]} ${C[dim]}(${n} lines)${C[reset]}"
 
-    # Settings: keep audio → the source file moves in next to the transcript
-    # (a copy — the user's original stays where it was).
-    local ext="${input:e}"
-    if mk_config_bool keep_audio && [[ -n "$ext" ]]; then
-        cp "$input" "$sess_dir/$sess.$ext" 2>/dev/null || true
+    # Settings: keep audio → an enhanced, normalized .m4a (DeepFilterNet
+    # when installed) — uniform with recordings, so the player always
+    # finds it. The user's original stays where it was.
+    if mk_config_bool keep_audio; then
+        _import_enhanced_m4a "$input" "$sess_dir/$sess.m4a" && \
+            print -P "${C[green]}✓${C[reset]} Audio kept: ${C[dim]}${sess}.m4a (enhanced)${C[reset]}"
+    fi
+
+    # Same name inference a live meeting gets — the offline diarizer just
+    # handed this import's clusters to the sidecar, so confident names
+    # both rewrite the transcript AND enroll voices.
+    if typeset -f infer_speaker_names >/dev/null 2>&1; then
+        print -- "inferring speaker names (step 2/3)" > /tmp/meetink-postproc.state
+        infer_speaker_names "$out"
     fi
 
     # Point live.txt at the import so the app window shows it — but never
