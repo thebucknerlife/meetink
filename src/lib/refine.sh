@@ -185,6 +185,20 @@ _mix_enhanced_m4a() {
     return $rc
 }
 
+# Kill any in-flight post-processing (stop pipeline or reprocess): the
+# lock-holder shell, its python workers, and the narration files. Used by
+# discard and by the app's Delete — a deleted meeting must not keep a
+# multi-hour refine chewing on its corpse.
+postproc_kill() {
+    local holder=$(cat /tmp/meetink-refine.lock/pid 2>/dev/null)
+    [[ -n "$holder" ]] && kill -9 "$holder" 2>/dev/null || true
+    pkill -9 -f "src/refine/refine.py" 2>/dev/null || true
+    pkill -9 -f "src/refine/enhance.py" 2>/dev/null || true
+    pkill -9 -f "enhance-venv/bin/deepFilter" 2>/dev/null || true
+    rm -rf /tmp/meetink-refine.lock
+    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+}
+
 # Install the DeepFilterNet venv (torch — a large download; opt-in).
 cmd_enhance_install() {
     local venv="$MK_HOME/enhance-venv"

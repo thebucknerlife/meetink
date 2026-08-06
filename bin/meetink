@@ -321,6 +321,12 @@ cmd_app() {
     if [[ "$1" == "build" || ! -d "$app" ]]; then
         build_app
     fi
+    # LSMultipleInstancesProhibited makes `open` ACTIVATE a running
+    # instance instead of launching the rebuilt one — rebuilds silently
+    # stopped deploying (field case: "the new buttons aren't showing").
+    # Replace, don't activate.
+    pkill -f "Meetink.app/Contents/MacOS/meetink-app" 2>/dev/null || true
+    sleep 0.5
     open "$app"
     print -P "${C[green]}✓${C[reset]} Meetink.app launched ${C[dim]}(menu bar icon + transcript window)${C[reset]}"
 }
@@ -1063,7 +1069,9 @@ cmd_discard() {
     kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true
     rm -f "$PID_FILE"
     stop_whisper_server
-    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+    # A discard means "this meeting is garbage" — any post-processing
+    # already chewing on it dies too.
+    postproc_kill
     # Folder-style session: the whole directory (transcript + spools) goes.
     if [[ -n "$actual" && -f "$actual" ]]; then
         local dir="${actual:h}"
@@ -1230,6 +1238,7 @@ case "${1:-}" in
     simulate|sim)      shift 2>/dev/null; cmd_simulate "$@" ;;
     migrate)           cmd_migrate ;;
     discard)           cmd_discard ;;
+    postproc-kill)     postproc_kill; print -P "${C[green]}✓${C[reset]} Post-processing stopped." ;;
     reprocess)         shift 2>/dev/null; cmd_reprocess "$@" ;;
     watch-daemon)      # Headless watcher (spawned by Meetink.app; see watch.daemon_main)
                        MEETINK_HOME="$MK_HOME" PYTHONPATH="$MK_ROOT/src" \

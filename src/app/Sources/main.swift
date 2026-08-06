@@ -921,27 +921,31 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// 14-hour capture must die WITHOUT a trip through post-processing).
     @objc private func showActionsMenu() {
         let menu = NSMenu()
+        menu.autoenablesItems = false
+        func add(_ title: String, _ sel: Selector) {
+            let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            item.target = self
+            item.isEnabled = true
+            menu.addItem(item)
+        }
         let liveRecording = fixedPath == nil && recordingPID() != nil
         if liveRecording {
-            let discard = NSMenuItem(title: "Discard Recording…",
-                                     action: #selector(discardRecording), keyEquivalent: "")
-            discard.target = self
-            menu.addItem(discard)
-        } else if !lastResolvedPath.isEmpty, !snapshot.lines.isEmpty {
-            let link = NSMenuItem(title: "Link Event…",
-                                  action: #selector(linkEvent), keyEquivalent: "")
-            link.target = self
-            menu.addItem(link)
+            add("Discard Recording…", #selector(discardRecording))
+        } else if !lastResolvedPath.isEmpty {
+            // Even an empty/broken transcript can be linked or deleted —
+            // gating on content left the button silently dead.
+            add("Link Event…", #selector(linkEvent))
             menu.addItem(.separator())
-            let del = NSMenuItem(title: "Delete Meeting…",
-                                 action: #selector(deleteMeeting), keyEquivalent: "")
-            del.target = self
-            menu.addItem(del)
+            add("Delete Meeting…", #selector(deleteMeeting))
+        } else {
+            add("No transcript open", #selector(showActionsMenu))
+            menu.items.last?.isEnabled = false
         }
-        guard !menu.items.isEmpty else { return }
-        menu.popUp(positioning: nil,
-                   at: NSPoint(x: 0, y: menuButton.bounds.height + 4),
-                   in: menuButton)
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: menuButton)
+        } else {
+            menu.popUp(positioning: nil, at: .zero, in: menuButton)
+        }
     }
 
     @objc private func discardRecording() {
@@ -974,6 +978,16 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         alert.addButton(withTitle: "Move to Trash")
         guard alert.runModal() == .alertSecondButtonReturn else { return }
         stopPlayback()
+        // If a post-process/reprocess is chewing on THIS meeting, kill it —
+        // deleting the files under a running refine strands a multi-hour
+        // job writing into the Trash.
+        if postprocPath() == path, let launcher = launcherPath() {
+            let killer = Process()
+            killer.executableURL = URL(fileURLWithPath: launcher)
+            killer.arguments = ["postproc-kill"]
+            try? killer.run()
+            killer.waitUntilExit()
+        }
         let fm = FileManager.default
         let dir = (path as NSString).deletingLastPathComponent
         let base = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
