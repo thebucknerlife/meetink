@@ -2669,8 +2669,7 @@ final class PanelDividerView: NSView {
 final class SettingsViewController: NSViewController {
     private let keepSpoolsBox = NSButton(
         checkboxWithTitle: "Keep audio spools", target: nil, action: nil)
-    private let watchBox = NSButton(
-        checkboxWithTitle: "Auto-record meetings", target: nil, action: nil)
+    private let watchModePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let calendarsStack = NSStackView()
     private var calendarBoxes: [(box: NSButton, id: String)] = []
     private let keepAudioBox = NSButton(
@@ -2686,8 +2685,10 @@ final class SettingsViewController: NSViewController {
         keepAudioBox.action = #selector(toggled(_:))
         keepSpoolsBox.target = self
         keepSpoolsBox.action = #selector(toggled(_:))
-        watchBox.target = self
-        watchBox.action = #selector(toggled(_:))
+        watchModePopup.addItems(withTitles: [
+            "Disabled", "Notify only (ask before recording)", "Automatic"])
+        watchModePopup.target = self
+        watchModePopup.action = #selector(watchModeChanged)
 
         func caption(_ text: String) -> NSTextField {
             let f = NSTextField(wrappingLabelWithString: text)
@@ -2702,10 +2703,14 @@ final class SettingsViewController: NSViewController {
         let spoolsCaption = caption(
             "Keep the raw microphone and system-audio streams as two separate "
             + "wav files — replayable end-to-end with `meetink simulate`.")
+        let watchRow = NSStackView(views: [
+            NSTextField(labelWithString: "Meeting watch:"), watchModePopup])
+        watchRow.orientation = .horizontal
+        watchRow.spacing = 8
         let watchCaption = caption(
-            "Watch the calendar and running meeting apps; start recording "
-            + "automatically (1-minute warning for scheduled meetings). Runs "
-            + "whenever Meetink is running — no REPL needed.")
+            "Watches the calendar and running meeting apps whenever Meetink "
+            + "is running. Automatic starts recordings by itself; Notify only "
+            + "sends a notification with a Start button instead.")
         let calTitle = NSTextField(labelWithString: "Calendars")
         calTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         let calCaption = caption(
@@ -2721,7 +2726,7 @@ final class SettingsViewController: NSViewController {
 
         let stack = NSStackView(views: [
             title,
-            watchBox, watchCaption,
+            watchRow, watchCaption,
             keepAudioBox, audioCaption,
             keepSpoolsBox, spoolsCaption,
             calTitle, calCaption, calendarsStack,
@@ -2731,7 +2736,7 @@ final class SettingsViewController: NSViewController {
         stack.alignment = .leading
         stack.spacing = 8
         stack.setCustomSpacing(20, after: title)
-        stack.setCustomSpacing(2, after: watchBox)
+        stack.setCustomSpacing(2, after: watchRow)
         stack.setCustomSpacing(18, after: watchCaption)
         stack.setCustomSpacing(2, after: keepAudioBox)
         stack.setCustomSpacing(18, after: audioCaption)
@@ -2766,7 +2771,11 @@ final class SettingsViewController: NSViewController {
         super.viewWillAppear()
         keepAudioBox.state = configBool("keep_audio") ? .on : .off
         keepSpoolsBox.state = configBool("keep_spools") ? .on : .off
-        watchBox.state = configBool("watch_enabled") ? .on : .off
+        if !configBool("watch_enabled") {
+            watchModePopup.selectItem(at: 0)
+        } else {
+            watchModePopup.selectItem(at: (configValue("watch_mode") ?? "auto") == "notify" ? 1 : 2)
+        }
         loadCalendars()
     }
 
@@ -2821,9 +2830,21 @@ final class SettingsViewController: NSViewController {
     }
 
     @objc private func toggled(_ sender: NSButton) {
-        let key = sender == keepAudioBox ? "keep_audio"
-            : sender == keepSpoolsBox ? "keep_spools" : "watch_enabled"
+        let key = sender == keepAudioBox ? "keep_audio" : "keep_spools"
         configSetValue(key, sender.state == .on ? "true" : "false")
+    }
+
+    @objc private func watchModeChanged() {
+        switch watchModePopup.indexOfSelectedItem {
+        case 0:
+            configSetValue("watch_enabled", "false")
+        case 1:
+            configSetValue("watch_enabled", "true")
+            configSetValue("watch_mode", "notify")
+        default:
+            configSetValue("watch_enabled", "true")
+            configSetValue("watch_mode", "auto")
+        }
     }
 }
 

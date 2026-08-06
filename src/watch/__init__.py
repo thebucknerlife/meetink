@@ -153,6 +153,21 @@ class WatchedEvent:
         return s
 
 
+def _watch_mode() -> str:
+    """disabled | auto | notify — the Settings popup writes watch_mode
+    (and watch_enabled=false for disabled; the daemon isn't even running
+    then). 'notify' asks before recording instead of auto-starting."""
+    cfg = MK_HOME / "config"
+    try:
+        for line in cfg.read_text().splitlines():
+            if line.startswith("watch_mode="):
+                v = line.split("=", 1)[1].strip()
+                return v if v in ("auto", "notify") else "auto"
+    except OSError:
+        pass
+    return "auto"
+
+
 def _wlog(msg: str) -> None:
     """Timestamped decision log — lands in /tmp/meetink-watch.log via the
     app's pipe. Every start/stop/skip should say WHY, or field debugging
@@ -744,6 +759,38 @@ class WatchManager:
                 file=sys.stderr,
             )
 
+        if _watch_mode() == "notify":
+            # Ask instead of auto-starting. The worker blocks on the
+            # notification click; mark RECORDING optimistically only
+            # after the user says yes.
+            with self._lock:
+                chosen.status = EventStatus.EXPIRED  # don't re-fire the sweep
+            ev = chosen
+
+            def confirm_worker():
+                response = _agent_notify(
+                    title="Record this meeting?",
+                    body=ev.title,
+                    actions=["Start recording"],
+                    default="Start recording",
+                    timeout=600,
+                )
+                if "start" not in (response or "").lower():
+                    _wlog(f"notify mode: user did not start '{ev.title}'")
+                    return
+                if _start_recording_subprocess(env_extras):
+                    with self._lock:
+                        ev.status = EventStatus.RECORDING
+                        ev.recorded_at = _now()
+                        self._currently_recording = ev.id
+                        self._seen_active_this_recording = False
+                        self._inactive_streak = 0
+                        self._last_active_poll = time.time()
+                    _wlog(f"recording started for event '{ev.title}' (user-confirmed)")
+
+            threading.Thread(target=confirm_worker, daemon=True).start()
+            return
+
         ok = _start_recording_subprocess(env_extras)
         with self._lock:
             if ok:
@@ -796,10 +843,24 @@ class WatchManager:
         drops to FAST_END_POLL_S once we've seen the first inactive)."""
         with self._lock:
             if not self._seen_active_this_recording:
-                return   # never saw the meeting app — run to the event end
-            if self._inactive_streak < MEETING_END_QUIET_TICKS:
+                # Never saw the meeting app: activity-based ending can't
+                # apply (that's how real calls died at 43 s), so the
+                # backstop is the calendar — event end + 10 min grace.
+                # Seen-active meetings that RUN LONG never hit this:
+                # activity keeps them alive past the boundary, and the
+                # overlap logic defers the next event rather than
+                # stealing the recorder.
+                rid = self._currently_recording
+                ev = self._events.get(rid) if rid else None
+                if ev is None or (now - ev.end).total_seconds() < 600:
+                    return
+                recording_id = rid
+                _wlog(f"stopping '{ev.title}': never saw a meeting app and "
+                      f"the event ended 10+ min ago")
+            elif self._inactive_streak < MEETING_END_QUIET_TICKS:
                 return
-            recording_id = self._currently_recording
+            else:
+                recording_id = self._currently_recording
         _wlog(f"stopping recording ({recording_id or 'instant'}): meeting app "
               f"inactive for {MEETING_END_QUIET_TICKS} consecutive polls")
 
@@ -891,13 +952,27 @@ class WatchManager:
         body = f"Detected {source} call. Recording in 60 s — Skip to ignore."
 
         def worker() -> None:
-            response = _agent_notify(
-                title="meetink — instant meeting",
-                body=body,
-                actions=["Skip"],
-                default="Continue",
-                timeout=NOTIFY_TIMEOUT_S,
-            )
+            # Auto mode: records unless the user clicks Skip (opt-out).
+            # Notify mode: records only when the user clicks Start
+            # (opt-in) — same knob as scheduled meetings.
+            if _watch_mode() == "notify":
+                response = _agent_notify(
+                    title="Record this meeting?",
+                    body=body,
+                    actions=["Start recording"],
+                    default="Start recording",
+                    timeout=600,
+                )
+                if "start" not in (response or "").lower():
+                    response = "skip"
+            else:
+                response = _agent_notify(
+                    title="meetink — instant meeting",
+                    body=body,
+                    actions=["Skip"],
+                    default="Continue",
+                    timeout=NOTIFY_TIMEOUT_S,
+                )
             if response.strip().lower() == "skip":
                 with self._lock:
                     ev.status = EventStatus.SKIPPED
