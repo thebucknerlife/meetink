@@ -550,6 +550,21 @@ def offline_diarize_multi(streams: list[dict], port: int,
     # exact embeddings into a voice profile. Without this the offline
     # analysis was discarded and post-call assignment had nothing to enroll
     # from. Best-effort: an old sidecar without /session/load just 404s.
+    # COLLISION GUARD: the sidecar's session state belongs to the LIVE
+    # recording when one is running — replacing it mid-call from a
+    # concurrent reprocess/import would wipe the live Speaker-N clusters
+    # and scramble labels for the rest of the meeting. The live session's
+    # own stop pushes after its capture exits, so this only skips the
+    # genuinely-concurrent case.
+    try:
+        live_pid = int(Path("/tmp/meetink-capture.pid").read_text().strip())
+        os.kill(live_pid, 0)
+        log("a recording is live — NOT handing clusters to the sidecar "
+            "(post-call assignment for this transcript needs a reprocess)")
+        return out
+    except (OSError, ValueError):
+        pass
+
     payload = {"clusters": []}
     for g, lab in zip(groups, labels):
         sample_idx = g if len(g) <= 40 else             [g[int(k * (len(g) - 1) / 39)] for k in range(40)]
