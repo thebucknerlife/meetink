@@ -234,6 +234,162 @@ def parse_label_priors(txt_path: str) -> list[tuple[float, float, str]]:
     return spans
 
 
+PYANNOTE_VENV = os.environ.get(
+    "MEETINK_PYANNOTE_VENV",
+    os.path.expanduser("~/.meetink/pyannote-venv"))
+
+
+def pyannote_diarize_import(raw: bytes, segs: list[dict],
+                            port: int) -> list[dict] | None:
+    """Premium diarization for IMPORTS: pyannote 3.1 does the WHO-SPOKE-
+    WHEN (joint segmentation + clustering, overlap-aware — much stronger
+    than our sliding-window clustering on single-stream audio), then the
+    sidecar does the WHO-IS-IT: each pyannote cluster is embedded and
+    matched against enrolled profiles with the same gate ladder the rest
+    of the system uses, unnamed clusters become Speaker N, and the
+    clusters are handed to the sidecar so post-hoc assignment enrolls
+    real voice data. Returns labeled entries or None (caller falls back
+    to the built-in path). Disable with import_diarizer=builtin."""
+    import numpy as np
+
+    py = os.path.join(PYANNOTE_VENV, "bin", "python")
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "pyannote_diar.py")
+    if not (os.path.isfile(py) and os.path.isfile(helper)):
+        return None
+    cfg = os.path.expanduser("~/.meetink/config")
+    try:
+        for line in open(cfg):
+            if line.startswith("import_diarizer=") and \
+                    line.strip().split("=", 1)[1] == "builtin":
+                return None
+    except OSError:
+        pass
+
+    prof = _http_json(f"http://127.0.0.1:{port}/profiles/centroids")
+    if prof is None:
+        return None   # sidecar down — the fallback path handles that too
+
+    print("refine: status identifying speakers (pyannote)", flush=True)
+    with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tf:
+        tf.write(raw)
+        raw_path = tf.name
+    try:
+        proc = subprocess.run([py, helper, "--raw", raw_path],
+                              capture_output=True, text=True, timeout=3600)
+    finally:
+        os.unlink(raw_path)
+    if proc.returncode != 0:
+        log(f"pyannote failed (rc={proc.returncode}) — using built-in "
+            f"diarizer: {proc.stderr.strip()[-200:]}")
+        return None
+    # Relay its progress retroactively is pointless; parse the result.
+    try:
+        turns = json.loads(proc.stdout.strip().splitlines()[-1])["turns"]
+    except (ValueError, KeyError, IndexError):
+        log("pyannote produced no parsable turns — using built-in diarizer")
+        return None
+    if not turns:
+        return None
+    log(f"pyannote: {len(turns)} turns, "
+        f"{len(set(t[2] for t in turns))} speakers")
+
+    # Majority-overlap speaker per parakeet segment.
+    def seg_speaker(a: float, b: float) -> str | None:
+        votes: dict[str, float] = {}
+        for t0, t1, spk in turns:
+            ov = min(b, t1) - max(a, t0)
+            if ov > 0:
+                votes[spk] = votes.get(spk, 0.0) + ov
+        return max(votes, key=lambda k: votes[k]) if votes else None
+
+    # Name pyannote's clusters via the sidecar: embed a sample of each
+    # cluster's segments, average, and run the same profile gate ladder
+    # offline_diarize_multi uses.
+    threshold = float(prof.get("settings", {}).get("threshold", 0.65))
+    margin = float(prof.get("settings", {}).get("margin", 0.07))
+    single_floor = float(prof.get("settings", {}).get("single_profile_floor", 0.78))
+    profiles = {
+        name: np.asarray(cents, dtype=np.float32)
+        for name, cents in (prof.get("profiles") or {}).items()
+    }
+
+    by_spk: dict[str, list[dict]] = {}
+    for seg in segs:
+        spk = seg_speaker(seg["start"], seg["end"])
+        seg["_spk"] = spk
+        if spk:
+            by_spk.setdefault(spk, []).append(seg)
+
+    spk_embs: dict[str, list] = {}
+    for spk, spk_segs in by_spk.items():
+        sample = spk_segs if len(spk_segs) <= 12 else \
+            [spk_segs[int(k * (len(spk_segs) - 1) / 11)] for k in range(12)]
+        embs = []
+        for seg in sample:
+            a = int(seg["start"] * SAMPLE_RATE) * 2
+            b = min(len(raw), int(seg["end"] * SAMPLE_RATE) * 2)
+            resp = _http_json(f"http://127.0.0.1:{port}/embed",
+                              data=_wav_bytes(raw, a, b))
+            vec = (resp or {}).get("embedding")
+            if vec:
+                v = np.asarray(vec, dtype=np.float32)
+                embs.append(v / (np.linalg.norm(v) + 1e-9))
+        if embs:
+            spk_embs[spk] = embs
+
+    names: dict[str, str] = {}
+    speaker_n = 0
+    for spk in sorted(by_spk, key=lambda k: -len(by_spk[k])):
+        nm = None
+        embs = spk_embs.get(spk)
+        if embs:
+            c = np.mean(embs, axis=0)
+            c = c / (np.linalg.norm(c) + 1e-9)
+            best_name, best_sim, runner = None, -1.0, -1.0
+            for name, cent_rows in profiles.items():
+                sim = float(np.max(cent_rows @ c)) if len(cent_rows) else -1.0
+                if sim > best_sim:
+                    best_name, runner, best_sim = name, best_sim, sim
+                elif sim > runner:
+                    runner = sim
+            ok = best_name is not None and best_sim >= threshold
+            if ok and len(profiles) == 1:
+                ok = best_sim >= single_floor
+            elif ok:
+                ok = (best_sim - runner) >= margin
+            if ok:
+                nm = best_name.upper()
+        if nm is None:
+            speaker_n += 1
+            nm = f"Speaker {speaker_n}"
+        names[spk] = nm
+
+    # Hand the clusters to the sidecar (same contract as the built-in
+    # path) unless a live recording owns the session.
+    try:
+        live_pid = int(Path("/tmp/meetink-capture.pid").read_text().strip())
+        os.kill(live_pid, 0)
+        log("a recording is live — NOT handing clusters to the sidecar")
+    except (OSError, ValueError):
+        payload = {"clusters": [
+            {"label": names[spk], "embeddings": [e.tolist() for e in embs]}
+            for spk, embs in spk_embs.items()
+        ]}
+        resp = _http_json(f"http://127.0.0.1:{port}/session/load",
+                          data=json.dumps(payload).encode())
+        if resp and resp.get("ok"):
+            log(f"session clusters handed to sidecar ({len(spk_embs)})")
+
+    out = []
+    for seg in segs:
+        label = names.get(seg.pop("_spk", None) or "", "THEM")
+        out.append({**seg, "label": label, "origin": "import"})
+    log(f"pyannote diarize: {len(names)} voices "
+        f"({', '.join(sorted(set(names.values())))})")
+    return out
+
+
 def offline_diarize_multi(streams: list[dict], port: int,
                           me_label: str | None = None,
                           priors: list[tuple[float, float, str]] | None = None) -> list[dict] | None:
@@ -623,9 +779,12 @@ def main() -> int:
     if args.input:
         raw = decode_to_raw(args.input)
         segs = transcribe_sentences(model, raw, "import")
-        labeled = offline_diarize_multi(
-            [{"raw": raw, "segs": segs, "origin": "import"}],
-            args.diarize_port)
+        # Premium path first (pyannote), built-in clustering as fallback.
+        labeled = pyannote_diarize_import(raw, segs, args.diarize_port)
+        if labeled is None:
+            labeled = offline_diarize_multi(
+                [{"raw": raw, "segs": segs, "origin": "import"}],
+                args.diarize_port)
         if labeled is not None:
             for seg in labeled:
                 entries.append((seg["start"], seg["label"], seg["text"],

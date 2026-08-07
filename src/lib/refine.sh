@@ -249,6 +249,30 @@ cmd_enhance_install() {
     print -P "${C[green]}✓${C[reset]} DeepFilterNet installed — future recordings (and reprocess) use it automatically"
 }
 
+# Install the pyannote venv — the premium import diarizer. The pinned
+# set below is a MATRIX, not preferences: pyannote.audio 4.x requires
+# accepting a different gated model (community-1); 3.x needs the old
+# torchaudio API (< 2.3), which needs numpy 1.x, which needs scipy
+# < 1.12, and huggingface_hub >= 0.26 removed use_auth_token. Every pin
+# was field-derived; loosen at your peril.
+cmd_pyannote_install() {
+    local venv="$MK_HOME/pyannote-venv"
+    print -P "${C[bright_yellow]}▸${C[reset]} Installing pyannote ${C[dim]}(torch — a large download)...${C[reset]}"
+    if command -v uv >/dev/null 2>&1; then
+        uv venv "$venv" --python 3.12 && \
+        uv pip install --python "$venv/bin/python" \
+            'pyannote.audio<4' 'torch==2.2.2' 'torchaudio==2.2.2' \
+            'huggingface_hub==0.25.2' 'numpy<2' 'scipy==1.11.4' || return 1
+    else
+        python3 -m venv "$venv" && "$venv/bin/pip" install \
+            'pyannote.audio<4' 'torch==2.2.2' 'torchaudio==2.2.2' \
+            'huggingface_hub==0.25.2' 'numpy<2' 'scipy==1.11.4' || return 1
+    fi
+    print -P "${C[green]}✓${C[reset]} pyannote installed. Accept the gated models once (huggingface.co:"
+    print -P "  ${C[dim]}pyannote/speaker-diarization-3.1 and pyannote/segmentation-3.0), log in"
+    print -P "  via huggingface-cli, and imports use it automatically.${C[reset]}"
+}
+
 # Archive the just-stopped session's audio next to its transcript (i.e.
 # into the per-session folder). Two independent knobs from $MK_HOME/config:
 #   keep_audio  → <base>.m4a  — mic+sys mixed into one listenable file
