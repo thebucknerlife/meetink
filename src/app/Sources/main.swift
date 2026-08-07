@@ -1186,6 +1186,63 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
     // MARK: Click-to-name
 
+    /// Right-click menu on the transcript: structured segment editing.
+    /// Recordings only — a live transcript is being written by capture.
+    func textView(_ view: NSTextView, menu: NSMenu, for event: NSEvent,
+                  at charIndex: Int) -> NSMenu? {
+        let liveRecording = fixedPath == nil && recordingPID() != nil
+        guard !liveRecording, !lastResolvedPath.isEmpty,
+              let line = lineIndex(forChar: charIndex) else { return menu }
+        let edit = NSMenu()
+        func add(_ title: String, _ sel: Selector) {
+            let i = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            i.target = self
+            i.representedObject = ["line": line, "char": charIndex]
+            edit.addItem(i)
+        }
+        add("Edit Segment…", #selector(menuEditSegment(_:)))
+        add("Split Segment Here", #selector(menuSplitSegment(_:)))
+        add("Delete Segment…", #selector(menuDeleteSegment(_:)))
+        edit.addItem(.separator())
+        for item in menu.items where item.action == #selector(NSText.copy(_:)) {
+            edit.addItem(item.copy() as! NSMenuItem)
+        }
+        return edit
+    }
+
+    private func lineIndex(forChar charIndex: Int) -> Int? {
+        for (line, range) in lineRanges
+        where charIndex >= range.location && charIndex < range.location + range.length + 1 {
+            return line
+        }
+        return nil
+    }
+
+    @objc private func menuEditSegment(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? [String: Int],
+              let line = info["line"] else { return }
+        editSegment(line)
+    }
+
+    @objc private func menuSplitSegment(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? [String: Int],
+              let line = info["line"], let ch = info["char"],
+              let range = lineRanges[line] else { return }
+        splitSegment(line, atChar: ch - range.location)
+    }
+
+    @objc private func menuDeleteSegment(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? [String: Int],
+              let line = info["line"], line < snapshot.lines.count else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete this segment?"
+        alert.informativeText = String(snapshot.lines[line].text.prefix(120))
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Delete")
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        deleteSegment(line)
+    }
+
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
         if let url = link as? URL, url.scheme == "meetink-play",
            let idx = Int(url.host ?? ""), idx < lineOffsets.count {
@@ -1530,6 +1587,164 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard row >= 0, row < panelRows.count,
               case .speaker(let name, _, _) = panelRows[row] else { return }
         promptForName(label: name)
+    }
+
+    // MARK: Segment editing (recordings only)
+    //
+    // No freeform document editing — every mutation is structured and
+    // per-segment via the right-click menu: Edit… (bounded freeform inside
+    // one segment), Split Here (two segments, both keeping the speaker),
+    // Delete. The transcript file stays the source of truth: edits rewrite
+    // it in place (inode preserved, the watcher re-renders), timing.json
+    // is spliced in lockstep, and the first edit snapshots
+    // <base>.pre-edit.txt.
+
+    private func snapshotBeforeFirstEdit() {
+        let pre = (lastResolvedPath as NSString).deletingPathExtension + ".pre-edit.txt"
+        if !FileManager.default.fileExists(atPath: pre) {
+            try? FileManager.default.copyItem(atPath: lastResolvedPath, toPath: pre)
+        }
+    }
+
+    /// The transcript's raw lines plus the indices of its content lines
+    /// (the "[HH:MM:SS] SPEAKER: text" ones, in order — the same order
+    /// snapshot.lines and timing.json use).
+    private func readTranscriptLines() -> (all: [String], contentIdx: [Int])? {
+        guard let text = try? String(contentsOfFile: lastResolvedPath, encoding: .utf8)
+        else { return nil }
+        var all = text.components(separatedBy: "\n")
+        if all.last == "" { all.removeLast() }
+        var idx: [Int] = []
+        for (i, l) in all.enumerated() where l.range(
+            of: #"^\[\d{2}:\d{2}:\d{2}\] [^:]+: "#, options: .regularExpression) != nil {
+            idx.append(i)
+        }
+        return (all, idx)
+    }
+
+    private func writeTranscriptLines(_ all: [String]) {
+        // Non-atomic on purpose: an atomic write swaps the inode and
+        // orphans every watcher/tail on the old one.
+        try? (all.joined(separator: "\n") + "\n")
+            .write(toFile: lastResolvedPath, atomically: false, encoding: .utf8)
+        refreshIfChanged(force: true)
+    }
+
+    /// Splice timing.json's lines array alongside a transcript edit:
+    /// replace entry `line` with `entries` (empty = delete).
+    private func spliceTiming(line: Int, with entries: [[String: Any]]) {
+        let tPath = (lastResolvedPath as NSString).deletingPathExtension + ".timing.json"
+        guard let data = FileManager.default.contents(atPath: tPath),
+              var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var lines = obj["lines"] as? [[String: Any]],
+              line < lines.count,
+              lines.count == snapshot.lines.count else { return }   // misaligned: leave it
+        lines.replaceSubrange(line...line, with: entries)
+        obj["lines"] = lines
+        if let out = try? JSONSerialization.data(withJSONObject: obj) {
+            try? out.write(to: URL(fileURLWithPath: tPath))
+        }
+    }
+
+    private func editSegment(_ line: Int) {
+        guard line < snapshot.lines.count else { return }
+        let seg = snapshot.lines[line]
+        let alert = NSAlert()
+        alert.messageText = "Edit segment"
+        alert.informativeText = "\(seg.speaker) — \(seg.timestamp). Clear the text to delete the segment."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420, height: 84))
+        let tv = NSTextView(frame: scroll.bounds)
+        tv.string = seg.text
+        tv.font = NSFont.systemFont(ofSize: 13)
+        tv.isRichText = false
+        scroll.documentView = tv
+        scroll.hasVerticalScroller = true
+        alert.accessoryView = scroll
+        alert.window.initialFirstResponder = tv
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let newText = tv.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\n", with: " ")
+        applySegmentText(line, newText)
+    }
+
+    private func applySegmentText(_ line: Int, _ newText: String) {
+        guard var (all, idx) = readTranscriptLines(), line < idx.count else { return }
+        snapshotBeforeFirstEdit()
+        let seg = snapshot.lines[line]
+        if newText.isEmpty {
+            all.remove(at: idx[line])
+            spliceTiming(line: line, with: [])
+        } else {
+            all[idx[line]] = "[\(seg.timestamp)] \(seg.speaker): \(newText)"
+            // The line's word timings no longer match its text — keep the
+            // start offset, drop the words (highlight degrades to
+            // segment-level for this line only).
+            var entry: [String: Any] = ["label": seg.speaker, "words": []]
+            entry["t"] = line < lineOffsets.count ? lineOffsets[line] : 0
+            spliceTiming(line: line, with: [entry])
+        }
+        writeTranscriptLines(all)
+    }
+
+    private func deleteSegment(_ line: Int) {
+        applySegmentText(line, "")
+    }
+
+    private func splitSegment(_ line: Int, atChar offset: Int) {
+        guard var (all, idx) = readTranscriptLines(), line < idx.count,
+              line < snapshot.lines.count else { return }
+        let seg = snapshot.lines[line]
+        let text = seg.text as NSString
+        guard offset > 0, offset < text.length else { return }
+        // Snap the cut to the nearest word boundary.
+        var cut = offset
+        while cut < text.length,
+              !CharacterSet.whitespaces.contains(
+                Unicode.Scalar(text.character(at: cut)) ?? " ") { cut += 1 }
+        let first = text.substring(to: cut).trimmingCharacters(in: .whitespaces)
+        let second = text.substring(from: cut).trimmingCharacters(in: .whitespaces)
+        guard !first.isEmpty, !second.isEmpty else { return }
+        snapshotBeforeFirstEdit()
+
+        // Second half's timestamp: the timing entry's word whose text
+        // consumes `first`, else the first half's stamp.
+        var t2 = line < lineOffsets.count ? lineOffsets[line] : 0
+        var words1: [[String: Any]] = []
+        var words2: [[String: Any]] = []
+        let tPath = (lastResolvedPath as NSString).deletingPathExtension + ".timing.json"
+        if let data = FileManager.default.contents(atPath: tPath),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let tl = obj["lines"] as? [[String: Any]], line < tl.count,
+           let words = tl[line]["words"] as? [[String: Any]] {
+            var consumed = 0
+            for w in words {
+                let wlen = ((w["w"] as? String) ?? "").count + 1
+                if consumed < first.count {
+                    words1.append(w)
+                } else {
+                    if words2.isEmpty, let s0 = w["s"] as? Double { t2 = s0 }
+                    words2.append(w)
+                }
+                consumed += wlen
+            }
+        }
+        var stamp2 = seg.timestamp
+        if let started = snapshot.startedAt, t2 > 0 {
+            let df = DateFormatter()
+            df.dateFormat = "HH:mm:ss"
+            stamp2 = df.string(from: started.addingTimeInterval(t2))
+        }
+
+        all[idx[line]] = "[\(seg.timestamp)] \(seg.speaker): \(first)"
+        all.insert("[\(stamp2)] \(seg.speaker): \(second)", at: idx[line] + 1)
+        let t1 = line < lineOffsets.count ? lineOffsets[line] : 0
+        spliceTiming(line: line, with: [
+            ["t": t1, "label": seg.speaker, "words": words1],
+            ["t": t2, "label": seg.speaker, "words": words2],
+        ])
+        writeTranscriptLines(all)
     }
 
     /// Speaker whose sample should start playing once the player is ready
