@@ -768,11 +768,17 @@ class WatchManager:
             ev = chosen
 
             def confirm_worker():
+                # Both buttons; the TIMEOUT default is Skip — notify mode
+                # is opt-in, so an unanswered notification must NOT record
+                # (it previously auto-started after the 10-min wait).
+                # Persistence note: banner display time is the OS's call —
+                # Alerts style keeps it up; the buttons also remain
+                # clickable from Notification Center for the full window.
                 response = _agent_notify(
                     title="Record this meeting?",
                     body=ev.title,
-                    actions=["Start recording"],
-                    default="Start recording",
+                    actions=["Start recording", "Skip"],
+                    default="Skip",
                     timeout=600,
                 )
                 if "start" not in (response or "").lower():
@@ -959,8 +965,8 @@ class WatchManager:
                 response = _agent_notify(
                     title="Record this meeting?",
                     body=body,
-                    actions=["Start recording"],
-                    default="Start recording",
+                    actions=["Start recording", "Skip"],
+                    default="Skip",
                     timeout=600,
                 )
                 if "start" not in (response or "").lower():
