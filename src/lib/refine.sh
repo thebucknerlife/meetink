@@ -164,6 +164,7 @@ enhance_enabled() {
 #   $1 = mic.raw  $2 = sys.raw  $3 = out.m4a
 _mix_enhanced_m4a() {
     local mic="$1" sys="$2" out="$3"
+    local _mix_t0=$SECONDS
     local -a raw=(-f s16le -ar 16000 -ac 1)
     local ed=""
     if enhance_enabled && [[ -x "$MK_PARAKEET_VENV/bin/python" ]]; then
@@ -182,6 +183,8 @@ _mix_enhanced_m4a() {
         -filter_complex "[0:a]asplit=2[m1][m2];[1:a]asplit=2[s1][s2];[s1][m1]sidechaincompress=threshold=0.02:ratio=8:attack=10:release=400[sd];[m2][s2]sidechaincompress=threshold=0.02:ratio=8:attack=10:release=400[md];[md][sd]amix=inputs=2:duration=longest:normalize=0" \
         -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || rc=$?
     [[ -n "$ed" ]] && rm -rf "$ed"
+    print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0))" \
+        >> "$MK_HOME/perf.log" 2>/dev/null || true
     return $rc
 }
 

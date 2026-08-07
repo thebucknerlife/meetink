@@ -53,6 +53,32 @@ SAMPLE_RATE = 16000
 MODEL_ID = "mlx-community/parakeet-tdt-0.6b-v2"
 
 
+_PERF: dict[str, float] = {}
+_PERF_T0 = None
+
+
+def perf_mark(phase: str, t0: float) -> None:
+    import time as _t
+    _PERF[phase] = _PERF.get(phase, 0.0) + (_t.time() - t0)
+
+
+def perf_write(kind: str, name: str, audio_s: float) -> None:
+    """One line per run into ~/.meetink/perf.log — the longitudinal
+    record of what each phase costs, so 'is it getting faster?' has data
+    instead of vibes. Grep-able key=value format."""
+    import time as _t
+    total = _t.time() - _PERF_T0 if _PERF_T0 else 0
+    parts = [f"{k}_s={v:.1f}" for k, v in sorted(_PERF.items())]
+    line = (f"{_t.strftime('%Y-%m-%d %H:%M:%S')}  kind={kind} name={name} "
+            f"audio_s={audio_s:.0f} total_s={total:.1f} " + " ".join(parts))
+    try:
+        with open(os.path.expanduser("~/.meetink/perf.log"), "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    log(f"perf: {line.split('  ', 1)[1]}")
+
+
 def log(msg: str) -> None:
     print(f"refine: {msg}", file=sys.stderr)
 
@@ -867,9 +893,14 @@ def main() -> int:
     if not args.input and not (args.mic or args.sys_):
         ap.error("need --input or at least one of --mic/--sys")
 
+    import time as _time
+    global _PERF_T0
+    _PERF_T0 = _time.time()
     log(f"loading {MODEL_ID}")
+    _t0 = _time.time()
     from parakeet_mlx import from_pretrained
     model = from_pretrained(MODEL_ID)
+    perf_mark("load", _t0)
 
     # (start_s, label, text, origin, tokens) — origin drives echo
     # suppression; tokens (parakeet word timestamps, may be None) feed the
@@ -891,15 +922,21 @@ def main() -> int:
                 print(f"refine: progress diarize {int(100 * (i + 1) / n)}",
                       flush=True)
 
+    audio_s = 0.0
     if args.input:
         raw = decode_to_raw(args.input)
+        audio_s = len(raw) / 2 / SAMPLE_RATE
+        _t0 = _time.time()
         segs = transcribe_sentences(model, raw, "import")
+        perf_mark("transcribe", _t0)
         # Premium path first (pyannote), built-in clustering as fallback.
+        _t0 = _time.time()
         labeled = pyannote_diarize_import(raw, segs, args.diarize_port)
         if labeled is None:
             labeled = offline_diarize_multi(
                 [{"raw": raw, "segs": segs, "origin": "import"}],
                 args.diarize_port)
+        perf_mark("diarize", _t0)
         if labeled is not None:
             for seg in labeled:
                 entries.append((seg["start"], seg["label"], seg["text"],
@@ -908,21 +945,27 @@ def main() -> int:
             diarize_all(raw, segs, "import")
     else:
         streams: list[dict] = []
+        _t0 = _time.time()
         if args.mic and Path(args.mic).exists():
             mic_raw = Path(args.mic).read_bytes()
+            audio_s = max(audio_s, len(mic_raw) / 2 / SAMPLE_RATE)
             streams.append({"raw": mic_raw, "origin": "mic",
                             "segs": transcribe_sentences(model, mic_raw, "mic")})
         if args.sys_ and Path(args.sys_).exists():
             sys_raw = Path(args.sys_).read_bytes()
+            audio_s = max(audio_s, len(sys_raw) / 2 / SAMPLE_RATE)
             streams.append({"raw": sys_raw, "origin": "sys",
                             "segs": transcribe_sentences(model, sys_raw, "sys")})
+        perf_mark("transcribe", _t0)
         # Joint diarization across BOTH streams: the mic is no longer
         # assumed to be only the user — in-person guests, speakerphone
         # calls and hybrid meetings all label correctly, anchored by the
         # user's enrolled profile (or the dominant mic voice as fallback).
+        _t0 = _time.time()
         labeled = offline_diarize_multi(
             streams, args.diarize_port, me_label=args.me,
             priors=parse_label_priors(args.prior) if args.prior else None)
+        perf_mark("diarize", _t0)
         if labeled is not None:
             for seg in labeled:
                 entries.append((seg["start"], seg["label"], seg["text"],
@@ -1090,6 +1133,8 @@ def main() -> int:
     Path(args.out + ".timing.json").write_text(
         json.dumps({"lines": timing_lines}))
     log(f"wrote {len(entries)} lines -> {args.out}")
+    perf_write("import" if args.input else "session",
+               Path(args.out).stem, audio_s)
     return 0
 
 
