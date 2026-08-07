@@ -169,7 +169,7 @@ def cancel_direction(ref: np.ndarray, sig: np.ndarray,
 
 
 def residual_echo_gate(mic: np.ndarray, sys_: np.ndarray, delay: int,
-                       floor: float = 0.12) -> np.ndarray:
+                       floor: float = 0.12) -> tuple[np.ndarray, np.ndarray | None]:
     """Post-AEC safety net for the user's remote echo.
 
     The linear filter assumes a fixed echo path, but conferencing echo
@@ -185,7 +185,7 @@ def residual_echo_gate(mic: np.ndarray, sys_: np.ndarray, delay: int,
     n = len(sys_)
     nb = n // B
     if nb < 4:
-        return sys_
+        return sys_, None
     mic = mic[:n]
     if len(mic) < n:
         mic = np.pad(mic, (0, n - len(mic)))
@@ -240,6 +240,32 @@ def residual_echo_gate(mic: np.ndarray, sys_: np.ndarray, delay: int,
     if ducked:
         log(f"sys: residual echo gate ducked {ducked * B / RATE:.0f}s "
             f"of {nb * B / RATE:.0f}s")
+    # The per-block gain curve travels to the archive-rate stream too —
+    # it's the transferable part of the echo work (see apply_block_gains).
+    return out, gains
+
+
+def apply_block_gains(x: np.ndarray, gains: np.ndarray,
+                      analysis_len: int) -> np.ndarray:
+    """Apply a 16 kHz-analysis gain curve to a stream at another rate.
+
+    Time-proportional mapping: gain block k covers the same fraction of
+    the archive stream as it did of the analysis stream (both spool pairs
+    are driven by the same callbacks, so their timelines are proportional
+    even if the sample-count ratio isn't exactly 3). Block-sliced in
+    place — np.repeat at 48 kHz would allocate the full stream again."""
+    if gains is None or not analysis_len:
+        return x
+    B = RATE // 20
+    out = x.copy()
+    n = len(out)
+    for k, g in enumerate(gains):
+        if g >= 0.999:
+            continue
+        a = int(k * B * n / analysis_len)
+        b = int((k + 1) * B * n / analysis_len)
+        if a < b:
+            out[a:b] *= g
     return out
 
 
@@ -249,8 +275,15 @@ def deepfilter_available() -> bool:
     return os.path.isfile(os.path.join(ENHANCE_VENV, "bin", "deepFilter"))
 
 
-def deepfilter(x: np.ndarray, name: str) -> np.ndarray:
-    """Run one stream through DeepFilterNet3 via its CLI (own venv)."""
+def deepfilter(x: np.ndarray, name: str, rate: int = RATE) -> np.ndarray:
+    """Run one stream through DeepFilterNet3 via its CLI (own venv).
+
+    DFN3 is natively a 48 kHz model. Feed it 48 kHz and its output comes
+    back at 48 kHz untouched; feed it 16 kHz and it resamples internally
+    AND we have to decimate its output back down — the nearest-neighbor
+    decimation below is unfiltered and contributed audible aliasing (part
+    of the 'tinny/sharp' field report). The archive path avoids it
+    entirely by staying at 48 kHz."""
     import wave
 
     progress(f"DeepFilterNet {name} — takes a while on long meetings")
@@ -259,7 +292,7 @@ def deepfilter(x: np.ndarray, name: str) -> np.ndarray:
         with wave.open(src, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
-            w.setframerate(RATE)
+            w.setframerate(rate)
             w.writeframes((np.clip(x, -1, 1) * 32767).astype(np.int16).tobytes())
         rc = subprocess.run(
             [os.path.join(ENHANCE_VENV, "bin", "deepFilter"), src, "-o", td],
@@ -272,10 +305,10 @@ def deepfilter(x: np.ndarray, name: str) -> np.ndarray:
             frames = w.readframes(w.getnframes())
             sr = w.getframerate()
         y = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-        if sr != RATE:   # DFN outputs 48 kHz — bring it back to the spool rate
-            idx = (np.arange(int(len(y) * RATE / sr)) * (sr / RATE)).astype(np.int64)
+        if sr != rate:   # rate mismatch — bring it back to the stream rate
+            idx = (np.arange(int(len(y) * rate / sr)) * (sr / rate)).astype(np.int64)
             y = y[np.minimum(idx, len(y) - 1)]
-        log(f"{name}: DeepFilterNet applied")
+        log(f"{name}: DeepFilterNet applied ({rate // 1000} kHz)")
         return y
 
 
@@ -285,6 +318,8 @@ def main() -> int:
     ap.add_argument("--sys", dest="sys_", required=True)
     ap.add_argument("--out-mic", required=True)
     ap.add_argument("--out-sys", required=True)
+    ap.add_argument("--mic48", help="48 kHz archive spool for the mic stream")
+    ap.add_argument("--sys48", help="48 kHz archive spool for the sys stream")
     ap.add_argument("--no-deepfilter", action="store_true")
     ap.add_argument("--progress-state",
                     help="file to narrate progress into (app status bar)")
@@ -298,19 +333,43 @@ def main() -> int:
         log("a stream is empty — nothing to enhance")
         return 1
 
+    # 48 kHz archive pair (optional). ALL analysis stays at 16 kHz — the
+    # FDAF subtraction is sample-level and can't transfer across rates
+    # (measured effect ~0: rms barely moves, and it self-disables on
+    # divergence), but the residual echo gate is a per-block gain curve
+    # that maps onto the archive streams by time. The outputs then ARE
+    # the 48 kHz streams, so DFN runs at its native rate and the mix
+    # keeps full bandwidth.
+    mic48 = load_raw(args.mic48) if args.mic48 else None
+    sys48 = load_raw(args.sys48) if args.sys48 else None
+    archive = (mic48 is not None and sys48 is not None
+               and len(mic48) > RATE * 3 and len(sys48) > RATE * 3)
+    if archive:
+        log("archive: 48 kHz streams present — output stays full bandwidth")
+
     # The user's remote echo inside sys (mic is the reference), then
     # speaker/headphone bleed inside mic (sys is the reference).
     clean_sys, sys_delay = cancel_direction(mic, sys_, "sys")
     clean_mic, _ = cancel_direction(sys_, mic, "mic")
+    gate_gains = None
     if sys_delay >= 0:
-        clean_sys = residual_echo_gate(mic, clean_sys, sys_delay)
+        clean_sys, gate_gains = residual_echo_gate(mic, clean_sys, sys_delay)
+
+    if archive:
+        out_sys = apply_block_gains(sys48, gate_gains, len(sys_))
+        out_mic = mic48
+        out_rate = 48000
+    else:
+        out_sys = clean_sys
+        out_mic = clean_mic
+        out_rate = RATE
 
     if not args.no_deepfilter and deepfilter_available():
-        clean_sys = deepfilter(clean_sys, "sys")
-        clean_mic = deepfilter(clean_mic, "mic")
+        out_sys = deepfilter(out_sys, "sys", out_rate)
+        out_mic = deepfilter(out_mic, "mic", out_rate)
 
-    save_raw(clean_mic, args.out_mic)
-    save_raw(clean_sys, args.out_sys)
+    save_raw(out_mic, args.out_mic)
+    save_raw(out_sys, args.out_sys)
     return 0
 
 

@@ -44,6 +44,17 @@ let meName: String = {
 // step deletes the spools on success.
 let spoolDir = ProcessInfo.processInfo.environment["MEETINK_SPOOL_DIR"]
 
+// Archive-rate spooling (MEETINK_SPOOL48=on, launcher sets it from the
+// keep_audio config). The transcription pipeline stays 16 kHz end to end,
+// but a 16 kHz archive caps playback at 8 kHz bandwidth — remote voices
+// sound like AM radio no matter what post-processing does. When enabled,
+// ScreenCaptureKit runs at 48 kHz (downsampled in-process for whisper)
+// and a second spool pair keeps the full-bandwidth streams for the
+// listenable m4a. ~345 MB/hour/stream, deleted with the 16 kHz spools.
+let archiveRate: Double = 48000
+let spool48Enabled = spoolDir != nil
+    && (ProcessInfo.processInfo.environment["MEETINK_SPOOL48"] ?? "off") == "on"
+
 func int16Data(_ samples: [Float]) -> Data {
     var data = Data(capacity: samples.count * 2)
     for sample in samples {
@@ -855,12 +866,39 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
 
 // MARK: - Stream Delegate
 
+/// Linear-interpolation resampler — the fallback when AVAudioConverter
+/// can't be built. No anti-alias filter, so only for edge cases; the
+/// converter path is the quality path.
+func resampleLinear(_ samples: [Float], from inputRate: Double,
+                    to outputRate: Double) -> [Float] {
+    let ratio = outputRate / inputRate
+    let outCount = Int(Double(samples.count) * ratio)
+    return (0..<outCount).map { i -> Float in
+        let srcIdx = Double(i) / ratio
+        let idx = Int(srcIdx)
+        let frac = Float(srcIdx - Double(idx))
+        if idx + 1 < samples.count {
+            return samples[idx] * (1 - frac) + samples[idx + 1] * frac
+        }
+        return idx < samples.count ? samples[idx] : 0
+    }
+}
+
 class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
     let buffer: AudioBuffer
     let targetFormat: AVAudioFormat
+    /// 48 kHz sys archive spool; nil when archive spooling is off.
+    let archiveSpool: SpoolWriter?
+    // Persistent downsampler for the whisper path when SCK runs at the
+    // archive rate. One instance across callbacks — AVAudioConverter
+    // carries filter state internally, so the stream stays continuous
+    // (rebuilding it per buffer would click at every boundary).
+    private var downConverter: AVAudioConverter?
+    private var downConverterRate: Double = 0
 
-    init(buffer: AudioBuffer) {
+    init(buffer: AudioBuffer, archiveSpool: SpoolWriter? = nil) {
         self.buffer = buffer
+        self.archiveSpool = archiveSpool
         self.targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
         super.init()
     }
@@ -905,22 +943,59 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
             monoSamples = float32Samples
         }
 
-        if abs(inputRate - sampleRate) > 1.0 {
-            let ratio = sampleRate / inputRate
-            let outCount = Int(Double(monoSamples.count) * ratio)
-            let resampled = (0..<outCount).map { i -> Float in
-                let srcIdx = Double(i) / ratio
-                let idx = Int(srcIdx)
-                let frac = Float(srcIdx - Double(idx))
-                if idx + 1 < monoSamples.count {
-                    return monoSamples[idx] * (1 - frac) + monoSamples[idx + 1] * frac
-                }
-                return idx < monoSamples.count ? monoSamples[idx] : 0
+        // Full-bandwidth archive copy first, straight from the stream.
+        if let archiveSpool {
+            if abs(inputRate - archiveRate) <= 1.0 {
+                archiveSpool.append(monoSamples)
+            } else {
+                archiveSpool.append(resampleLinear(
+                    monoSamples, from: inputRate, to: archiveRate))
             }
-            buffer.appendSystem(resampled)
-        } else {
-            buffer.appendSystem(monoSamples)
         }
+
+        // Whisper path: 16 kHz. When SCK delivers 16 kHz directly (archive
+        // spooling off) this is a straight append, exactly as before.
+        if abs(inputRate - sampleRate) <= 1.0 {
+            buffer.appendSystem(monoSamples)
+            return
+        }
+        // Downsample with AVAudioConverter (filtered, stateful) — linear
+        // interpolation without a low-pass would alias >8 kHz content
+        // into the speech band and degrade transcription.
+        if downConverter == nil || downConverterRate != inputRate {
+            if let inFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                         sampleRate: inputRate, channels: 1,
+                                         interleaved: false) {
+                downConverter = AVAudioConverter(from: inFmt, to: targetFormat)
+                downConverterRate = inputRate
+            }
+        }
+        if let converter = downConverter,
+           let inBuffer = AVAudioPCMBuffer(pcmFormat: converter.inputFormat,
+                                           frameCapacity: AVAudioFrameCount(monoSamples.count)) {
+            inBuffer.frameLength = AVAudioFrameCount(monoSamples.count)
+            monoSamples.withUnsafeBufferPointer { src in
+                inBuffer.floatChannelData![0].update(from: src.baseAddress!,
+                                                     count: monoSamples.count)
+            }
+            let ratio = sampleRate / inputRate
+            let outputFrameCount = AVAudioFrameCount(Double(monoSamples.count) * ratio)
+            if let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat,
+                                                frameCapacity: outputFrameCount) {
+                let status = converter.convert(to: outBuffer, error: nil) { _, outStatus in
+                    outStatus.pointee = .haveData
+                    return inBuffer
+                }
+                if status == .haveData, let floatData = outBuffer.floatChannelData {
+                    buffer.appendSystem(Array(UnsafeBufferPointer(
+                        start: floatData[0], count: Int(outBuffer.frameLength))))
+                    return
+                }
+            }
+        }
+        // Converter unavailable — old linear-interp fallback.
+        buffer.appendSystem(resampleLinear(monoSamples, from: inputRate,
+                                           to: sampleRate))
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
@@ -1106,6 +1181,30 @@ struct LocalSpeechCapture {
         // deallocated at the closing brace and SCK kept "capturing" into a
         // dead object: startCapture() succeeds, zero errors, zero samples,
         // 0-byte sys spool (field-debugged mid-Zoom-call 2026-08-04).
+        // --- Spool writers (no-ops when MEETINK_SPOOL_DIR is unset) ---
+        // Created before the capture sources: the SCK delegate and mic tap
+        // write the 48 kHz archive spools directly from their callbacks
+        // (the 16 kHz pair still flows through the chunk loop below, so
+        // sim mode spools exactly as before — sim feeds AudioBuffer and
+        // never touches the archive writers, whose files stay empty and
+        // are ignored by the mix's size guard).
+        var spoolSys = SpoolWriter(path: nil)
+        var spoolMic = SpoolWriter(path: nil)
+        var spool48Sys = SpoolWriter(path: nil)
+        var spool48Mic = SpoolWriter(path: nil)
+        if let dir = spoolDir {
+            try? FileManager.default.createDirectory(
+                atPath: dir, withIntermediateDirectories: true)
+            spoolSys = SpoolWriter(path: "\(dir)/session-sys.raw")
+            spoolMic = SpoolWriter(path: "\(dir)/session-mic.raw")
+            if spool48Enabled {
+                spool48Sys = SpoolWriter(path: "\(dir)/session-sys.48k.raw")
+                spool48Mic = SpoolWriter(path: "\(dir)/session-mic.48k.raw")
+            }
+            fputs("Spooling session audio to \(dir) (for post-meeting refine"
+                  + (spool48Enabled ? " + 48 kHz archive" : "") + ")\n", stderr)
+        }
+
         var scStream: SCStream? = nil
         var scDelegate: CaptureDelegate? = nil
         if !simMode {
@@ -1129,14 +1228,18 @@ struct LocalSpeechCapture {
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
-        config.sampleRate = Int(sampleRate)
+        // Archive spooling wants the full-bandwidth stream; the delegate
+        // downsamples to 16 kHz for whisper. With archiving off SCK
+        // delivers 16 kHz directly — byte-identical to the old behavior.
+        config.sampleRate = spool48Enabled ? Int(archiveRate) : Int(sampleRate)
         config.channelCount = 1
         config.width = 2
         config.height = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-        let delegate = CaptureDelegate(buffer: audioBuffer)
+        let delegate = CaptureDelegate(buffer: audioBuffer,
+                                       archiveSpool: spool48Enabled ? spool48Sys : nil)
 
         let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
         try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: DispatchQueue(label: "system-audio"))
@@ -1242,6 +1345,15 @@ struct LocalSpeechCapture {
             // actual format for the same reason.
             var converter: AVAudioConverter? = nil
             var converterInputFormat: AVAudioFormat? = nil
+            // Second lazy converter for the 48 kHz archive spool — same
+            // per-buffer-format rebuild rule as above (AirPods flip rates
+            // mid-call), independent instance so each conversion keeps its
+            // own filter state.
+            var converter48: AVAudioConverter? = nil
+            var converter48InputFormat: AVAudioFormat? = nil
+            let archiveFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                              sampleRate: archiveRate,
+                                              channels: 1, interleaved: false)!
             inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { inBuffer, _ in
                 let inFormat = inBuffer.format
                 guard inFormat.sampleRate > 0 else { return }
@@ -1261,6 +1373,24 @@ struct LocalSpeechCapture {
                     let samples = Array(UnsafeBufferPointer(start: floatData[0], count: Int(outBuffer.frameLength)))
                     audioBuffer.appendMic(samples)
                     updateMicHeartbeat()
+                }
+                if spool48Enabled {
+                    if converter48InputFormat != inFormat {
+                        converter48 = AVAudioConverter(from: inFormat, to: archiveFormat)
+                        converter48InputFormat = inFormat
+                    }
+                    guard let converter48 = converter48 else { return }
+                    let ratio48 = archiveRate / inFormat.sampleRate
+                    let outCount48 = AVAudioFrameCount(Double(inBuffer.frameLength) * ratio48)
+                    guard let out48 = AVAudioPCMBuffer(pcmFormat: archiveFormat, frameCapacity: outCount48) else { return }
+                    let status48 = converter48.convert(to: out48, error: nil) { _, outStatus in
+                        outStatus.pointee = .haveData
+                        return inBuffer
+                    }
+                    if status48 == .haveData, let fd = out48.floatChannelData {
+                        spool48Mic.append(Array(UnsafeBufferPointer(
+                            start: fd[0], count: Int(out48.frameLength))))
+                    }
                 }
             }
             try engine.start()
@@ -1370,17 +1500,6 @@ struct LocalSpeechCapture {
         }
         sigintSource.resume()
 
-        // --- Spool writers (no-ops when MEETINK_SPOOL_DIR is unset) ---
-        var spoolSys = SpoolWriter(path: nil)
-        var spoolMic = SpoolWriter(path: nil)
-        if let dir = spoolDir {
-            try? FileManager.default.createDirectory(
-                atPath: dir, withIntermediateDirectories: true)
-            spoolSys = SpoolWriter(path: "\(dir)/session-sys.raw")
-            spoolMic = SpoolWriter(path: "\(dir)/session-mic.raw")
-            fputs("Spooling session audio to \(dir) (for post-meeting refine)\n", stderr)
-        }
-
         // --- Chunk processing loop ---
         while running {
             try await Task.sleep(nanoseconds: 1_000_000_000)
@@ -1440,6 +1559,8 @@ struct LocalSpeechCapture {
         if let m = remaining.mic { spoolMic.append(m) }
         spoolSys.close()
         spoolMic.close()
+        spool48Sys.close()
+        spool48Mic.close()
         let idx = audioBuffer.chunkIndex
         if let sysSamples = remaining.system, hasAudio(sysSamples) {
             let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_final_them.wav")

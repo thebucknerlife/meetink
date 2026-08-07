@@ -946,11 +946,17 @@ cmd_start() {
         spool_env="$session_dir"
     fi
 
+    # 48 kHz archive spooling only matters when the mixed m4a will be
+    # kept — it costs ~690 MB/hour of (deleted-at-stop) disk while live.
+    local spool48=off
+    mk_config_bool keep_audio && spool48=on
+
     MEETINK_MODEL="$MK_MODEL" \
     MEETINK_TRANSCRIPT="$session_file" \
     MEETINK_PROMPT="$MK_PROMPT" \
     MEETINK_ME_NAME="$(me_name_get)" \
     MEETINK_SPOOL_DIR="$spool_env" \
+    MEETINK_SPOOL48="$spool48" \
         "$binary" 2>/tmp/meetink-capture.log &
     echo $! > "$PID_FILE"
     disown 2>/dev/null || true

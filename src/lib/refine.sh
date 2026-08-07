@@ -66,7 +66,8 @@ refine_enabled() {
 # Clear stale spools before a new session so a crash's leftovers can't get
 # stitched onto the wrong meeting. Called from cmd_start.
 refine_clear_spool() {
-    rm -f "$MK_SPOOL_DIR"/session-sys.raw "$MK_SPOOL_DIR"/session-mic.raw
+    rm -f "$MK_SPOOL_DIR"/session-sys.raw "$MK_SPOOL_DIR"/session-mic.raw \
+          "$MK_SPOOL_DIR"/session-sys.48k.raw "$MK_SPOOL_DIR"/session-mic.48k.raw
 }
 
 # Refine the just-stopped session in place. Called from cmd_stop after label
@@ -138,7 +139,7 @@ refine_session() {
         # Playback timing sidecar — lands as <base>.timing.json so titling
         # renames it with the transcript (same-basename rule).
         [[ -f "$tmp.timing.json" ]] && mv "$tmp.timing.json" "${actual%.txt}.timing.json"
-        rm -f "$tmp" "$mic" "$sys"
+        rm -f "$tmp" "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw"
         local n=$(grep -cE '^\[[0-9:]{8}\]' "$actual" 2>/dev/null)
         # NOTE: no nested ${${...}text:t} tricks here — that exact form is a
         # runtime "bad substitution" in zsh, and under set -e it killed
@@ -169,8 +170,19 @@ enhance_enabled() {
 _mix_enhanced_m4a() {
     local mic="$1" sys="$2" out="$3"
     local _mix_t0=$SECONDS
-    local -a raw=(-f s16le -ar 16000 -ac 1)
     local ed=""
+    # 48 kHz archive spools (capture writes them when keep_audio is on):
+    # when the sibling pair exists with real content, the mix runs at
+    # 48 kHz — a 16 kHz m4a caps playback at 8 kHz bandwidth ("tinny"
+    # field report). Sub-second files are sim-mode leftovers; skip them.
+    local mic48="${mic%.raw}.48k.raw" sys48="${sys%.raw}.48k.raw"
+    local ar=16000
+    local have48=0
+    if [[ -s "$mic48" && -s "$sys48" ]] \
+        && (( $(stat -f%z "$mic48" 2>/dev/null || echo 0) > 96000 )) \
+        && (( $(stat -f%z "$sys48" 2>/dev/null || echo 0) > 96000 )); then
+        have48=1
+    fi
     if enhance_enabled && [[ -x "$MK_PARAKEET_VENV/bin/python" ]]; then
         ed=$(mktemp -d -t meetink-enhance)
         # live_deepfilter=off keeps the echo-cancel but skips DFN on live
@@ -179,16 +191,27 @@ _mix_enhanced_m4a() {
         local -a dfnflag=()
         [[ "$(grep '^live_deepfilter=' "$MK_CONFIG_FILE" 2>/dev/null | cut -d= -f2-)" == "off" ]] \
             && dfnflag=(--no-deepfilter)
+        local -a arch=()
+        (( have48 )) && arch=(--mic48 "$mic48" --sys48 "$sys48")
         if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/enhance.py" \
                 --mic "$mic" --sys "$sys" \
                 --out-mic "$ed/mic.raw" --out-sys "$ed/sys.raw" \
                 --progress-state /tmp/meetink-postproc.state \
-                "${dfnflag[@]}" \
+                "${arch[@]}" "${dfnflag[@]}" \
                 2>>/tmp/meetink-refine.log; then
             mic="$ed/mic.raw"
             sys="$ed/sys.raw"
+            # enhance.py emits 48 kHz outputs when it got the 48 kHz pair
+            (( have48 )) && ar=48000
+        elif (( have48 )); then
+            # enhance failed — still mix the raw archive streams rather
+            # than falling back to the band-limited pair.
+            mic="$mic48"; sys="$sys48"; ar=48000
         fi
+    elif (( have48 )); then
+        mic="$mic48"; sys="$sys48"; ar=48000
     fi
+    local -a raw=(-f s16le -ar $ar -ac 1)
     local rc=0
     ffmpeg -v error -y "${raw[@]}" -i "$mic" "${raw[@]}" -i "$sys" \
         -filter_complex "[0:a]asplit=2[m1][m2];[1:a]asplit=2[s1][s2];[s1][m1]sidechaincompress=threshold=0.02:ratio=8:attack=10:release=400[sd];[m2][s2]sidechaincompress=threshold=0.02:ratio=8:attack=10:release=400[md];[md][sd]amix=inputs=2:duration=longest:normalize=0" \
@@ -336,7 +359,13 @@ audio_archive_session() {
         else
             local only="$mic"
             [[ -s "$sys" ]] && only="$sys"
-            ffmpeg -v error -y "${raw[@]}" -i "$only" \
+            local -a onlyraw=("${raw[@]}")
+            if [[ -s "${only%.raw}.48k.raw" ]] \
+                && (( $(stat -f%z "${only%.raw}.48k.raw" 2>/dev/null || echo 0) > 96000 )); then
+                only="${only%.raw}.48k.raw"
+                onlyraw=(-f s16le -ar 48000 -ac 1)
+            fi
+            ffmpeg -v error -y "${onlyraw[@]}" -i "$only" \
                 -c:a aac -b:a 96k "${base}.m4a" 2>>/tmp/meetink-refine.log || rc=$?
         fi
         if (( rc == 0 )); then
@@ -346,18 +375,31 @@ audio_archive_session() {
         fi
     fi
     if (( keep_spools )); then
-        local kept=""
-        if [[ -s "$mic" ]] && ffmpeg -v error -y "${raw[@]}" -i "$mic" "${base}.mic.wav" 2>>/tmp/meetink-refine.log; then
-            kept="${base:t}.mic.wav"
-        fi
-        if [[ -s "$sys" ]] && ffmpeg -v error -y "${raw[@]}" -i "$sys" "${base}.sys.wav" 2>>/tmp/meetink-refine.log; then
-            kept="${kept:+$kept / }${base:t}.sys.wav"
-        fi
+        # Archive the best copy we have: the 48 kHz spool when capture
+        # wrote one (full bandwidth), else the 16 kHz transcription spool.
+        # Every consumer of these wavs resamples explicitly (reprocess
+        # -ar 16000, simulate -ar 16000), so the higher rate is safe.
+        local kept="" src stream
+        local -a wavin
+        for stream in mic sys; do
+            src="$mic"
+            [[ "$stream" == sys ]] && src="$sys"
+            wavin=("${raw[@]}")
+            if [[ -s "${src%.raw}.48k.raw" ]] \
+                && (( $(stat -f%z "${src%.raw}.48k.raw" 2>/dev/null || echo 0) > 96000 )); then
+                src="${src%.raw}.48k.raw"
+                wavin=(-f s16le -ar 48000 -ac 1)
+            fi
+            if [[ -s "$src" ]] && ffmpeg -v error -y "${wavin[@]}" -i "$src" "${base}.${stream}.wav" 2>>/tmp/meetink-refine.log; then
+                kept="${kept:+$kept / }${base:t}.${stream}.wav"
+            fi
+        done
         [[ -n "$kept" ]] && print -P "${C[green]}✓${C[reset]} Spools kept: ${C[dim]}${kept}${C[reset]}"
     fi
     # When refine won't run (it normally deletes the spools itself), tidy
     # now so stale audio can't bleed into the next session.
-    refine_enabled 2>/dev/null || rm -f "$mic" "$sys"
+    refine_enabled 2>/dev/null || \
+        rm -f "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw"
     return 0
 }
 
@@ -392,6 +434,14 @@ cmd_reprocess() {
     if [[ -s "$base.mic.wav" || -s "$base.sys.wav" ]]; then
         [[ -s "$base.mic.wav" ]] && { ffmpeg -v error -y -i "$base.mic.wav" -ar 16000 -ac 1 -f s16le "$tmpdir/mic.raw" && args+=(--mic "$tmpdir/mic.raw"); }
         [[ -s "$base.sys.wav" ]] && { ffmpeg -v error -y -i "$base.sys.wav" -ar 16000 -ac 1 -f s16le "$tmpdir/sys.raw" && args+=(--sys "$tmpdir/sys.raw"); }
+        # Kept wavs recorded at 48 kHz → re-derive the archive pair too, so
+        # the rebuilt m4a keeps full bandwidth (the mix step finds them as
+        # siblings of $tmpdir/{mic,sys}.raw).
+        local wavrate=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$base.mic.wav" 2>/dev/null)
+        if [[ "$wavrate" == "48000" && -s "$base.mic.wav" && -s "$base.sys.wav" ]]; then
+            ffmpeg -v error -y -i "$base.mic.wav" -ar 48000 -ac 1 -f s16le "$tmpdir/mic.48k.raw" 2>>/tmp/meetink-refine.log || true
+            ffmpeg -v error -y -i "$base.sys.wav" -ar 48000 -ac 1 -f s16le "$tmpdir/sys.48k.raw" 2>>/tmp/meetink-refine.log || true
+        fi
         print -P "${C[bright_yellow]}▸${C[reset]} Reprocessing ${C[bold]}${actual:t}${C[reset]} ${C[dim]}(from kept spools)...${C[reset]}"
     elif [[ -s "$base.m4a" ]]; then
         ffmpeg -v error -y -i "$base.m4a" -ar 16000 -ac 1 -f s16le "$tmpdir/sys.raw" || { rm -rf "$tmpdir"; return 1 }
