@@ -2512,6 +2512,11 @@ final class UploadViewController: NSViewController, NSTableViewDataSource, NSTab
     private var jobs: [UploadJob] = []
     private var running = false
     var isBusy: Bool { running }
+    /// (name, status) for the Activity page — active/queued jobs only.
+    func jobSummaries() -> [(String, String)] {
+        jobs.filter { !$0.done && !$0.failed }
+            .map { ($0.url.lastPathComponent, $0.status) }
+    }
     var onOpenTranscript: ((String) -> Void)?
 
     private let dropLabel = NSTextField(labelWithString: "Drop audio files here to transcribe")
@@ -2596,27 +2601,35 @@ final class UploadViewController: NSViewController, NSTableViewDataSource, NSTab
         job.status = "starting…"
         table.reloadData()
 
+        // Output goes to a LOG FILE, not pipes: a pipe's reader dies with
+        // the app, and the next write SIGPIPEs the whole import (field
+        // case: 20 minutes of pyannote lost to an app rebuild). The job
+        // polls the log; if the app restarts mid-run the import finishes
+        // on its own and the meeting appears with its results.
+        let logPath = "/tmp/meetink-upload-\(Int(Date().timeIntervalSince1970)).log"
+        FileManager.default.createFile(atPath: logPath, contents: nil)
+        guard let logHandle = FileHandle(forWritingAtPath: logPath) else {
+            job.failed = true; job.status = "couldn't open log"; running = false
+            table.reloadData(); return
+        }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launcher)
         proc.arguments = ["refine", job.url.path]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
+        proc.standardOutput = logHandle
+        proc.standardError = logHandle
 
-        var lineBuffer = Data()
-        var allOutput = ""
-        pipe.fileHandleForReading.readabilityHandler = { [weak self, weak job] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            lineBuffer.append(data)
-            while let nl = lineBuffer.firstIndex(of: 0x0A) {
-                let lineData = lineBuffer.subdata(in: lineBuffer.startIndex..<nl)
-                lineBuffer.removeSubrange(lineBuffer.startIndex...nl)
-                guard let raw = String(data: lineData, encoding: .utf8) else { continue }
+        var offset: UInt64 = 0
+        let poll = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self, weak job] _ in
+            guard let reader = FileHandle(forReadingAtPath: logPath) else { return }
+            defer { try? reader.close() }
+            try? reader.seek(toOffset: offset)
+            let data = reader.readDataToEndOfFile()
+            offset += UInt64(data.count)
+            guard let chunk = String(data: data, encoding: .utf8), !chunk.isEmpty else { return }
+            for raw in chunk.components(separatedBy: "\n") {
                 let line = raw.replacingOccurrences(
                     of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
                     .trimmingCharacters(in: .whitespaces)
-                allOutput += line + "\n"
                 var newStatus: String? = nil
                 if line.hasPrefix("refine: progress"),
                    let pct = Int(line.split(separator: " ").last ?? "") {
@@ -2627,24 +2640,23 @@ final class UploadViewController: NSViewController, NSTableViewDataSource, NSTab
                 } else if line.hasPrefix("TRANSCRIPT_PATH: ") {
                     job?.finalPath = String(line.dropFirst("TRANSCRIPT_PATH: ".count))
                 }
-                if let st = newStatus {
-                    DispatchQueue.main.async {
-                        job?.status = st
-                        self?.table.reloadData()
-                    }
-                }
+                if let st = newStatus { job?.status = st }
             }
+            self?.table.reloadData()
         }
         proc.terminationHandler = { [weak self, weak job] p in
-            pipe.fileHandleForReading.readabilityHandler = nil
             DispatchQueue.main.async {
+                poll.invalidate()
                 guard let self else { return }
                 if p.terminationStatus == 0, job?.finalPath != nil {
                     job?.done = true
                     job?.status = "complete"
+                } else if p.terminationStatus == 0 {
+                    job?.done = true
+                    job?.status = "complete (see Meetings)"
                 } else {
                     job?.failed = true
-                    job?.status = "failed — " + String(allOutput.suffix(120))
+                    job?.status = "failed — see \(logPath)"
                 }
                 self.running = false
                 self.table.reloadData()
@@ -2652,6 +2664,7 @@ final class UploadViewController: NSViewController, NSTableViewDataSource, NSTab
             }
         }
         do { try proc.run() } catch {
+            poll.invalidate()
             job.failed = true
             job.status = "couldn't launch"
             running = false
@@ -2965,6 +2978,90 @@ final class PanelDividerView: NSView {
     }
 }
 
+// MARK: - Activity page
+
+/// Live view of everything the system is doing — recording, post-
+/// processing, watch daemon, servers — so 'what is going on right now?'
+/// has one answer instead of four log files.
+final class ActivityViewController: NSViewController {
+    private let body = NSTextField(wrappingLabelWithString: "")
+    private var timer: Timer? = nil
+    /// Wired to the upload queue so in-app jobs show here too.
+    var uploadJobsProvider: (() -> [(String, String)])? = nil
+
+    override func loadView() {
+        let root = NSView()
+        let title = NSTextField(labelWithString: "Activity")
+        title.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        body.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        body.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(title)
+        root.addSubview(body)
+        NSLayoutConstraint.activate([
+            title.topAnchor.constraint(equalTo: root.topAnchor, constant: 24),
+            title.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            body.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 16),
+            body.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            body.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -24),
+        ])
+        self.view = root
+    }
+
+    override func viewWillAppear() {
+        super.viewWillAppear()
+        refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
+    override func viewWillDisappear() {
+        super.viewWillDisappear()
+        timer?.invalidate()
+    }
+
+    private func pidAlive(_ pidFile: String) -> Bool {
+        guard let raw = try? String(contentsOfFile: pidFile, encoding: .utf8),
+              let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return false }
+        return kill(pid, 0) == 0
+    }
+
+    private func refresh() {
+        var lines: [String] = []
+        if recordingPID() != nil {
+            let live = (try? FileManager.default.destinationOfSymbolicLink(
+                atPath: liveSymlinkPath())) ?? ""
+            let dur = live.isEmpty ? nil : meetingDuration(live, isLive: true)
+            lines.append("● Recording — \(meetingDisplayName(live))"
+                + (dur.map { "  (\(formatDuration($0)))" } ?? ""))
+        } else {
+            lines.append("○ Not recording")
+        }
+        if let pp = postprocState() {
+            let target = postprocPath().map(meetingDisplayName) ?? "?"
+            lines.append("● Post-processing — \(target)")
+            lines.append("    \(pp)")
+        } else {
+            lines.append("○ No post-processing")
+        }
+        for (name, status) in uploadJobsProvider?() ?? [] {
+            lines.append("● Upload — \(name): \(status)")
+        }
+        let watchOn = configBool("watch_enabled")
+        let mode = (configValue("watch_mode") ?? "auto") == "notify" ? "notify-only" : "automatic"
+        let daemonUp = pidAlive("/tmp/meetink-watch.pid")
+        lines.append(watchOn
+            ? "\(daemonUp ? "●" : "⚠") Watch — \(mode)\(daemonUp ? "" : " (daemon not running)")"
+            : "○ Watch — disabled")
+        lines.append(pidAlive("/tmp/meetink-whisper.pid")
+            ? "● whisper-server — running" : "○ whisper-server — stopped")
+        lines.append("\nLogs: /tmp/meetink-watch.log · /tmp/meetink-refine.log · /tmp/meetink-capture.log")
+        body.stringValue = lines.joined(separator: "\n")
+    }
+}
+
 // MARK: - Settings page
 
 /// Checkbox settings, persisted as key=value lines in ~/.meetink/config —
@@ -3155,7 +3252,7 @@ final class SettingsViewController: NSViewController {
 // MARK: - Main window (status strip + sidebar + detail)
 
 final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
-    private let sidebarItems = ["Meetings", "Vocab", "Upload", "Profiles"]
+    private let sidebarItems = ["Meetings", "Vocab", "Upload", "Profiles", "Activity"]
     private let sidebar = NSTableView()
 
     private let stripDot = NSTextField(labelWithString: "●")
@@ -3175,6 +3272,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     let readerVC = TranscriptViewController()
     let settingsVC = SettingsViewController()
     let profilesVC = ProfilesViewController()
+    let activityVC = ActivityViewController()
     private let settingsButton = NSButton()
 
     private var pollTimer: Timer?
@@ -3341,6 +3439,9 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             self?.sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
             self?.meetingsVC.refresh()
         }
+        activityVC.uploadJobsProvider = { [weak self] in
+            (self?.uploadVC.jobSummaries() ?? [])
+        }
         meetingsVC.playingProvider = { [weak self] in
             self?.readerVC.playingTranscriptPath
         }
@@ -3374,14 +3475,15 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         case 0: setDetail(meetingsVC)
         case 1: setDetail(vocabVC)
         case 3: setDetail(profilesVC)
-        case 4: setDetail(settingsVC)
+        case 4: setDetail(activityVC)
+        case 5: setDetail(settingsVC)
         default: setDetail(uploadVC)
         }
     }
 
     @objc private func openSettings() {
         sidebar.deselectAll(nil)
-        showPage(4)
+        showPage(5)
     }
 
     func openTranscript(_ path: String?) {

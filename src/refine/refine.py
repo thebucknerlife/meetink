@@ -274,18 +274,29 @@ def pyannote_diarize_import(raw: bytes, segs: list[dict],
     with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as tf:
         tf.write(raw)
         raw_path = tf.name
+    # Popen with streamed stderr: pyannote runs MINUTES on long files, and
+    # its progress lines must reach the status bar live, not post-mortem
+    # (field report: 'is it hanging? would be nice if it had progress').
+    stderr_tail = ""
     try:
-        proc = subprocess.run([py, helper, "--raw", raw_path],
-                              capture_output=True, text=True, timeout=3600)
+        proc = subprocess.Popen([py, helper, "--raw", raw_path],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
+        for line in proc.stderr:
+            stderr_tail = (stderr_tail + line)[-400:]
+            if line.startswith("pyannote: progress "):
+                pct = line.rsplit(" ", 1)[-1].strip()
+                print(f"refine: status identifying speakers — pyannote {pct}%",
+                      flush=True)
+        stdout, _ = proc.communicate(timeout=60)
     finally:
         os.unlink(raw_path)
     if proc.returncode != 0:
         log(f"pyannote failed (rc={proc.returncode}) — using built-in "
-            f"diarizer: {proc.stderr.strip()[-200:]}")
+            f"diarizer: {stderr_tail.strip()[-200:]}")
         return None
-    # Relay its progress retroactively is pointless; parse the result.
     try:
-        turns = json.loads(proc.stdout.strip().splitlines()[-1])["turns"]
+        turns = json.loads(stdout.strip().splitlines()[-1])["turns"]
     except (ValueError, KeyError, IndexError):
         log("pyannote produced no parsable turns — using built-in diarizer")
         return None
