@@ -194,6 +194,7 @@ postproc_kill() {
     [[ -n "$holder" ]] && kill -9 "$holder" 2>/dev/null || true
     pkill -9 -f "src/refine/refine.py" 2>/dev/null || true
     pkill -9 -f "src/refine/enhance.py" 2>/dev/null || true
+    pkill -9 -f "src/refine/pyannote_diar.py" 2>/dev/null || true
     pkill -9 -f "enhance-venv/bin/deepFilter" 2>/dev/null || true
     rm -rf /tmp/meetink-refine.lock
     rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
