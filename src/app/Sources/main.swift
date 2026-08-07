@@ -186,6 +186,46 @@ func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> N
     return img
 }
 
+/// Write a calendar event (an agent `events` JSON object) onto a meeting:
+/// metadata first (exact title + event record), then the slug rename,
+/// then the header lines. Header edits are safe on a LIVE transcript —
+/// capture re-opens by path per append, and the path doesn't change here.
+/// '# event:' is what stop-time titling reads to name the meeting (live
+/// meetings defer their rename to /stop); '# attendees:' feeds the
+/// diarize whitelist mid-call. Returns the transcript's (possibly moved)
+/// path.
+func applyEventToMeeting(txtPath: String, event e: [String: Any]) -> String {
+    let title = (e["title"] as? String) ?? ""
+    let names = ((e["attendees"] as? [[String: String]]) ?? [])
+        .compactMap { $0["name"]?.isEmpty == false ? $0["name"] : $0["email"] }
+    var path = txtPath
+    setMeetingMeta(path, "event", ["title": title,
+                                   "start": (e["start"] as? String) ?? "",
+                                   "attendees": names])
+    if !title.isEmpty, let newPath = renameMeeting(txtPath: path, displayName: title) {
+        path = newPath
+    }
+    if (!names.isEmpty || !title.isEmpty),
+       var text = try? String(contentsOfFile: path, encoding: .utf8) {
+        func upsert(_ line: String, matching pattern: String) {
+            if let r = text.range(of: pattern, options: [.regularExpression]) {
+                text.replaceSubrange(r, with: line)
+            } else if let r = text.range(of: "Started:") {
+                text.insert(contentsOf: line + "\n", at: r.lowerBound)
+            }
+        }
+        if !title.isEmpty {
+            upsert("# event: " + title, matching: #"(?m)^# event:.*$"#)
+        }
+        if !names.isEmpty {
+            upsert("# attendees: " + names.joined(separator: ", "),
+                   matching: #"(?m)^# attendees:.*$"#)
+        }
+        try? text.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+    return path
+}
+
 /// True when this transcript is the one the capture binary is writing
 /// RIGHT NOW. It matters because capture re-opens the transcript BY PATH
 /// on every append — move the file or its folder and every later chunk
@@ -1164,42 +1204,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func eventPicked(_ sender: NSMenuItem) {
         guard sender.tag >= 0, sender.tag < fetchedEvents.count else { return }
         let e = fetchedEvents[sender.tag]
-        let title = (e["title"] as? String) ?? ""
-        let names = ((e["attendees"] as? [[String: String]]) ?? [])
-            .compactMap { $0["name"]?.isEmpty == false ? $0["name"] : $0["email"] }
-        var path = lastResolvedPath
-        // Metadata first (exact title + event record), then the slug
-        // rename, then the attendees header line.
-        setMeetingMeta(path, "event", ["title": title,
-                                       "start": (e["start"] as? String) ?? "",
-                                       "attendees": names])
-        if !title.isEmpty, let newPath = renameMeeting(txtPath: path, displayName: title) {
-            if fixedPath != nil { fixedPath = newPath }
-            path = newPath
-        }
-        if (!names.isEmpty || !title.isEmpty),
-           var text = try? String(contentsOfFile: path, encoding: .utf8) {
-            // Header edits are safe on a LIVE transcript — capture
-            // re-opens by path per append, and the path doesn't change
-            // here. '# event:' is what stop-time titling reads to name
-            // the meeting (live meetings defer their rename to /stop);
-            // '# attendees:' feeds the diarize whitelist mid-call.
-            func upsert(_ line: String, matching pattern: String) {
-                if let r = text.range(of: pattern, options: [.regularExpression]) {
-                    text.replaceSubrange(r, with: line)
-                } else if let r = text.range(of: "Started:") {
-                    text.insert(contentsOf: line + "\n", at: r.lowerBound)
-                }
-            }
-            if !title.isEmpty {
-                upsert("# event: " + title, matching: #"(?m)^# event:.*$"#)
-            }
-            if !names.isEmpty {
-                upsert("# attendees: " + names.joined(separator: ", "),
-                       matching: #"(?m)^# attendees:.*$"#)
-            }
-            try? text.write(toFile: path, atomically: true, encoding: .utf8)
-        }
+        let newPath = applyEventToMeeting(txtPath: lastResolvedPath, event: e)
+        if fixedPath != nil { fixedPath = newPath }
         refreshIfChanged(force: true)
     }
 
@@ -3570,10 +3576,346 @@ final class SettingsViewController: NSViewController {
     }
 }
 
+// MARK: - Today page
+
+/// The day at a glance: the last 3 and next 8 calendar meetings that
+/// have other attendees, each with a Start Recording / Go to Transcript
+/// action, and the event covering the current time highlighted.
+final class TodayViewController: NSViewController {
+    /// Open a transcript in the reader; nil = the live view.
+    var onOpen: ((String?) -> Void)?
+
+    private let stack = NSStackView()
+    private var events: [[String: Any]] = []
+    private var refreshTimer: Timer?
+    private var fetching = false
+    private var startingEventStart: String?  // start ISO of an in-flight start
+    private let iso = ISO8601DateFormatter()
+
+    override func loadView() {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let doc = FlippedView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(stack)
+        scroll.documentView = doc
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: doc.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
+            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+        ])
+        self.view = scroll
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        rebuildRows()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.fetchEvents()
+        }
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        fetchEvents()
+    }
+
+    /// Agent `events` over a -12h…+24h window (read-to-EOF before
+    /// waitUntilExit — the pipe-deadlock lesson applies here too).
+    private func fetchEvents() {
+        guard !fetching else { return }
+        let agent = "\(mkHome)/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
+        guard FileManager.default.isExecutableFile(atPath: agent) else { return }
+        fetching = true
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: agent)
+        var args = ["events",
+                    "--from", iso.string(from: Date().addingTimeInterval(-12 * 3600)),
+                    "--to", iso.string(from: Date().addingTimeInterval(24 * 3600))]
+        if let hidden = configValue("hidden_calendars"), !hidden.isEmpty {
+            args += ["--hidden-calendars", hidden]
+        }
+        proc.arguments = args
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        DispatchQueue.global().async { [weak self] in
+            defer { DispatchQueue.main.async { self?.fetching = false } }
+            do { try proc.run() } catch { return }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            let all = (try? JSONSerialization.jsonObject(with: data)
+                       as? [[String: Any]]) ?? []
+            // Only meetings with other attendees — solo calendar blocks
+            // (focus time, reminders) aren't recordable conversations.
+            let meetings = all.filter {
+                (($0["attendees"] as? [[String: String]]) ?? []).count >= 2
+            }
+            DispatchQueue.main.async {
+                self?.events = meetings
+                self?.rebuildRows()
+            }
+        }
+    }
+
+    /// Recorded meetings that carry an event record (or a matching title),
+    /// so rows can offer "Go to Transcript" instead of a re-record.
+    private func recordedIndex() -> [(path: String, title: String, start: String, date: Date)] {
+        let dir = transcriptsDir()
+        let fm = FileManager.default
+        var out: [(String, String, String, Date)] = []
+        for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] {
+            let folder = dir + "/" + item
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: folder, isDirectory: &isDir),
+                  isDir.boolValue, !item.hasPrefix("."), !item.hasPrefix("_") else { continue }
+            let txt = folder + "/" + item + ".txt"
+            guard fm.fileExists(atPath: txt) else { continue }
+            let meta = meetingMeta(txt)
+            let ev = meta["event"] as? [String: Any]
+            let title = (ev?["title"] as? String)
+                ?? (meta["title"] as? String) ?? ""
+            let start = (ev?["start"] as? String) ?? ""
+            out.append((txt, title, start, meetingRecordingDate(txt)))
+        }
+        return out
+    }
+
+    private func transcriptFor(_ e: [String: Any],
+                               in index: [(path: String, title: String, start: String, date: Date)]) -> String? {
+        let title = (e["title"] as? String) ?? ""
+        let start = (e["start"] as? String) ?? ""
+        // Exact event-record match first (title + start distinguishes
+        // recurring meetings) …
+        if let hit = index.first(where: { $0.start == start && $0.title == title }) {
+            return hit.path
+        }
+        // … then title + recording-time proximity, for watch-started
+        // meetings that only got the '# event:' header and meta title.
+        guard let sd = iso.date(from: start) else { return nil }
+        let ed = (e["end"] as? String).flatMap { iso.date(from: $0) }
+            ?? sd.addingTimeInterval(3600)
+        return index.first(where: {
+            $0.title.caseInsensitiveCompare(title) == .orderedSame
+                && $0.date >= sd.addingTimeInterval(-3600)
+                && $0.date <= ed.addingTimeInterval(2 * 3600)
+        })?.path
+    }
+
+    private func rebuildRows() {
+        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        rowActions.removeAll()
+
+        let header = NSTextField(labelWithString: "Today")
+        header.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        stack.addArrangedSubview(header)
+        let df = DateFormatter()
+        df.dateFormat = "EEEE, MMMM d"
+        let sub = NSTextField(labelWithString: df.string(from: Date()))
+        sub.font = NSFont.systemFont(ofSize: 12)
+        sub.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(sub)
+        stack.setCustomSpacing(14, after: sub)
+
+        let now = Date()
+        var past: [[String: Any]] = []
+        var upcoming: [[String: Any]] = []
+        for e in events {
+            let end = (e["end"] as? String).flatMap { iso.date(from: $0) }
+                ?? (e["start"] as? String).flatMap { iso.date(from: $0) }
+            if let end, end < now { past.append(e) } else { upcoming.append(e) }
+        }
+        past = Array(past.suffix(3))
+        upcoming = Array(upcoming.prefix(8))
+
+        if past.isEmpty && upcoming.isEmpty {
+            let empty = NSTextField(labelWithString: events.isEmpty
+                ? "No meetings with attendees in the last 12 / next 24 hours."
+                : "Nothing to show.")
+            empty.textColor = .secondaryLabelColor
+            stack.addArrangedSubview(empty)
+            return
+        }
+
+        let index = recordedIndex()
+        let liveTxt: String? = {
+            guard recordingPID() != nil,
+                  let dest = try? FileManager.default
+                    .destinationOfSymbolicLink(atPath: liveSymlinkPath()) else { return nil }
+            return dest.hasPrefix("/") ? dest
+                : (liveSymlinkPath() as NSString).deletingLastPathComponent + "/" + dest
+        }()
+
+        for (section, list) in [("Earlier", past), ("Up next", upcoming)] where !list.isEmpty {
+            let label = NSTextField(labelWithString: section)
+            label.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            label.textColor = .tertiaryLabelColor
+            stack.addArrangedSubview(label)
+            for e in list {
+                let row = makeRow(e, index: index, liveTxt: liveTxt, now: now)
+                stack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: stack.widthAnchor,
+                                           constant: -32).isActive = true
+            }
+            stack.setCustomSpacing(14, after: stack.arrangedSubviews.last!)
+        }
+    }
+
+    private func makeRow(_ e: [String: Any],
+                         index: [(path: String, title: String, start: String, date: Date)],
+                         liveTxt: String?, now: Date) -> NSView {
+        let title = (e["title"] as? String) ?? "(untitled)"
+        let start = (e["start"] as? String).flatMap { iso.date(from: $0) }
+        let end = (e["end"] as? String).flatMap { iso.date(from: $0) }
+        let attendeeCount = ((e["attendees"] as? [[String: String]]) ?? []).count
+        let isNow = start.map { s in
+            s <= now && now <= (end ?? s.addingTimeInterval(3600))
+        } ?? false
+        let isPast = (end ?? .distantFuture) < now
+
+        let box = NSView()
+        box.wantsLayer = true
+        box.layer?.cornerRadius = 8
+        box.layer?.backgroundColor = isNow
+            ? NSColor.controlAccentColor.withAlphaComponent(0.13).cgColor
+            : NSColor.quaternaryLabelColor.withAlphaComponent(0.08).cgColor
+
+        let tf = DateFormatter()
+        tf.dateFormat = "h:mm a"
+        var when = start.map { tf.string(from: $0) } ?? "?"
+        if let end { when += " – " + tf.string(from: end) }
+        let timeLabel = NSTextField(labelWithString: when)
+        timeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        timeLabel.textColor = isPast ? .tertiaryLabelColor : .secondaryLabelColor
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.systemFont(ofSize: 13,
+                                            weight: isNow ? .semibold : .regular)
+        titleLabel.textColor = isPast ? .secondaryLabelColor : .labelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+
+        let who = NSTextField(labelWithString: "\(attendeeCount) attendees")
+        who.font = NSFont.systemFont(ofSize: 11)
+        who.textColor = .tertiaryLabelColor
+
+        let left = NSStackView(views: [timeLabel, titleLabel, who])
+        left.orientation = .vertical
+        left.alignment = .leading
+        left.spacing = 2
+
+        let h = NSStackView()
+        h.orientation = .horizontal
+        h.spacing = 8
+        h.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+        h.translatesAutoresizingMaskIntoConstraints = false
+        h.addArrangedSubview(left)
+        h.addArrangedSubview(NSView())
+
+        if isNow {
+            let badge = NSTextField(labelWithString: "NOW")
+            badge.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+            badge.textColor = .controlAccentColor
+            h.addArrangedSubview(badge)
+        }
+
+        let button = NSButton(title: "", target: self, action: #selector(rowAction(_:)))
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        let recorded = transcriptFor(e, in: index)
+        let startISO = (e["start"] as? String) ?? ""
+        if let recorded, recorded == liveTxt {
+            button.title = "Go to Transcript"
+            rowActions[startISO + title] = { [weak self] in self?.onOpen?(nil) }
+        } else if let recorded {
+            button.title = "Go to Transcript"
+            rowActions[startISO + title] = { [weak self] in self?.onOpen?(recorded) }
+        } else if isPast {
+            button.isHidden = true
+        } else if startingEventStart == startISO {
+            button.title = "Starting…"
+            button.isEnabled = false
+        } else if liveTxt != nil {
+            // Something else is already recording — one capture at a time.
+            button.title = "Start Recording"
+            button.isEnabled = false
+        } else {
+            button.title = "Start Recording"
+            rowActions[startISO + title] = { [weak self] in
+                self?.startRecording(for: e)
+            }
+        }
+        button.identifier = NSUserInterfaceItemIdentifier(startISO + title)
+        h.addArrangedSubview(button)
+
+        box.addSubview(h)
+        NSLayoutConstraint.activate([
+            h.topAnchor.constraint(equalTo: box.topAnchor),
+            h.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+            h.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+            h.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+        ])
+        return box
+    }
+
+    private var rowActions: [String: () -> Void] = [:]
+
+    @objc private func rowAction(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue else { return }
+        rowActions[id]?()
+    }
+
+    /// `meetink start`, then stamp the calendar event on the fresh
+    /// session (meta + headers; the rename waits for /stop). Mirrors
+    /// what the watch does for its own event starts.
+    private func startRecording(for e: [String: Any]) {
+        guard let launcher = launcherPath() else { return }
+        startingEventStart = (e["start"] as? String) ?? ""
+        rebuildRows()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["start"]
+        var env = ProcessInfo.processInfo.environment
+        env["MEETINK_NO_TAIL"] = "1"
+        proc.environment = env
+        let live = liveSymlinkPath()
+        // The symlink still points at the PREVIOUS session until
+        // cmd_start retargets it — stamping the event before it moves
+        // would link the wrong meeting.
+        let before = try? FileManager.default.destinationOfSymbolicLink(atPath: live)
+        DispatchQueue.global().async { [weak self] in
+            defer {
+                DispatchQueue.main.async {
+                    self?.startingEventStart = nil
+                    self?.rebuildRows()
+                }
+            }
+            do { try proc.run() } catch { return }
+            proc.waitUntilExit()
+            var dest: String? = nil
+            for _ in 0..<30 {
+                dest = try? FileManager.default.destinationOfSymbolicLink(atPath: live)
+                if recordingPID() != nil, let d = dest, d != before { break }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            guard recordingPID() != nil, let d = dest, d != before else { return }
+            let resolved = d.hasPrefix("/") ? d
+                : (live as NSString).deletingLastPathComponent + "/" + d
+            _ = applyEventToMeeting(txtPath: resolved, event: e)
+        }
+    }
+}
+
 // MARK: - Main window (status strip + sidebar + detail)
 
 final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
-    private let sidebarItems = ["Meetings", "Vocab", "Upload", "Profiles"]
+    private let sidebarItems = ["Today", "Meetings", "Vocab", "Upload", "Profiles"]
     private let sidebar = NSTableView()
 
     private let stripDot = NSTextField(labelWithString: "●")
@@ -3587,6 +3929,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     private let detailContainer = NSView()
     private var currentDetail: NSViewController?
 
+    let todayVC = TodayViewController()
     let meetingsVC = MeetingsViewController()
     let vocabVC = VocabViewController()
     let uploadVC = UploadViewController()
@@ -3628,8 +3971,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         container.onAudioDrop = { [weak self] urls in
             guard let self else { return }
             self.uploadVC.enqueue(urls)
-            self.showPage(2)
-            self.sidebar.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
+            self.showPage(3)
+            self.sidebar.selectRowIndexes(IndexSet(integer: 3), byExtendingSelection: false)
         }
         container.onDragState = { [weak self] active in
             self?.uploadVC.setDragActive(active)
@@ -3775,9 +4118,12 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             self?.openTranscript(path)
         }
         readerVC.onMeetingDeleted = { [weak self] in
-            self?.showPage(0)
-            self?.sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            self?.showPage(1)
+            self?.sidebar.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
             self?.meetingsVC.refresh()
+        }
+        todayVC.onOpen = { [weak self] path in
+            self?.openTranscript(path)
         }
         activityVC.uploadJobsProvider = { [weak self] in
             (self?.uploadVC.jobSummaries() ?? [])
@@ -3790,8 +4136,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             self?.readerVC.playSpeakerSample(speaker)
         }
 
-        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        showPage(0)
+        // Land on Meetings (row 1) — Today is first in the list but the
+        // meetings index stays the default page.
+        sidebar.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        showPage(1)
     }
 
     private func setDetail(_ vc: NSViewController) {
@@ -3812,23 +4160,24 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     func showPage(_ index: Int) {
         switch index {
-        case 0: setDetail(meetingsVC)
-        case 1: setDetail(vocabVC)
-        case 3: setDetail(profilesVC)
-        case 4: setDetail(activityVC)
-        case 5: setDetail(settingsVC)
+        case 0: setDetail(todayVC)
+        case 1: setDetail(meetingsVC)
+        case 2: setDetail(vocabVC)
+        case 4: setDetail(profilesVC)
+        case 5: setDetail(activityVC)
+        case 6: setDetail(settingsVC)
         default: setDetail(uploadVC)
         }
     }
 
     @objc private func openSettings() {
         sidebar.deselectAll(nil)
-        showPage(5)
+        showPage(6)
     }
 
     @objc private func openActivity() {
         sidebar.deselectAll(nil)
-        showPage(4)
+        showPage(5)
     }
 
     func openTranscript(_ path: String?) {
