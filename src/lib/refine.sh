@@ -210,7 +210,14 @@ _import_enhanced_m4a() {
     local dfn="$MK_HOME/enhance-venv/bin/deepFilter"
     local td=$(mktemp -d -t meetink-import-enh)
     local rc=1
-    if enhance_enabled && [[ -x "$dfn" ]]; then
+    # DFN is OPT-IN for imports (import_deepfilter=on): on single-stream
+    # room recordings its noise reduction eats faint far-mic speech — the
+    # transcript (from the original audio) shows words the enhanced m4a
+    # no longer contains, which reads as broken playback sync. Recordings
+    # keep DFN: near-mic streams survive it.
+    local dfn_ok=""
+    [[ "$(grep '^import_deepfilter=' "$MK_CONFIG_FILE" 2>/dev/null | cut -d= -f2-)" == "on" ]] && dfn_ok=1
+    if [[ -n "$dfn_ok" ]] && enhance_enabled && [[ -x "$dfn" ]]; then
         print -- "enhancing audio — DeepFilterNet (step 3/3)" > /tmp/meetink-postproc.state
         if ffmpeg -v error -y -i "$input" -vn -ar 48000 -ac 1 "$td/in.wav" 2>>/tmp/meetink-refine.log && \
            "$dfn" "$td/in.wav" -o "$td" >>/tmp/meetink-refine.log 2>&1 && \

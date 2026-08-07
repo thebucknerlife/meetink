@@ -1201,6 +1201,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             edit.addItem(i)
         }
         add("Edit Segment…", #selector(menuEditSegment(_:)))
+        add("Reassign Segment to…", #selector(menuReassignSegment(_:)))
         add("Split Segment Here", #selector(menuSplitSegment(_:)))
         add("Delete Segment…", #selector(menuDeleteSegment(_:)))
         edit.addItem(.separator())
@@ -1216,6 +1217,47 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             return line
         }
         return nil
+    }
+
+    /// Rewrite ONE line's speaker label (not the whole cluster — that's
+    /// the panel's job). This is how a freshly split half changes hands:
+    /// same-speaker halves render as one block, but the right-click knows
+    /// which LINE it landed on, and once the label differs the block view
+    /// separates them naturally.
+    @objc private func menuReassignSegment(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? [String: Int],
+              let line = info["line"], line < snapshot.lines.count else { return }
+        let seg = snapshot.lines[line]
+        let alert = NSAlert()
+        alert.messageText = "Reassign this segment"
+        alert.informativeText = String(seg.text.prefix(120))
+        alert.addButton(withTitle: "Reassign")
+        alert.addButton(withTitle: "Cancel")
+        let combo = NSComboBox(frame: NSRect(x: 0, y: 0, width: 220, height: 25))
+        combo.addItems(withObjectValues: enrolledProfiles())
+        combo.placeholderString = "Name"
+        combo.completes = true
+        combo.numberOfVisibleItems = 16
+        combo.delegate = ComboAutoOpen.shared
+        alert.accessoryView = combo
+        alert.window.initialFirstResponder = combo
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = combo.stringValue.trimmingCharacters(in: .whitespaces).uppercased()
+        guard !name.isEmpty, !name.contains("/"), !name.hasPrefix(".") else { return }
+        guard var (all, idx) = readTranscriptLines(), line < idx.count else { return }
+        snapshotBeforeFirstEdit()
+        all[idx[line]] = "[\(seg.timestamp)] \(name): \(seg.text)"
+        var entry: [String: Any] = ["label": name]
+        entry["t"] = line < lineOffsets.count ? lineOffsets[line] : 0
+        // Keep the words — the text didn't change, only the label.
+        let tPath = (lastResolvedPath as NSString).deletingPathExtension + ".timing.json"
+        if let data = FileManager.default.contents(atPath: tPath),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let tl = obj["lines"] as? [[String: Any]], line < tl.count {
+            entry["words"] = tl[line]["words"] ?? []
+        }
+        spliceTiming(line: line, with: [entry])
+        writeTranscriptLines(all)
     }
 
     @objc private func menuEditSegment(_ sender: NSMenuItem) {

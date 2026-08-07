@@ -169,7 +169,7 @@ def cancel_direction(ref: np.ndarray, sig: np.ndarray,
 
 
 def residual_echo_gate(mic: np.ndarray, sys_: np.ndarray, delay: int,
-                       floor: float = 0.03) -> np.ndarray:
+                       floor: float = 0.12) -> np.ndarray:
     """Post-AEC safety net for the user's remote echo.
 
     The linear filter assumes a fixed echo path, but conferencing echo
@@ -221,7 +221,11 @@ def residual_echo_gate(mic: np.ndarray, sys_: np.ndarray, delay: int,
         if a < b_:
             me[k] = me_raw[a:b_].max()
 
-    echoish = (me > 0.006) & (se < 1.5 * me)
+    # 0.9, not 1.5: an echo is an ATTENUATED copy — sys at or above the
+    # delayed mic's level is more likely real (soft) remote speech, and
+    # the aggressive ratio was ducking it to inaudible (field report:
+    # transcript shows words the audio barely contains).
+    echoish = (me > 0.006) & (se < 0.9 * me)
     # Dilate one block each side: echo tails smear past the envelope.
     d = echoish.copy()
     d[1:] |= echoish[:-1]
