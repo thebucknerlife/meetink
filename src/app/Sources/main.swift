@@ -116,7 +116,17 @@ func recordingPID() -> Int32? {
           let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
         return nil
     }
-    return kill(pid, 0) == 0 ? pid : nil
+    guard kill(pid, 0) == 0 else { return nil }
+    // PID reuse guard: a stale pid file whose number the OS recycled to
+    // some unrelated process must not read as 'recording' (field case:
+    // the strip said Recording during an upload with no capture alive).
+    var buf = [CChar](repeating: 0, count: 4096)
+    let n = proc_pidpath(pid, &buf, UInt32(buf.count))
+    if n > 0 {
+        let path = String(cString: buf)
+        if !path.hasSuffix("meetink-capture") { return nil }
+    }
+    return pid
 }
 
 /// Keeps the assignment combo's dropdown open and filtered while the

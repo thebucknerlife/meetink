@@ -121,6 +121,10 @@ refine_session() {
                 "refine: status "*)
                     print -- "${line#refine: status } (step 2/3)" > "$state" ;;
             esac
+            # Re-assert the target pointer — a raced cleanup can delete it
+            # mid-run, blanking the meeting's scoped status (self-heals on
+            # the next line).
+            [[ -f /tmp/meetink-postproc.path ]] || print -- "$actual" > /tmp/meetink-postproc.path 2>/dev/null
         done
     rc=${pipestatus[1]}
     _refine_unlock
@@ -411,6 +415,10 @@ cmd_reprocess() {
                 "refine: status "*)
                     print -- "${line#refine: status } (step 2/3)" > "$state" ;;
             esac
+            # Re-assert the target pointer — a raced cleanup can delete it
+            # mid-run, blanking the meeting's scoped status (self-heals on
+            # the next line).
+            [[ -f /tmp/meetink-postproc.path ]] || print -- "$actual" > /tmp/meetink-postproc.path 2>/dev/null
         done
     rc=${pipestatus[1]}
     _refine_unlock
@@ -551,6 +559,10 @@ cmd_refine() {
                 "refine: status "*)
                     print -- "${line#refine: status } (step 2/3)" > "$state" ;;
             esac
+            # Re-assert the target pointer — a raced cleanup can delete it
+            # mid-run, blanking the meeting's scoped status (self-heals on
+            # the next line).
+            [[ -f /tmp/meetink-postproc.path ]] || print -- "$actual" > /tmp/meetink-postproc.path 2>/dev/null
         done
     rc=${pipestatus[1]}
     _refine_unlock

@@ -311,9 +311,10 @@ def pyannote_diarize_import(raw: bytes, segs: list[dict],
         for line in proc.stderr:
             stderr_tail = (stderr_tail + line)[-400:]
             if line.startswith("pyannote: progress "):
-                pct = line.rsplit(" ", 1)[-1].strip()
-                print(f"refine: status identifying speakers — pyannote {pct}%",
-                      flush=True)
+                parts = line.strip().split(" ")
+                pct, phase = parts[2], (parts[3] if len(parts) > 3 else "")
+                print(f"refine: status identifying speakers — pyannote "
+                      f"{phase + ' ' if phase else ''}{pct}%", flush=True)
         stdout, _ = proc.communicate(timeout=60)
     finally:
         os.unlink(raw_path)

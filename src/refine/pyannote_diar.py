@@ -48,10 +48,13 @@ def main() -> int:
     # Plain callable hook — pyannote's ProgressHook renders rich terminal
     # UI to STDOUT, which buries the JSON result line this script's whole
     # contract depends on. stderr only.
+    # Include the phase name: the pipeline runs segmentation THEN
+    # embeddings, each 0-100% — one anonymous bar looked like pyannote
+    # 'running twice' (field report).
     def hook(step_name, step_artifact, file=None, total=None, completed=None):
         if total:
             pct = 15 + int(80 * (completed or 0) / total)
-            print(f"pyannote: progress {pct}", file=sys.stderr, flush=True)
+            print(f"pyannote: progress {pct} {step_name}", file=sys.stderr, flush=True)
 
     diarization = pipeline({"waveform": waveform, "sample_rate": 16000}, hook=hook)
 
