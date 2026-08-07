@@ -582,6 +582,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var pollTimer: Timer?
     private var lastInode: UInt64 = 0
     private var lastSize: UInt64 = 0
+    private var lastMtime: TimeInterval = 0
     private var lastResolvedPath: String = ""
     private var rawText: String = ""
     private var snapshot = TranscriptSnapshot()
@@ -1241,11 +1242,16 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
-        DispatchQueue.global().async {
+        DispatchQueue.global().async { [weak self] in
             do { try proc.run() } catch { return }
             proc.waitUntilExit()
             let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
                              encoding: .utf8) ?? ""
+            // Always re-render on completion: the label rewrite preserves
+            // the inode AND often the size (same-length name), so the
+            // change detector can't see it ('sometimes the name updates,
+            // sometimes not until I reopen the meeting').
+            DispatchQueue.main.async { self?.refreshIfChanged(force: true) }
             if proc.terminationStatus != 0 || out.lowercased().contains("error") {
                 DispatchQueue.main.async {
                     let alert = NSAlert()
@@ -1280,9 +1286,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
         let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
         let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        // mtime too: in-place label rewrites keep the inode by design and
+        // can keep the size (same-length name) — mtime always moves.
+        let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
 
-        if force || inode != lastInode || size != lastSize || resolved != lastResolvedPath {
-            lastInode = inode; lastSize = size; lastResolvedPath = resolved
+        if force || inode != lastInode || size != lastSize
+            || mtime != lastMtime || resolved != lastResolvedPath {
+            lastInode = inode; lastSize = size; lastMtime = mtime
+            lastResolvedPath = resolved
             if let text = try? String(contentsOfFile: resolved, encoding: .utf8) {
                 rawText = text
                 snapshot = parseTranscript(text)
