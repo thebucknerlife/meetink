@@ -1213,8 +1213,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func downloadTranscript() {
         guard !lastResolvedPath.isEmpty else { return }
         let panel = NSSavePanel()
+        // "_transcript_7-30" — the meeting's month-day, no leading zeros.
+        let df = DateFormatter()
+        df.dateFormat = "M-d"
+        let suffix = "_transcript_" + df.string(from: meetingRecordingDate(lastResolvedPath))
         panel.nameFieldStringValue = meetingDisplayName(lastResolvedPath)
-            .replacingOccurrences(of: "/", with: "-") + ".txt"
+            .replacingOccurrences(of: "/", with: "-") + suffix + ".txt"
         panel.directoryURL = FileManager.default.urls(
             for: .downloadsDirectory, in: .userDomainMask).first
         panel.begin { [weak self] response in
