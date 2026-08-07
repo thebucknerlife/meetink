@@ -244,7 +244,7 @@ def _agent_meeting_active() -> dict:
 
 
 def _agent_notify(title: str, body: str, actions: list[str],
-                  default: str, timeout: int) -> str:
+                  default: str, timeout: int, linger: int = 0) -> str:
     """Blocking call. Caller usually runs this on a dedicated worker
     thread because the agent waits up to `timeout` seconds for a click."""
     if not MK_AGENT.is_file():
@@ -256,7 +256,8 @@ def _agent_notify(title: str, body: str, actions: list[str],
              "--body", body,
              "--actions", ",".join(actions),
              "--default", default,
-             "--timeout", str(timeout)],
+             "--timeout", str(timeout),
+             "--linger", str(linger)],
             capture_output=True, text=True, timeout=timeout + 15,
         )
         return proc.stdout.strip() or default
@@ -780,6 +781,7 @@ class WatchManager:
                     actions=["Start recording", "Skip"],
                     default="Skip",
                     timeout=600,
+                    linger=15,
                 )
                 if "start" not in (response or "").lower():
                     _wlog(f"notify mode: user did not start '{ev.title}'")
@@ -968,6 +970,7 @@ class WatchManager:
                     actions=["Start recording", "Skip"],
                     default="Skip",
                     timeout=600,
+                    linger=15,
                 )
                 if "start" not in (response or "").lower():
                     response = "skip"

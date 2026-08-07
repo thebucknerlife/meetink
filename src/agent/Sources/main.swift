@@ -12,6 +12,7 @@
 //       calendarTitle. Exits 0. Permission required: Calendar.
 //
 //   meetink-agent notify --title T --body B [--actions A1,A2,...]
+//                        [--default A] [--timeout SECS] [--linger SECS]
 //                        [--timeout SECS] [--default ACTION]
 //       Shows a macOS UserNotification with action buttons and waits
 //       up to SECS (default 60) for the user to click one. Exits 0
@@ -271,6 +272,7 @@ func cmdNotify(args: [String]) -> Int32 {
     var body = ""
     var actions: [String] = []
     var timeoutSecs: Double = 60.0
+    var lingerSecs: Double = 0
     var defaultAction = ""
 
     var i = 0
@@ -289,6 +291,10 @@ func cmdNotify(args: [String]) -> Int32 {
         case "--timeout":
             if i + 1 < args.count, let n = Double(args[i + 1]) {
                 timeoutSecs = n; i += 2
+            } else { i += 1 }
+        case "--linger":
+            if i + 1 < args.count, let n = Double(args[i + 1]) {
+                lingerSecs = n; i += 2
             } else { i += 1 }
         case "--default":
             if i + 1 < args.count { defaultAction = args[i + 1]; i += 2 } else { i += 1 }
@@ -325,11 +331,15 @@ func cmdNotify(args: [String]) -> Int32 {
     let unActions = actions.map {
         UNNotificationAction(identifier: $0, title: $0, options: [.foreground])
     }
+    // customDismissAction: an explicit dismiss (the ✕) reaches the
+    // delegate as UNNotificationDismissActionIdentifier. Without it we
+    // can't tell "user said no" apart from "banner slid away on its
+    // own" — and the linger loop below must NOT re-post after a real ✕.
     let cat = UNNotificationCategory(
         identifier: category,
         actions: unActions,
         intentIdentifiers: [],
-        options: []
+        options: [.customDismissAction]
     )
     center.setNotificationCategories([cat])
 
@@ -378,14 +388,43 @@ func cmdNotify(args: [String]) -> Int32 {
     // Wait for click or timeout. Drive the runloop on the main thread
     // so the delegate callbacks fire — UNUserNotificationCenter requires
     // main-thread delivery.
+    //
+    // --linger: macOS banners auto-slide away after ~5 s and no public
+    // API extends that (Alerts style is a per-app USER setting). So for
+    // the linger window we silently re-post the banner each time it
+    // slides away: remove the delivered copy, add a fresh request with
+    // no sound. Explicit ✕ or a button click sets delegate.clicked and
+    // ends the loop; auto-slide fires nothing, so only auto-slide gets
+    // re-posted. After the window the last copy sits in Notification
+    // Center, buttons still live until --timeout.
     let deadline = Date().addingTimeInterval(timeoutSecs)
+    let lingerEnd = Date().addingTimeInterval(lingerSecs)
+    var currentId = identifier
+    var nextRepost = Date().addingTimeInterval(6.0)
     while delegate.clicked == nil && Date() < deadline {
         RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
+        if lingerSecs > 0, delegate.clicked == nil,
+           Date() >= nextRepost, Date() < lingerEnd {
+            center.removeDeliveredNotifications(withIdentifiers: [currentId])
+            let repost = UNMutableNotificationContent()
+            repost.title = title
+            repost.body = body
+            repost.categoryIdentifier = category
+            repost.sound = nil  // one ding was enough
+            if #available(macOS 12.0, *) {
+                repost.interruptionLevel = .timeSensitive
+            }
+            currentId = UUID().uuidString
+            center.add(UNNotificationRequest(
+                identifier: currentId, content: repost, trigger: nil
+            )) { _ in }
+            nextRepost = Date().addingTimeInterval(6.0)
+        }
     }
 
     // Best-effort cleanup so dismissed notifications don't linger.
-    center.removeDeliveredNotifications(withIdentifiers: [identifier])
-    center.removePendingNotificationRequests(withIdentifiers: [identifier])
+    center.removeDeliveredNotifications(withIdentifiers: [currentId])
+    center.removePendingNotificationRequests(withIdentifiers: [currentId])
 
     print(delegate.clicked ?? defaultAction)
     return 0
