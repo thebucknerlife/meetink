@@ -582,6 +582,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let statusDot = NSTextField(labelWithString: "●")
     private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
     private let folderButton = NSButton(title: "Open Folder", target: nil, action: nil)
+    private let downloadButton = NSButton(title: "Download Transcript", target: nil, action: nil)
     private let reprocessButton = NSButton(title: "Reprocess", target: nil, action: nil)
     private let menuButton = NSButton(title: "", target: nil, action: nil)
     private var fetchedEvents: [[String: Any]] = []
@@ -670,6 +671,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         reprocessButton.toolTip = "Re-run transcription, diarization and audio "
             + "enhancement on this meeting's kept audio"
         reprocessButton.isHidden = true
+        downloadButton.bezelStyle = .rounded
+        downloadButton.controlSize = .small
+        downloadButton.font = NSFont.systemFont(ofSize: 11)
+        downloadButton.target = self
+        downloadButton.action = #selector(downloadTranscript)
         copyButton.bezelStyle = .rounded
         copyButton.controlSize = .small
         copyButton.font = NSFont.systemFont(ofSize: 11)
@@ -681,6 +687,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         strip.addArrangedSubview(NSView())
         strip.addArrangedSubview(reprocessButton)
         strip.addArrangedSubview(folderButton)
+        strip.addArrangedSubview(downloadButton)
         strip.addArrangedSubview(copyButton)
         strip.addArrangedSubview(menuButton)
 
@@ -1198,6 +1205,24 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard !lastResolvedPath.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting(
             [URL(fileURLWithPath: lastResolvedPath)])
+    }
+
+    /// Save a copy of the transcript wherever the user picks — the save
+    /// panel grants write access to the chosen location by consent, so
+    /// Downloads works without a standing TCC grant.
+    @objc private func downloadTranscript() {
+        guard !lastResolvedPath.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = meetingDisplayName(lastResolvedPath)
+            .replacingOccurrences(of: "/", with: "-") + ".txt"
+        panel.directoryURL = FileManager.default.urls(
+            for: .downloadsDirectory, in: .userDomainMask).first
+        panel.begin { [weak self] response in
+            guard response == .OK, let dest = panel.url, let self else { return }
+            try? FileManager.default.removeItem(at: dest)
+            try? FileManager.default.copyItem(
+                at: URL(fileURLWithPath: self.lastResolvedPath), to: dest)
+        }
     }
 
     @objc private func copyAll() {
