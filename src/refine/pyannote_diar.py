@@ -32,6 +32,14 @@ def main() -> int:
 
     print("pyannote: progress 5", file=sys.stderr, flush=True)
     pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+    # Apple-Silicon GPU: 2-4x over CPU for the segmentation/embedding
+    # models. Falls back silently — MPS gaps in old torch raise at .to().
+    try:
+        if torch.backends.mps.is_available():
+            pipeline.to(torch.device("mps"))
+            print("pyannote: using MPS (Apple GPU)", file=sys.stderr, flush=True)
+    except Exception:
+        pass
     print("pyannote: progress 15", file=sys.stderr, flush=True)
 
     data = np.fromfile(args.raw, dtype=np.int16).astype(np.float32) / 32768.0

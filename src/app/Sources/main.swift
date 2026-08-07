@@ -2983,8 +2983,12 @@ final class PanelDividerView: NSView {
 /// Live view of everything the system is doing — recording, post-
 /// processing, watch daemon, servers — so 'what is going on right now?'
 /// has one answer instead of four log files.
-final class ActivityViewController: NSViewController {
+final class ActivityViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     private let body = NSTextField(wrappingLabelWithString: "")
+    private let historyTable = NSTableView()
+    private let moreButton = NSButton(title: "Show more", target: nil, action: nil)
+    private var history: [String] = []      // newest first
+    private var historyShown = 50
     private var timer: Timer? = nil
     /// Wired to the upload queue so in-app jobs show here too.
     var uploadJobsProvider: (() -> [(String, String)])? = nil
@@ -2996,23 +3000,96 @@ final class ActivityViewController: NSViewController {
         title.translatesAutoresizingMaskIntoConstraints = false
         body.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         body.translatesAutoresizingMaskIntoConstraints = false
+
+        // History: every past event the pipeline logged, newest first.
+        let histTitle = NSTextField(labelWithString: "History")
+        histTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        histTitle.translatesAutoresizingMaskIntoConstraints = false
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        let col = NSTableColumn(identifier: .init("event"))
+        col.width = 560
+        historyTable.addTableColumn(col)
+        historyTable.headerView = nil
+        historyTable.rowHeight = 20
+        historyTable.dataSource = self
+        historyTable.delegate = self
+        scroll.documentView = historyTable
+        moreButton.bezelStyle = .rounded
+        moreButton.controlSize = .small
+        moreButton.target = self
+        moreButton.action = #selector(showMore)
+        moreButton.translatesAutoresizingMaskIntoConstraints = false
+
         root.addSubview(title)
         root.addSubview(body)
+        root.addSubview(histTitle)
+        root.addSubview(scroll)
+        root.addSubview(moreButton)
         NSLayoutConstraint.activate([
             title.topAnchor.constraint(equalTo: root.topAnchor, constant: 24),
             title.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
             body.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 16),
             body.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
             body.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -24),
+            histTitle.topAnchor.constraint(equalTo: body.bottomAnchor, constant: 20),
+            histTitle.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            scroll.topAnchor.constraint(equalTo: histTitle.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+            scroll.bottomAnchor.constraint(equalTo: moreButton.topAnchor, constant: -8),
+            moreButton.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            moreButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
         ])
         self.view = root
+    }
+
+    @objc private func showMore() {
+        historyShown += 100
+        loadHistory()
+    }
+
+    private func loadHistory() {
+        let path = "\(mkHome)/activity.log"
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+            history = []
+            historyTable.reloadData()
+            return
+        }
+        let all = text.split(separator: "\n").map(String.init).reversed()
+        history = Array(all.prefix(historyShown))
+        moreButton.isHidden = all.count <= historyShown
+        historyTable.reloadData()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { history.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?,
+                   row: Int) -> NSView? {
+        let cell = NSTableCellView()
+        let f = NSTextField(labelWithString: history[row])
+        f.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        f.textColor = .secondaryLabelColor
+        f.lineBreakMode = .byTruncatingTail
+        f.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(f)
+        cell.textField = f
+        NSLayoutConstraint.activate([
+            f.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+            f.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
+            f.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
     }
 
     override func viewWillAppear() {
         super.viewWillAppear()
         refresh()
+        loadHistory()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.refresh()
+            self?.loadHistory()
         }
     }
 
@@ -3252,7 +3329,7 @@ final class SettingsViewController: NSViewController {
 // MARK: - Main window (status strip + sidebar + detail)
 
 final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
-    private let sidebarItems = ["Meetings", "Vocab", "Upload", "Profiles", "Activity"]
+    private let sidebarItems = ["Meetings", "Vocab", "Upload", "Profiles"]
     private let sidebar = NSTableView()
 
     private let stripDot = NSTextField(labelWithString: "●")
@@ -3274,6 +3351,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     let profilesVC = ProfilesViewController()
     let activityVC = ActivityViewController()
     private let settingsButton = NSButton()
+    private let activityButton = NSButton()
 
     private var pollTimer: Timer?
 
@@ -3369,6 +3447,19 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         settingsButton.target = self
         settingsButton.action = #selector(openSettings)
         settingsButton.translatesAutoresizingMaskIntoConstraints = false
+        activityButton.title = "Activity"
+        if let icon = NSImage(systemSymbolName: "list.bullet.rectangle",
+                              accessibilityDescription: "Activity") {
+            activityButton.image = icon
+            activityButton.imagePosition = .imageLeading
+        }
+        activityButton.isBordered = false
+        activityButton.alignment = .left
+        activityButton.font = NSFont.systemFont(ofSize: 13)
+        activityButton.contentTintColor = .secondaryLabelColor
+        activityButton.target = self
+        activityButton.action = #selector(openActivity)
+        activityButton.translatesAutoresizingMaskIntoConstraints = false
 
         let sideDivider = NSBox()
         sideDivider.boxType = .separator
@@ -3380,6 +3471,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         content.addSubview(stripDivider)
         content.addSubview(sideScroll)
         content.addSubview(settingsButton)
+        content.addSubview(activityButton)
         content.addSubview(sideDivider)
         content.addSubview(detailContainer)
         NSLayoutConstraint.activate([
@@ -3394,10 +3486,14 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             sideScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             sideScroll.widthAnchor.constraint(equalToConstant: 150),
             sideScroll.bottomAnchor.constraint(equalTo: settingsButton.topAnchor, constant: -4),
+            activityButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            activityButton.widthAnchor.constraint(equalToConstant: 130),
+            activityButton.heightAnchor.constraint(equalToConstant: 26),
+            activityButton.topAnchor.constraint(equalTo: settingsButton.bottomAnchor, constant: 2),
+            activityButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
             settingsButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
             settingsButton.widthAnchor.constraint(equalToConstant: 130),
             settingsButton.heightAnchor.constraint(equalToConstant: 26),
-            settingsButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
             sideDivider.topAnchor.constraint(equalTo: stripDivider.bottomAnchor),
             sideDivider.leadingAnchor.constraint(equalTo: sideScroll.trailingAnchor),
             sideDivider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
@@ -3484,6 +3580,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     @objc private func openSettings() {
         sidebar.deselectAll(nil)
         showPage(5)
+    }
+
+    @objc private func openActivity() {
+        sidebar.deselectAll(nil)
+        showPage(4)
     }
 
     func openTranscript(_ path: String?) {

@@ -88,6 +88,13 @@ mk_notify() {
     disown 2>/dev/null || true
 }
 
+# Append one line to the persistent activity log (the app's Activity
+# page history). Every meaningful event — starts, stops, imports,
+# reprocesses, discards — should leave a timestamped trace here.
+mk_activity() {
+    print -- "$(date '+%Y-%m-%d %H:%M:%S')  $*" >> "$MK_HOME/activity.log" 2>/dev/null || true
+}
+
 # Code-signing identity for the app bundles. TCC (mic / screen recording)
 # keys grants to the SIGNATURE, and an ad-hoc signature is a content hash —
 # every rebuild mints a new identity and silently invalidates every grant
@@ -949,6 +956,7 @@ cmd_start() {
     disown 2>/dev/null || true
 
     mk_notify "Recording started" "${session_stamp} — live transcript is filling in"
+    mk_activity "recording started — ${session_stamp}"
 
     print -P ""
     print -P "${C[green]}${C[bold]}● Recording started${C[reset]}  (PID $(cat "$PID_FILE"))"
@@ -1018,6 +1026,7 @@ cmd_stop() {
 
     print -P "${C[green]}✓${C[reset]} Stopped."
     mk_notify "Recording stopped" "Post-processing…"
+    mk_activity "recording stopped — ${${stop_target:t}:r}"
 
     # Heal splintered speaker labels before titling/summary read the file:
     # clusters the diarize-server merged mid-session leave stale
@@ -1071,6 +1080,7 @@ cmd_stop() {
 
     rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
     mk_notify "Meeting ready" "${${stop_target:t}:r} — transcript and audio processed"
+    mk_activity "meeting ready — ${${stop_target:t}:r}"
 
     if [[ -f "$stop_target" ]]; then
         local lines=$(wc -l < "$stop_target" | tr -d ' ')
@@ -1118,6 +1128,7 @@ cmd_discard() {
         ln -sfn "$f" "$MK_TRANSCRIPT"
         break
     done
+    mk_activity "recording discarded — ${actual:t:r}"
     print -P "${C[green]}✓${C[reset]} Recording discarded."
 }
 

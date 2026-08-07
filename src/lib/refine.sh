@@ -427,6 +427,7 @@ cmd_reprocess() {
         [[ -f "$tmpdir/out.txt.timing.json" ]] && mv "$tmpdir/out.txt.timing.json" "${base}.timing.json"
         local n=$(grep -cE '^\[[0-9:]{8}\]' "$actual")
         print -P "${C[green]}✓${C[reset]} Reprocessed: ${n} lines ${C[dim]}(previous kept: ${base:t}.pre-reprocess.txt)${C[reset]}"
+        typeset -f mk_activity >/dev/null && mk_activity "reprocessed — ${${actual:t}:r}"
         # Rebuild the listenable m4a too — reprocess exists to pick up
         # pipeline improvements, and the audio pipeline is part of that.
         if [[ -s "$tmpdir/mic.raw" && -s "$tmpdir/sys.raw" ]]; then
@@ -475,6 +476,7 @@ cmd_relabel() {
     if (( rc == 0 )) && grep -qE '^\[' "$tmp"; then
         cat "$tmp" > "$actual"
         print -P "${C[green]}✓${C[reset]} Speakers relabeled ${C[dim]}(see /tmp/meetink-refine.log for the change count)${C[reset]}"
+        typeset -f mk_activity >/dev/null && mk_activity "relabeled — ${${actual:t}:r}"
     else
         print -P "${C[red]}error:${C[reset]} relabel failed ${C[dim]}(see /tmp/meetink-refine.log — full reprocess is the fallback)${C[reset]}"
     fi
@@ -524,6 +526,7 @@ cmd_refine() {
     } > "$out"
 
     print -P "${C[bright_yellow]}▸${C[reset]} Transcribing ${C[bold]}${input:t}${C[reset]} ${C[dim]}(parakeet)...${C[reset]}"
+    typeset -f mk_activity >/dev/null && mk_activity "import started — ${input:t}"
     _refine_lock
     # Same narration files the stop pipeline uses — the Meetings page
     # marks THIS row orange while the import works.
@@ -601,5 +604,6 @@ cmd_refine() {
         [[ -n "$by_ino" && -f "$by_ino" ]] && final="$by_ino"
     fi
     [[ -f "$final" ]] || final="$out"
+    typeset -f mk_activity >/dev/null && mk_activity "import finished — ${${final:t}:r}"
     print -- "TRANSCRIPT_PATH: $final"
 }
