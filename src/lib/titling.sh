@@ -619,7 +619,25 @@ title_session_file() {
     # name — the '# event:' header the capture binary wrote. Use it (slug
     # for the folder, exact title into meta.json) and skip the LLM guess.
     # Instant detections write '(instant meeting)' and fall through.
-    local event_title=$(grep '^# event: ' "$file" 2>/dev/null | head -1 | sed 's/^# event: //')
+    #
+    # A title in meta.json wins over the header: the app writes it there
+    # when the user renames or links an event DURING the recording — a
+    # live meeting can't be moved on disk (capture appends by path), so
+    # the physical rename lands here, at stop.
+    local event_title=""
+    local metaf="${file%.txt}.meta.json"
+    if [[ -f "$metaf" ]]; then
+        event_title=$(python3 - "$metaf" <<'PYEOF3' 2>/dev/null
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("title", "") or "")
+except Exception:
+    pass
+PYEOF3
+)
+    fi
+    [[ -z "$event_title" ]] && \
+        event_title=$(grep '^# event: ' "$file" 2>/dev/null | head -1 | sed 's/^# event: //')
     local slug=""
     if [[ -n "$event_title" && "$event_title" != "(instant meeting)" ]]; then
         slug=$(print -rn -- "$event_title" | tr -c 'A-Za-z0-9' '-' \

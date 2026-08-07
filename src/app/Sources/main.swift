@@ -186,6 +186,23 @@ func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> N
     return img
 }
 
+/// True when this transcript is the one the capture binary is writing
+/// RIGHT NOW. It matters because capture re-opens the transcript BY PATH
+/// on every append — move the file or its folder and every later chunk
+/// silently vanishes (field case: live transcript froze after Link Event
+/// mid-call).
+func isLiveRecording(txtPath: String) -> Bool {
+    guard recordingPID() != nil else { return false }
+    let live = liveSymlinkPath()
+    guard let dest = try? FileManager.default
+        .destinationOfSymbolicLink(atPath: live) else { return false }
+    let resolved = dest.hasPrefix("/")
+        ? dest
+        : (live as NSString).deletingLastPathComponent + "/" + dest
+    return (resolved as NSString).standardizingPath
+        == (txtPath as NSString).standardizingPath
+}
+
 /// Rename a meeting to a new display name: slugify, keep the timestamp
 /// prefix, move the session folder + every same-basename file (or the flat
 /// siblings), and retarget live.txt if it pointed at the old path. Returns
@@ -193,6 +210,14 @@ func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> N
 func renameMeeting(txtPath: String, displayName: String) -> String? {
     let title = displayName.trimmingCharacters(in: .whitespaces)
     guard !title.isEmpty else { return nil }
+    // A live meeting must not move on disk (see isLiveRecording). Record
+    // the exact title in meta.json — the display name updates everywhere
+    // immediately — and let stop-time titling perform the physical rename
+    // with its lockstep machinery once capture has exited.
+    if isLiveRecording(txtPath: txtPath) {
+        setMeetingMeta(txtPath, "title", title)
+        return txtPath
+    }
     // The exact title (dashes, punctuation, anything) goes to metadata
     // FIRST — it travels with the same-basename rename below. The slug is
     // just the folder's readable spelling.
@@ -981,6 +1006,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
         let liveRecording = fixedPath == nil && recordingPID() != nil
         if liveRecording {
+            // Linking while live is safe: it writes meta + header lines
+            // only, and the physical rename waits for /stop (capture
+            // appends by path — see isLiveRecording).
+            if !lastResolvedPath.isEmpty {
+                add("Link Event…", #selector(linkEvent))
+                menu.addItem(.separator())
+            }
             add("Discard Recording…", #selector(discardRecording))
         } else if !lastResolvedPath.isEmpty {
             // Even an empty/broken transcript can be linked or deleted —
@@ -1136,13 +1168,26 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             if fixedPath != nil { fixedPath = newPath }
             path = newPath
         }
-        if !names.isEmpty, var text = try? String(contentsOfFile: path, encoding: .utf8) {
-            let line = "# attendees: " + names.joined(separator: ", ")
-            if let r = text.range(of: #"^# attendees:.*$"#,
-                                  options: [.regularExpression]) {
-                text.replaceSubrange(r, with: line)
-            } else if let r = text.range(of: "Started:") {
-                text.insert(contentsOf: line + "\n", at: r.lowerBound)
+        if (!names.isEmpty || !title.isEmpty),
+           var text = try? String(contentsOfFile: path, encoding: .utf8) {
+            // Header edits are safe on a LIVE transcript — capture
+            // re-opens by path per append, and the path doesn't change
+            // here. '# event:' is what stop-time titling reads to name
+            // the meeting (live meetings defer their rename to /stop);
+            // '# attendees:' feeds the diarize whitelist mid-call.
+            func upsert(_ line: String, matching pattern: String) {
+                if let r = text.range(of: pattern, options: [.regularExpression]) {
+                    text.replaceSubrange(r, with: line)
+                } else if let r = text.range(of: "Started:") {
+                    text.insert(contentsOf: line + "\n", at: r.lowerBound)
+                }
+            }
+            if !title.isEmpty {
+                upsert("# event: " + title, matching: #"(?m)^# event:.*$"#)
+            }
+            if !names.isEmpty {
+                upsert("# attendees: " + names.joined(separator: ", "),
+                       matching: #"(?m)^# attendees:.*$"#)
             }
             try? text.write(toFile: path, atomically: true, encoding: .utf8)
         }
