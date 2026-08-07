@@ -969,6 +969,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             // Even an empty/broken transcript can be linked or deleted —
             // gating on content left the button silently dead.
             add("Link Event…", #selector(linkEvent))
+            add("Relabel Speakers (fast)…", #selector(relabelSpeakers))
             menu.addItem(.separator())
             add("Delete Meeting…", #selector(deleteMeeting))
         } else {
@@ -1129,6 +1130,21 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             try? text.write(toFile: path, atomically: true, encoding: .utf8)
         }
         refreshIfChanged(force: true)
+    }
+
+    /// Fast recluster: propagates per-segment corrections (exemplar
+    /// anchoring) without retranscribing — about a minute, vs a full
+    /// reprocess's many. The transcript reloads via the file watcher.
+    @objc private func relabelSpeakers() {
+        guard let launcher = launcherPath(), !lastResolvedPath.isEmpty else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["relabel", lastResolvedPath]
+        DispatchQueue.global().async { [weak self] in
+            try? proc.run()
+            proc.waitUntilExit()
+            DispatchQueue.main.async { self?.refreshIfChanged(force: true) }
+        }
     }
 
     /// Re-run the whole pipeline on this recording's kept audio (spools
@@ -2125,6 +2141,19 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     /// (the invariant titling relies on); flat legacy files rename in place.
     @objc private func renameClicked() {
         guard let f = clickedFile() else { return }
+        // Renaming moves the folder out from under an in-flight job — the
+        // reader's title field locks during processing, but this path
+        // didn't (field case: meeting renamed mid-import, the 20-minute
+        // pyannote run nearly wrote into a vanished directory).
+        if let pp = postprocPath(),
+           (pp as NSString).deletingLastPathComponent
+               == (f.path as NSString).deletingLastPathComponent {
+            let alert = NSAlert()
+            alert.messageText = "This meeting is still processing"
+            alert.informativeText = "Rename it when post-processing finishes."
+            alert.runModal()
+            return
+        }
         let alert = NSAlert()
         alert.messageText = "Rename meeting"
         alert.addButton(withTitle: "Rename")

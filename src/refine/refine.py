@@ -653,6 +653,42 @@ def offline_diarize_multi(streams: list[dict], port: int,
         for k in g:
             win_label[k] = lab
 
+    # Exemplar anchoring: the user's per-segment corrections are FEW-SHOT
+    # VOICEPRINTS, not just cluster names. When clustering FUSED several
+    # people into one cluster, overlap voting can only rename the fused
+    # blob — but a centroid built from each corrected span lets every
+    # window re-test against the actual voices, and strong matches take
+    # the person's label directly, overriding the fused cluster. Per-
+    # segment voting below then re-attributes the meeting. Workflow:
+    # reassign one clean span per person, hit Reprocess.
+    if priors:
+        per: dict[str, list] = {}
+        for k, (si, i, t0, t1) in enumerate(windows):
+            mid = (t0 + t1) / 2
+            for (p0, p1, lab) in priors:
+                if p0 <= mid <= p1:
+                    per.setdefault(lab, []).append(E[k])
+                    break
+        exemplars = {lab: (lambda m: m / (np.linalg.norm(m) + 1e-9))(
+                        np.mean(vs, axis=0))
+                     for lab, vs in per.items() if len(vs) >= 2}
+        if len(exemplars) >= 2:
+            # Two+ distinct voices pointed out — that's a real distinction
+            # worth propagating. (A single exemplar adds nothing beyond
+            # the overlap voting above.)
+            ANCHOR_FLOOR = 0.40   # between sticky (0.38) and cluster (0.50)
+            labs = list(exemplars)
+            M = np.stack([exemplars[l] for l in labs])
+            sims = E @ M.T
+            anchored = 0
+            for k in range(len(E)):
+                j = int(np.argmax(sims[k]))
+                if sims[k, j] >= ANCHOR_FLOOR:
+                    win_label[k] = labs[j]
+                    anchored += 1
+            log(f"exemplar anchoring: {len(exemplars)} corrected voices "
+                f"({', '.join(labs)}) re-attributed {anchored}/{len(E)} windows")
+
     # 4. Per-segment vote (duration-weighted) + single-change splits.
     out: list[dict] = []
     by_seg: dict[tuple[int, int], list] = {}
@@ -736,6 +772,69 @@ def offline_diarize_multi(streams: list[dict], port: int,
     return out
 
 
+def relabel_main(args) -> int:
+    """Recluster WITHOUT retranscribing. The transcript's text and the
+    timing sidecar already carry everything except fresh labels: segments
+    come from timing.json (offsets ARE the kept m4a's timeline — that's
+    what playback sync runs on), audio from the kept m4a, and the current
+    labels act as priors + exemplar corrections. A full reprocess spends
+    most of its minutes in Parakeet for text that will not change."""
+    txt = Path(args.relabel)
+    base = str(txt)[: -len(".txt")]
+    tj = Path(base + ".timing.json")
+    m4a = Path(base + ".m4a")
+    if not (txt.is_file() and tj.is_file() and m4a.is_file()):
+        log("relabel needs the transcript, its .timing.json and kept .m4a")
+        return 1
+    timing = json.loads(tj.read_text())["lines"]
+    lines = [l for l in txt.read_text(errors="replace").splitlines()
+             if re.match(r"^\[\d{2}:\d{2}:\d{2}\] [^:]+: ", l)]
+    if len(lines) != len(timing):
+        log(f"transcript/timing misaligned ({len(lines)} vs {len(timing)}) — "
+            f"run a full reprocess instead")
+        return 1
+
+    raw = decode_to_raw(str(m4a))
+    segs = []
+    for i, (line, t) in enumerate(zip(lines, timing)):
+        m = re.match(r"^\[[\d:]+\] ([^:]+): (.*)$", line)
+        start = float(t.get("t", 0))
+        end = float(timing[i + 1].get("t", start + 30)) if i + 1 < len(timing) \
+            else start + 30
+        segs.append({"start": start, "end": max(end, start + 0.5),
+                     "text": m.group(2) if m else "", "tokens": None})
+
+    labeled = offline_diarize_multi(
+        [{"raw": raw, "segs": segs, "origin": "import"}],
+        args.diarize_port, me_label=args.me,
+        priors=parse_label_priors(str(txt)))
+    if labeled is None:
+        log("diarize sidecar unreachable — relabel needs it")
+        return 1
+
+    # 1:1 with the original lines — only the label changes.
+    out_lines = []
+    changed = 0
+    for line, seg, t in zip(lines, labeled, timing):
+        m = re.match(r"^(\[[\d:]+\]) ([^:]+): (.*)$", line)
+        new = f"{m.group(1)} {seg['label']}: {m.group(3)}"
+        if seg["label"] != m.group(2):
+            changed += 1
+        out_lines.append(new)
+        t["label"] = seg["label"]
+
+    # Rewrite content lines in place, headers/footers untouched.
+    all_lines = txt.read_text(errors="replace").splitlines()
+    it = iter(out_lines)
+    for i, l in enumerate(all_lines):
+        if re.match(r"^\[\d{2}:\d{2}:\d{2}\] [^:]+: ", l):
+            all_lines[i] = next(it)
+    Path(args.out).write_text("\n".join(all_lines) + "\n")
+    tj.write_text(json.dumps({"lines": timing}))
+    log(f"relabel: {changed}/{len(lines)} lines changed speaker")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mic", help="mic-stream spool (raw s16le/16k/mono)")
@@ -746,9 +845,14 @@ def main() -> int:
     ap.add_argument("--header-from", help="copy header lines from this transcript")
     ap.add_argument("--started", help="session start (ISO8601) for wall-clock stamps")
     ap.add_argument("--prior", help="existing transcript whose labels seed the reprocess")
+    ap.add_argument("--relabel", help="fast path: re-diarize an EXISTING transcript "
+                    "using its timing sidecar and kept audio — no transcription, "
+                    "no enhancement; exemplar corrections propagate")
     ap.add_argument("--diarize-port", type=int, default=8179)
     args = ap.parse_args()
 
+    if args.relabel:
+        return relabel_main(args)
     if not args.input and not (args.mic or args.sys_):
         ap.error("need --input or at least one of --mic/--sys")
 

@@ -446,6 +446,42 @@ cmd_reprocess() {
         mk_notify "Reprocess done" "${${actual:t}:r}"
 }
 
+# Fast recluster of an existing meeting: no transcription, no
+# enhancement — embeddings + clustering + the user's label corrections
+# as exemplars. The 'I fixed two segments, propagate that' loop in about
+# a minute instead of a full reprocess.
+#   $1 = transcript path (or empty = latest)
+cmd_relabel() {
+    local file="${1:-$MK_TRANSCRIPT}" actual
+    actual="$file"
+    [[ -L "$file" ]] && actual=$(readlink "$file" 2>/dev/null)
+    if [[ ! -f "$actual" ]]; then
+        print -P "${C[red]}error:${C[reset]} no such transcript: $file"
+        return 1
+    fi
+    refine_available || { print -P "${C[red]}error:${C[reset]} parakeet venv missing"; return 1 }
+    local me=$(me_name_get 2>/dev/null)
+    local tmp=$(mktemp -t meetink-relabel)
+    print -P "${C[bright_yellow]}▸${C[reset]} Relabeling speakers ${C[bold]}${actual:t}${C[reset]} ${C[dim]}(fast — no retranscription)...${C[reset]}"
+    _refine_lock
+    local state=/tmp/meetink-postproc.state
+    print -- "relabeling speakers (fast)" > "$state"
+    print -- "$actual" > /tmp/meetink-postproc.path
+    local rc=0
+    "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" \
+        --relabel "$actual" --me "${me:-ME}" --out "$tmp" \
+        2>>/tmp/meetink-refine.log || rc=$?
+    _refine_unlock
+    if (( rc == 0 )) && grep -qE '^\[' "$tmp"; then
+        cat "$tmp" > "$actual"
+        print -P "${C[green]}✓${C[reset]} Speakers relabeled ${C[dim]}(see /tmp/meetink-refine.log for the change count)${C[reset]}"
+    else
+        print -P "${C[red]}error:${C[reset]} relabel failed ${C[dim]}(see /tmp/meetink-refine.log — full reprocess is the fallback)${C[reset]}"
+    fi
+    rm -f "$tmp" /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+    (( rc == 0 ))
+}
+
 # Import an audio file as a transcript: decode → parakeet → diarize →
 # title → summary. The transcript lands in the active project's folder and
 # live.txt points at it (unless a recording is in flight), so the app
