@@ -604,6 +604,10 @@ cmd_refine() {
     # The status line keeps the app's import window narrating through the
     # LLM phase, which has no measurable progress.
     print -- "refine: status generating title and summary"
+    # The state file too — post-transcription stages ran silently there
+    # and Activity showed a stale 'pyannote 100%' for minutes (field
+    # report: 'hanging at 100%' while the summary LLM worked).
+    print -- "generating title and summary (step 3/3)" > /tmp/meetink-postproc.state
     local ino=$(stat -f %i "$out" 2>/dev/null)
     if typeset -f title_session_file >/dev/null 2>&1; then
         title_session_file "$out"
