@@ -324,7 +324,7 @@ func formatMeetingDate(_ date: Date) -> String {
 func meetingDuration(_ txtPath: String, isLive: Bool) -> TimeInterval? {
     guard let fh = FileHandle(forReadingAtPath: txtPath) else { return nil }
     defer { try? fh.close() }
-    let head = String(data: fh.readData(ofLength: 500), encoding: .utf8) ?? ""
+    let head = String(data: fh.readData(ofLength: 2048), encoding: .utf8) ?? ""
     guard let sr = head.range(of: #"Started: ([0-9T:+.Z-]+)"#, options: .regularExpression),
           let started = isoParser.date(from: String(head[sr]).replacingOccurrences(
             of: "Started: ", with: "")) else { return nil }
@@ -338,19 +338,28 @@ func meetingDuration(_ txtPath: String, isLive: Bool) -> TimeInterval? {
             of: "Ended: ", with: "")) {
         return max(0, ended.timeIntervalSince(started))
     }
-    // No footer (crashed session): last line stamp minus Started, both as
-    // local seconds-of-day.
-    var lastStamp: (Int, Int, Int)? = nil
-    for line in tail.split(separator: "\n").reversed() {
-        if let m = line.range(of: #"^\[(\d{2}):(\d{2}):(\d{2})\]"#, options: .regularExpression) {
-            let p = line[m].dropFirst().dropLast().split(separator: ":").compactMap { Int($0) }
-            if p.count == 3 { lastStamp = (p[0], p[1], p[2]); break }
+    // No footer: last line stamp minus FIRST line stamp. Comparing the
+    // last stamp against the Started header breaks on imports, whose
+    // stamps are relative to the audio ("[01:50:05]" = 1h50m in) — read
+    // as 1:50 AM wall clock that wrapped past midnight into "15h 40m"
+    // (field case). First-to-last works for imports (first ≈ 00:00:00)
+    // and crashed live sessions (first ≈ Started) alike.
+    func stamp(in lines: [Substring]) -> Int? {
+        for line in lines {
+            if let m = line.range(of: #"^\[(\d{2}):(\d{2}):(\d{2})\]"#,
+                                  options: .regularExpression) {
+                let p = line[m].dropFirst().dropLast()
+                    .split(separator: ":").compactMap { Int($0) }
+                if p.count == 3 { return p[0] * 3600 + p[1] * 60 + p[2] }
+            }
         }
+        return nil
     }
-    guard let (h, m, sec) = lastStamp else { return nil }
-    let c = Calendar.current.dateComponents([.hour, .minute, .second], from: started)
-    var d = TimeInterval((h - c.hour!) * 3600 + (m - c.minute!) * 60 + (sec - c.second!))
-    if d < -3600 { d += 86400 }
+    guard let last = stamp(in: tail.split(separator: "\n").reversed()
+                                    .map { $0 }) else { return nil }
+    let first = stamp(in: head.split(separator: "\n")) ?? last
+    var d = TimeInterval(last - first)
+    if d < 0 { d += 86400 }
     return max(0, d)
 }
 
@@ -2189,9 +2198,51 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
 // MARK: - Meetings list page
 
+/// Table with Finder-ish affordances: ⌘⌫ deletes the selection, and a
+/// single click on the NAME of the already-selected row begins an inline
+/// rename — deferred past the double-click window so double-click still
+/// means "open". Any new click cancels the pending rename.
+final class MeetingsTable: NSTableView {
+    var onDeleteKey: (() -> Void)?
+    var onNameClickWhileSelected: ((Int) -> Void)?
+    private var pendingRename: DispatchWorkItem?
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 51,  // delete/backspace
+           event.modifierFlags.contains(.command),
+           !selectedRowIndexes.isEmpty {
+            onDeleteKey?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        pendingRename?.cancel()
+        let p = convert(event.locationInWindow, from: nil)
+        let r = row(at: p)
+        let wasSingleSelection = r >= 0
+            && selectedRowIndexes == IndexSet(integer: r)
+        let onName = column(at: p) == 0
+        super.mouseDown(with: event)
+        guard wasSingleSelection, onName, event.clickCount == 1,
+              selectedRowIndexes == IndexSet(integer: r) else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.onNameClickWhileSelected?(r)
+        }
+        pendingRename = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + NSEvent.doubleClickInterval, execute: work)
+    }
+}
+
 final class MeetingsViewController: NSViewController, NSTableViewDataSource,
-                                    NSTableViewDelegate, NSMenuDelegate {
-    private let table = NSTableView()
+                                    NSTableViewDelegate, NSMenuDelegate,
+                                    NSTextFieldDelegate {
+    private let table = MeetingsTable()
+    /// Path of the meeting whose name cell is mid-edit; pauses the 2 s
+    /// refresh (a reload would replace the cell under the field editor).
+    private var inlineEditPath: String?
     private enum MeetingStatus { case live, processing, playing, ended }
     /// Wired by MainWindowController to the reader: the txt path whose
     /// audio is currently playing (nil when paused/stopped).
@@ -2235,6 +2286,13 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         table.delegate = self
         table.target = self
         table.doubleAction = #selector(openSelected)
+        table.onDeleteKey = { [weak self] in
+            guard let self else { return }
+            self.deleteRows(Array(self.table.selectedRowIndexes))
+        }
+        table.onNameClickWhileSelected = { [weak self] row in
+            self?.beginInlineRename(row: row)
+        }
         table.usesAlternatingRowBackgroundColors = true
         table.allowsMultipleSelection = true
         let menu = NSMenu()
@@ -2300,7 +2358,11 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     }
 
     @objc private func deleteClicked() {
-        let rows = targetRows().filter { $0 < files.count }
+        deleteRows(targetRows())
+    }
+
+    private func deleteRows(_ rowsIn: [Int]) {
+        let rows = rowsIn.filter { $0 < files.count }
         guard !rows.isEmpty else { return }
         let alert = NSAlert()
         alert.messageText = rows.count == 1
@@ -2337,12 +2399,62 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         }
     }
 
+    // MARK: inline rename (slow click on the selected row's name)
+
+    private func beginInlineRename(row: Int) {
+        guard row >= 0, row < files.count, inlineEditPath == nil else { return }
+        let f = files[row]
+        // Same rule as the context-menu rename: nothing moves under a
+        // running post-process job.
+        if let pp = postprocPath(),
+           (pp as NSString).deletingLastPathComponent
+               == (f.path as NSString).deletingLastPathComponent { return }
+        guard let cell = table.view(atColumn: 0, row: row, makeIfNecessary: false)
+                as? NSTableCellView,
+              let tf = cell.textField else { return }
+        inlineEditPath = f.path
+        tf.isEditable = true
+        tf.isSelectable = true
+        tf.delegate = self
+        tf.stringValue = f.name
+        view.window?.makeFirstResponder(tf)
+        tf.currentEditor()?.selectAll(nil)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard let tf = obj.object as? NSTextField,
+              let path = inlineEditPath else { return }
+        tf.isEditable = false
+        tf.isSelectable = false
+        inlineEditPath = nil
+        let newName = tf.stringValue.trimmingCharacters(in: .whitespaces)
+        if !newName.isEmpty, newName != meetingDisplayName(path) {
+            _ = renameMeeting(txtPath: path, displayName: newName)
+        }
+        refresh()
+    }
+
+    func control(_ control: NSControl, textView: NSTextView,
+                 doCommandBy commandSelector: Selector) -> Bool {
+        // Esc = cancel: restore the old name so end-editing is a no-op.
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)),
+           let path = inlineEditPath, let tf = control as? NSTextField {
+            tf.stringValue = meetingDisplayName(path)
+            view.window?.makeFirstResponder(table)
+            return true
+        }
+        return false
+    }
+
     override func viewDidAppear() {
         super.viewDidAppear()
         refresh()
     }
 
     func refresh() {
+        // A reload would tear the field editor out of a mid-flight
+        // inline rename; the 2 s tick resumes when editing ends.
+        guard inlineEditPath == nil else { return }
         let dir = transcriptsDir()
         let fm = FileManager.default
         let items = (try? fm.contentsOfDirectory(atPath: dir)) ?? []

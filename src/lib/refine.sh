@@ -173,10 +173,17 @@ _mix_enhanced_m4a() {
     local ed=""
     if enhance_enabled && [[ -x "$MK_PARAKEET_VENV/bin/python" ]]; then
         ed=$(mktemp -d -t meetink-enhance)
+        # live_deepfilter=off keeps the echo-cancel but skips DFN on live
+        # mixes — DFN's denoise can leave voices tinny/robotic (same
+        # artifact class that made it opt-in for imports).
+        local -a dfnflag=()
+        [[ "$(grep '^live_deepfilter=' "$MK_CONFIG_FILE" 2>/dev/null | cut -d= -f2-)" == "off" ]] \
+            && dfnflag=(--no-deepfilter)
         if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/enhance.py" \
                 --mic "$mic" --sys "$sys" \
                 --out-mic "$ed/mic.raw" --out-sys "$ed/sys.raw" \
                 --progress-state /tmp/meetink-postproc.state \
+                "${dfnflag[@]}" \
                 2>>/tmp/meetink-refine.log; then
             mic="$ed/mic.raw"
             sys="$ed/sys.raw"
