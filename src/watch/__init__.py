@@ -345,11 +345,34 @@ def _match_attendees_to_profiles(attendees: list) -> list[str]:
 LAUNCHER = Path(__file__).resolve().parent.parent.parent / "bin" / "meetink"
 
 
+def _active_project() -> str:
+    cfg = MK_HOME / "config"
+    try:
+        for line in cfg.read_text().splitlines():
+            if line.startswith("active_project="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
 def _project_use(name: str) -> None:
     if not name:
         return
     subprocess.run([str(LAUNCHER), "project", "use", name],
                    check=False, capture_output=True)
+
+
+def _project_restore(prior: str) -> None:
+    """Put active_project back the way it was before a routed recording.
+    Leaving it set outlived the recording and scoped the whole app to the
+    routed folder — the meetings list went empty (field case)."""
+    if prior:
+        subprocess.run([str(LAUNCHER), "project", "use", prior],
+                       check=False, capture_output=True)
+    else:
+        subprocess.run([str(LAUNCHER), "project", "clear"],
+                       check=False, capture_output=True)
 
 
 def _start_recording_subprocess(env_extras: dict[str, str]) -> bool:
@@ -724,6 +747,8 @@ class WatchManager:
         # Drop the lock while we shell out — both subprocesses can take
         # 1-2 s on a cold whisper-server.
         if chosen.project:
+            self._project_before_routing = _active_project()
+            self._routed_project = True
             _project_use(chosen.project)
 
         # Auto-tune diarize sensitivity from the attendee count before
@@ -874,6 +899,7 @@ class WatchManager:
 
         # Drop the lock to shell out /stop
         _stop_recording_subprocess()
+        restore_project = False
         with self._lock:
             was_instant = False
             if recording_id and recording_id in self._events:
@@ -883,6 +909,9 @@ class WatchManager:
             self._currently_recording = None
             self._inactive_streak = 0
             self._instant_streak = 0
+            if getattr(self, "_routed_project", False):
+                self._routed_project = False
+                restore_project = True
             # Brief blips after wrap-up (e.g. user switches Zoom windows
             # while saying goodbye) shouldn't immediately re-arm instant
             # detection on the same call.
@@ -890,6 +919,8 @@ class WatchManager:
                 self._end_cooldown_until = (
                     time.time() + INSTANT_END_COOLDOWN_S
                 )
+        if restore_project:
+            _project_restore(getattr(self, "_project_before_routing", ""))
 
     # -- instant-meeting detection ----------------------------------------
 

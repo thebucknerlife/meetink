@@ -76,6 +76,18 @@ def _list_projects() -> list[str]:
                 continue
             if p.name.startswith(".") or p.name.startswith("_"):
                 continue
+            # Per-meeting session folders are NOT projects. Since the
+            # per-meeting-folders migration every meeting is a directory
+            # here, and offering them to the router had real fallout: an
+            # event matched a previous meeting's folder, project_use
+            # scoped the whole app to it, and the meetings list went
+            # empty ("all of my old meetings are gone"). Sessions are
+            # recognizable by the timestamp prefix or by containing
+            # their own same-named transcript.
+            if re.match(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}", p.name):
+                continue
+            if (p / f"{p.name}.txt").is_file():
+                continue
             out.append(p.name)
     except OSError:
         pass
