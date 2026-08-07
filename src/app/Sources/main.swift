@@ -1223,16 +1223,64 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             for: .downloadsDirectory, in: .userDomainMask).first
         panel.begin { [weak self] response in
             guard response == .OK, let dest = panel.url, let self else { return }
-            try? FileManager.default.removeItem(at: dest)
-            try? FileManager.default.copyItem(
-                at: URL(fileURLWithPath: self.lastResolvedPath), to: dest)
+            let content = self.exportHeader()
+                + ((try? String(contentsOfFile: self.lastResolvedPath, encoding: .utf8)) ?? "")
+            try? content.write(to: dest, atomically: true, encoding: .utf8)
         }
+    }
+
+    /// Context block prepended to exports (Download / Copy All) — built
+    /// at EXPORT time so it always reflects the current labels and edits.
+    /// Written for the next reader, human or LLM: who spoke and how much,
+    /// what calendar event this was (attendees ≠ speakers), and the
+    /// caveat that low-share unlabeled voices are usually diarization
+    /// artifacts, not extra participants.
+    private func exportHeader() -> String {
+        var lines: [String] = []
+        lines.append("# Meeting: \(meetingDisplayName(lastResolvedPath))")
+        var dateLine = "# Date: \(formatMeetingDate(snapshot.startedAt ?? meetingRecordingDate(lastResolvedPath)))"
+        if let dur = meetingDuration(lastResolvedPath, isLive: false) {
+            dateLine += "  ·  Duration: \(formatDuration(dur))"
+        }
+        lines.append(dateLine)
+        let meta = meetingMeta(lastResolvedPath)
+        if let event = meta["event"] as? [String: Any] {
+            if let t = event["title"] as? String, !t.isEmpty {
+                var ev = "# Calendar event: \(t)"
+                if let st = event["start"] as? String, !st.isEmpty { ev += " — \(st)" }
+                lines.append(ev)
+            }
+            if let att = event["attendees"] as? [String], !att.isEmpty {
+                lines.append("# Event attendees (invited — not necessarily who spoke): "
+                    + att.joined(separator: ", "))
+            }
+        }
+        let hidden = hiddenSpeakerNames()
+        let visible = snapshot.talkShare.filter { !hidden.contains($0.speaker.uppercased()) }
+        let vTotal = max(visible.reduce(0) { $0 + $1.fraction }, 0.0001)
+        if !visible.isEmpty {
+            lines.append("# Speakers by talk share: " + visible.map {
+                "\($0.speaker) \(Int(($0.fraction / vTotal * 100).rounded()))%"
+            }.joined(separator: ", "))
+        }
+        let hiddenPresent = snapshot.talkShare.filter { hidden.contains($0.speaker.uppercased()) }
+        if !hiddenPresent.isEmpty {
+            lines.append("# Non-participants (excluded from shares): "
+                + hiddenPresent.map(\.speaker).joined(separator: ", "))
+        }
+        if visible.contains(where: { $0.speaker.hasPrefix("Speaker ") }) {
+            lines.append("# Note: unlabeled 'Speaker N' voices with low share are usually "
+                + "cross-talk or hard-to-diarize moments, not additional participants "
+                + "(possible, but unlikely).")
+        }
+        return lines.joined(separator: "\n") + "\n\n"
     }
 
     @objc private func copyAll() {
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(rawText.isEmpty ? textView.string : rawText, forType: .string)
+        pb.setString(exportHeader() + (rawText.isEmpty ? textView.string : rawText),
+                     forType: .string)
         copyButton.title = "Copied ✓"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
             self?.copyButton.title = "Copy All"
