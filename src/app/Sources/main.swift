@@ -156,7 +156,26 @@ func enrolledProfiles() -> [String] {
         .sorted()
 }
 
-// MARK: - The M-waveform mark
+// MARK: - The M mark
+
+/// The bundled logo mark for the menu bar: black M + alpha at 18 pt
+/// (the PNG is 36 px, so it's crisp on retina). `tint: nil` returns it
+/// template-ready; a tint bakes the color in (recording = red). Returns
+/// nil when running outside the bundle — callers fall back to the drawn
+/// waveform mark.
+func menubarMarkImage(tint: NSColor? = nil) -> NSImage? {
+    guard let path = Bundle.main.path(forResource: "menubar-m", ofType: "png"),
+          let img = NSImage(contentsOfFile: path) else { return nil }
+    img.size = NSSize(width: 18, height: 18)
+    guard let tint else { return img }
+    let tinted = NSImage(size: img.size, flipped: false) { rect in
+        img.draw(in: rect)
+        tint.setFill()
+        rect.fill(using: .sourceAtop)
+        return true
+    }
+    return tinted
+}
 
 func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> NSImage {
     let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
@@ -3591,6 +3610,11 @@ final class TodayViewController: NSViewController {
     private var fetching = false
     private var startingEventStart: String?  // start ISO of an in-flight start
     private let iso = ISO8601DateFormatter()
+    /// The row the view scrolls to when the page appears: the whole day
+    /// renders, but the viewport starts at the 3rd-most-recent past
+    /// event so "now" is what you see, with just a little history above.
+    private weak var scrollAnchor: NSView?
+    private var wantsAnchorScroll = false
 
     override func loadView() {
         let scroll = NSScrollView()
@@ -3625,10 +3649,12 @@ final class TodayViewController: NSViewController {
 
     override func viewDidAppear() {
         super.viewDidAppear()
+        wantsAnchorScroll = true
+        applyAnchorScroll()
         fetchEvents()
     }
 
-    /// Agent `events` over a -12h…+24h window (read-to-EOF before
+    /// Agent `events` over the whole local day (read-to-EOF before
     /// waitUntilExit — the pipe-deadlock lesson applies here too).
     private func fetchEvents() {
         guard !fetching else { return }
@@ -3637,9 +3663,10 @@ final class TodayViewController: NSViewController {
         fetching = true
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: agent)
+        let dayStart = Calendar.current.startOfDay(for: Date())
         var args = ["events",
-                    "--from", iso.string(from: Date().addingTimeInterval(-12 * 3600)),
-                    "--to", iso.string(from: Date().addingTimeInterval(24 * 3600))]
+                    "--from", iso.string(from: dayStart),
+                    "--to", iso.string(from: dayStart.addingTimeInterval(24 * 3600))]
         if let hidden = configValue("hidden_calendars"), !hidden.isEmpty {
             args += ["--hidden-calendars", hidden]
         }
@@ -3732,13 +3759,10 @@ final class TodayViewController: NSViewController {
                 ?? (e["start"] as? String).flatMap { iso.date(from: $0) }
             if let end, end < now { past.append(e) } else { upcoming.append(e) }
         }
-        past = Array(past.suffix(3))
-        upcoming = Array(upcoming.prefix(8))
 
         if past.isEmpty && upcoming.isEmpty {
-            let empty = NSTextField(labelWithString: events.isEmpty
-                ? "No meetings with attendees in the last 12 / next 24 hours."
-                : "Nothing to show.")
+            let empty = NSTextField(labelWithString:
+                "No meetings with attendees today.")
             empty.textColor = .secondaryLabelColor
             stack.addArrangedSubview(empty)
             return
@@ -3753,6 +3777,12 @@ final class TodayViewController: NSViewController {
                 : (liveSymlinkPath() as NSString).deletingLastPathComponent + "/" + dest
         }()
 
+        // The scroll anchor is the 3rd-most-recent past event: the whole
+        // day is in the document, but the page opens with just that much
+        // history above the fold. With ≤3 past events everything already
+        // fits from the top — no anchor, no scroll.
+        let anchorEvent = past.count > 3 ? past[past.count - 3] : nil
+        scrollAnchor = nil
         for (section, list) in [("Earlier", past), ("Up next", upcoming)] where !list.isEmpty {
             let label = NSTextField(labelWithString: section)
             label.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
@@ -3763,9 +3793,29 @@ final class TodayViewController: NSViewController {
                 stack.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: stack.widthAnchor,
                                            constant: -32).isActive = true
+                if let anchorEvent,
+                   (e["start"] as? String) == (anchorEvent["start"] as? String),
+                   (e["title"] as? String) == (anchorEvent["title"] as? String) {
+                    scrollAnchor = row
+                }
             }
             stack.setCustomSpacing(14, after: stack.arrangedSubviews.last!)
         }
+        applyAnchorScroll()
+    }
+
+    /// Scroll so the anchor row sits at the top of the viewport. Runs
+    /// only when armed by viewDidAppear — timer rebuilds must not yank
+    /// the scroll position out from under the user.
+    private func applyAnchorScroll() {
+        guard wantsAnchorScroll, let anchor = scrollAnchor,
+              let scroll = view as? NSScrollView,
+              let doc = scroll.documentView else { return }
+        doc.layoutSubtreeIfNeeded()
+        let frame = anchor.convert(anchor.bounds, to: doc)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, frame.minY - 8)))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        wantsAnchorScroll = false
     }
 
     private func makeRow(_ e: [String: Any],
@@ -3915,7 +3965,7 @@ final class TodayViewController: NSViewController {
 // MARK: - Main window (status strip + sidebar + detail)
 
 final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
-    private let sidebarItems = ["Today", "Meetings", "Vocab", "Upload", "Profiles"]
+    private let sidebarItems = ["Today", "Meetings", "Upload"]
     private let sidebar = NSTableView()
 
     private let stripDot = NSTextField(labelWithString: "●")
@@ -3939,6 +3989,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     let activityVC = ActivityViewController()
     private let settingsButton = NSButton()
     private let activityButton = NSButton()
+    private let profilesButton = NSButton()
+    private let vocabButton = NSButton()
 
     private var pollTimer: Timer?
 
@@ -3971,8 +4023,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         container.onAudioDrop = { [weak self] urls in
             guard let self else { return }
             self.uploadVC.enqueue(urls)
-            self.showPage(3)
-            self.sidebar.selectRowIndexes(IndexSet(integer: 3), byExtendingSelection: false)
+            self.showPage(2)
+            self.sidebar.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
         }
         container.onDragState = { [weak self] active in
             self?.uploadVC.setDragActive(active)
@@ -4019,34 +4071,33 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         sidebar.style = .sourceList
         sideScroll.documentView = sidebar
 
-        // Settings, pinned at the bottom of the sidebar (below the nav
-        // table, above nothing — it never scrolls away).
-        settingsButton.title = "Settings"
-        if let gear = NSImage(systemSymbolName: "gearshape",
-                              accessibilityDescription: "Settings") {
-            settingsButton.image = gear
-            settingsButton.imagePosition = .imageLeading
+        // Utility pages, pinned at the bottom of the sidebar (below the
+        // nav table — they never scroll away). Top to bottom: Settings,
+        // Activity, Profiles, Vocab.
+        func styleUtilityButton(_ b: NSButton, _ title: String,
+                                _ symbol: String, _ action: Selector) {
+            b.title = title
+            if let icon = NSImage(systemSymbolName: symbol,
+                                  accessibilityDescription: title) {
+                b.image = icon
+                b.imagePosition = .imageLeading
+            }
+            b.isBordered = false
+            b.alignment = .left
+            b.font = NSFont.systemFont(ofSize: 13)
+            b.contentTintColor = .secondaryLabelColor
+            b.target = self
+            b.action = action
+            b.translatesAutoresizingMaskIntoConstraints = false
         }
-        settingsButton.isBordered = false
-        settingsButton.alignment = .left
-        settingsButton.font = NSFont.systemFont(ofSize: 13)
-        settingsButton.contentTintColor = .secondaryLabelColor
-        settingsButton.target = self
-        settingsButton.action = #selector(openSettings)
-        settingsButton.translatesAutoresizingMaskIntoConstraints = false
-        activityButton.title = "Activity"
-        if let icon = NSImage(systemSymbolName: "list.bullet.rectangle",
-                              accessibilityDescription: "Activity") {
-            activityButton.image = icon
-            activityButton.imagePosition = .imageLeading
-        }
-        activityButton.isBordered = false
-        activityButton.alignment = .left
-        activityButton.font = NSFont.systemFont(ofSize: 13)
-        activityButton.contentTintColor = .secondaryLabelColor
-        activityButton.target = self
-        activityButton.action = #selector(openActivity)
-        activityButton.translatesAutoresizingMaskIntoConstraints = false
+        styleUtilityButton(settingsButton, "Settings", "gearshape",
+                           #selector(openSettings))
+        styleUtilityButton(activityButton, "Activity", "list.bullet.rectangle",
+                           #selector(openActivity))
+        styleUtilityButton(profilesButton, "Profiles", "person.2",
+                           #selector(openProfiles))
+        styleUtilityButton(vocabButton, "Vocab", "character.book.closed",
+                           #selector(openVocab))
 
         let sideDivider = NSBox()
         sideDivider.boxType = .separator
@@ -4059,6 +4110,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         content.addSubview(sideScroll)
         content.addSubview(settingsButton)
         content.addSubview(activityButton)
+        content.addSubview(profilesButton)
+        content.addSubview(vocabButton)
         content.addSubview(sideDivider)
         content.addSubview(detailContainer)
         NSLayoutConstraint.activate([
@@ -4073,14 +4126,22 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             sideScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             sideScroll.widthAnchor.constraint(equalToConstant: 150),
             sideScroll.bottomAnchor.constraint(equalTo: settingsButton.topAnchor, constant: -4),
+            settingsButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            settingsButton.widthAnchor.constraint(equalToConstant: 130),
+            settingsButton.heightAnchor.constraint(equalToConstant: 26),
             activityButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
             activityButton.widthAnchor.constraint(equalToConstant: 130),
             activityButton.heightAnchor.constraint(equalToConstant: 26),
             activityButton.topAnchor.constraint(equalTo: settingsButton.bottomAnchor, constant: 2),
-            activityButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
-            settingsButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
-            settingsButton.widthAnchor.constraint(equalToConstant: 130),
-            settingsButton.heightAnchor.constraint(equalToConstant: 26),
+            profilesButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            profilesButton.widthAnchor.constraint(equalToConstant: 130),
+            profilesButton.heightAnchor.constraint(equalToConstant: 26),
+            profilesButton.topAnchor.constraint(equalTo: activityButton.bottomAnchor, constant: 2),
+            vocabButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            vocabButton.widthAnchor.constraint(equalToConstant: 130),
+            vocabButton.heightAnchor.constraint(equalToConstant: 26),
+            vocabButton.topAnchor.constraint(equalTo: profilesButton.bottomAnchor, constant: 2),
+            vocabButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
             sideDivider.topAnchor.constraint(equalTo: stripDivider.bottomAnchor),
             sideDivider.leadingAnchor.constraint(equalTo: sideScroll.trailingAnchor),
             sideDivider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
@@ -4136,10 +4197,9 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             self?.readerVC.playSpeakerSample(speaker)
         }
 
-        // Land on Meetings (row 1) — Today is first in the list but the
-        // meetings index stays the default page.
-        sidebar.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
-        showPage(1)
+        // Today is the launch page — the day at a glance.
+        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        showPage(0)
     }
 
     private func setDetail(_ vc: NSViewController) {
@@ -4162,22 +4222,32 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         switch index {
         case 0: setDetail(todayVC)
         case 1: setDetail(meetingsVC)
-        case 2: setDetail(vocabVC)
-        case 4: setDetail(profilesVC)
-        case 5: setDetail(activityVC)
-        case 6: setDetail(settingsVC)
+        case 3: setDetail(settingsVC)
+        case 4: setDetail(activityVC)
+        case 5: setDetail(profilesVC)
+        case 6: setDetail(vocabVC)
         default: setDetail(uploadVC)
         }
     }
 
     @objc private func openSettings() {
         sidebar.deselectAll(nil)
-        showPage(6)
+        showPage(3)
     }
 
     @objc private func openActivity() {
         sidebar.deselectAll(nil)
+        showPage(4)
+    }
+
+    @objc private func openProfiles() {
+        sidebar.deselectAll(nil)
         showPage(5)
+    }
+
+    @objc private func openVocab() {
+        sidebar.deselectAll(nil)
+        showPage(6)
     }
 
     func openTranscript(_ path: String?) {
@@ -4380,10 +4450,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         buildMainMenu()
-        NSApp.applicationIconImage = mWaveformImage(
-            size: 512,
-            barColor: NSColor(srgbRed: 0.345, green: 0.337, blue: 0.839, alpha: 1),
-            tile: NSColor(srgbRed: 0.98, green: 0.98, blue: 1.0, alpha: 1))
+        // Dock / ⌘Tab icon from the bundled icns (the new logo); the
+        // drawn mark is only the bare-binary fallback.
+        if let icnsPath = Bundle.main.path(forResource: "Meetink", ofType: "icns"),
+           let icon = NSImage(contentsOfFile: icnsPath) {
+            NSApp.applicationIconImage = icon
+        } else {
+            NSApp.applicationIconImage = mWaveformImage(
+                size: 512,
+                barColor: NSColor(srgbRed: 0.345, green: 0.337, blue: 0.839, alpha: 1),
+                tile: NSColor(srgbRed: 0.98, green: 0.98, blue: 1.0, alpha: 1))
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         updateStatusIcon(recording: false)
@@ -4517,11 +4594,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusIcon(recording: Bool) {
         guard let button = statusItem.button else { return }
         if recording {
-            let img = mWaveformImage(size: 18, barColor: .systemRed)
+            let img = menubarMarkImage(tint: .systemRed)
+                ?? mWaveformImage(size: 18, barColor: .systemRed)
             img.isTemplate = false
             button.image = img
         } else {
-            let img = mWaveformImage(size: 18, barColor: .black)
+            let img = menubarMarkImage()
+                ?? mWaveformImage(size: 18, barColor: .black)
             img.isTemplate = true
             button.image = img
         }

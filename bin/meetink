@@ -303,6 +303,9 @@ build_app() {
     # CFBundleIconFile; a runtime applicationIconImage alone leaves the
     # generic placeholder in the app switcher.
     cp "$MK_ROOT/src/app/Resources/Meetink.icns" "$resources_dir/Meetink.icns"
+    # Menu-bar mark (black M + alpha, 36 px = 18 pt retina) — the status
+    # item loads it from Resources; falls back to a drawn mark if absent.
+    cp "$MK_ROOT/src/app/Resources/menubar-m.png" "$resources_dir/menubar-m.png" 2>/dev/null || true
 
     # Sign with the stable identity when available. Ad-hoc fallback means
     # mic/screen grants reset on EVERY rebuild (TCC keys on the signature)
