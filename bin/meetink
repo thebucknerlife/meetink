@@ -1122,14 +1122,6 @@ cmd_stop() {
         trim_trailing_silence "$stop_target"
     fi
 
-    # Archive the session audio into the meeting folder when the user asked
-    # for it (Settings: keep_audio mixes a listenable .m4a; keep_spools keeps
-    # the two raw streams as wavs, replayable via `meetink simulate`). Must
-    # run BEFORE refine_session — refine deletes the spools on success.
-    if typeset -f audio_archive_session >/dev/null 2>&1; then
-        audio_archive_session "$stop_target"
-    fi
-
     # Re-transcribe the whole session with full acoustic context (parakeet)
     # and replace the transcript content in place. Runs BEFORE name
     # inference so names are inferred from the better text, and refine's
@@ -1137,6 +1129,14 @@ cmd_stop() {
     # clusters that inference checks.
     if typeset -f refine_session >/dev/null 2>&1; then
         refine_session "$stop_target"
+    fi
+
+    # Archive the session audio AFTER refine: the transcript-driven mix
+    # gates the mic by the user's word timings, which only exist once
+    # refine has written the timing sidecar. This step is the spools'
+    # last consumer and deletes them on every path.
+    if typeset -f audio_archive_session >/dev/null 2>&1; then
+        audio_archive_session "$stop_target"
     fi
 
     # Infer real names for the surviving Speaker-N labels from the

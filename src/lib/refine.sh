@@ -139,14 +139,17 @@ refine_session() {
         # Playback timing sidecar — lands as <base>.timing.json so titling
         # renames it with the transcript (same-basename rule).
         [[ -f "$tmp.timing.json" ]] && mv "$tmp.timing.json" "${actual%.txt}.timing.json"
-        rm -f "$tmp" "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw"
+        # Spools survive refine now: audio_archive_session runs AFTER us
+        # (the transcript-driven mix needs the timing sidecar) and owns
+        # their deletion.
+        rm -f "$tmp"
         local n=$(grep -cE '^\[[0-9:]{8}\]' "$actual" 2>/dev/null)
         # NOTE: no nested ${${...}text:t} tricks here — that exact form is a
         # runtime "bad substitution" in zsh, and under set -e it killed
         # cmd_stop mid-pipeline (transcript replaced, but consolidation /
         # names / titling never ran — field-debugged from the launcher log).
         local raw_name="${actual%.txt}.live-raw.txt"
-        print -P "${C[green]}✓${C[reset]} Refined: ${n} lines ${C[dim]}(raw kept: ${raw_name:t}; spool deleted)${C[reset]}"
+        print -P "${C[green]}✓${C[reset]} Refined: ${n} lines ${C[dim]}(raw kept: ${raw_name:t})${C[reset]}"
     else
         rm -f "$tmp"
         print -P "${C[yellow]}⚠${C[reset]} Refine failed — keeping the live transcript ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
@@ -224,6 +227,34 @@ _mix_enhanced_m4a() {
         && (( $(stat -f%z "$sys48" 2>/dev/null || echo 0) > 96000 )); then
         have48=1
     fi
+    # Transcript-driven mix (the "what I heard on the call" path): sys
+    # passes through UNTOUCHED — it is the audio the user heard, so no
+    # enhance/DFN coloration — and the mic opens only inside the user's
+    # own word spans (plus mic-exclusive speech for in-person voices).
+    # Requires refine's timing sidecar, which is why the m4a step runs
+    # AFTER refine now. Falls back to enhance + sidechain duck when the
+    # timing is missing or the gating bails.
+    local timing="${out%.m4a}.timing.json"
+    if [[ -f "$timing" && -x "$MK_PARAKEET_VENV/bin/python" ]]; then
+        local tmic="$mic" tsys="$sys" tar=16000
+        (( have48 )) && { tmic="$mic48"; tsys="$sys48"; tar=48000; }
+        local md=$(mktemp -d -t meetink-mix)
+        if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/transcript_mix.py" \
+                --mic "$tmic" --sys "$tsys" --rate $tar \
+                --timing "$timing" --me "$(me_name_get 2>/dev/null || print ME)" \
+                --out "$md/mixed.raw" 2>>/tmp/meetink-refine.log; then
+            local rc2=0
+            ffmpeg -v error -y -f s16le -ar $tar -ac 1 -i "$md/mixed.raw" \
+                -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || rc2=$?
+            rm -rf "$md"
+            print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=transcript" \
+                >> "$MK_HOME/perf.log" 2>/dev/null || true
+            return $rc2
+        fi
+        rm -rf "$md"
+        print -P "${C[dim]}  (transcript mix bailed — enhance + duck fallback)${C[reset]}"
+    fi
+
     if enhance_enabled && [[ -x "$MK_PARAKEET_VENV/bin/python" ]]; then
         ed=$(mktemp -d -t meetink-enhance)
         # live_deepfilter=off keeps the echo-cancel but skips DFN on live
@@ -368,15 +399,6 @@ cmd_pyannote_install() {
 # on success). Best-effort — never blocks the stop pipeline. Titling later
 # renames these in lockstep with the transcript (same-basename rule).
 audio_archive_session() {
-    local keep_audio=0 keep_spools=0
-    mk_config_bool keep_audio && keep_audio=1
-    mk_config_bool keep_spools && keep_spools=1
-    (( keep_audio || keep_spools )) || return 0
-    if ! command -v ffmpeg >/dev/null 2>&1; then
-        print -P "${C[yellow]}⚠${C[reset]} keep audio: ffmpeg not found — skipping"
-        return 0
-    fi
-
     local actual="$1"
     [[ -L "$actual" ]] && actual=$(readlink "$actual" 2>/dev/null)
     [[ -f "$actual" ]] || return 0
@@ -387,6 +409,18 @@ audio_archive_session() {
         sys="$MK_SPOOL_DIR/session-sys.raw"
     fi
     [[ -s "$mic" || -s "$sys" ]] || return 0
+
+    # This step is the spools' last consumer (it runs after refine now),
+    # so every exit path below deletes them.
+    local keep_audio=0 keep_spools=0
+    mk_config_bool keep_audio && keep_audio=1
+    mk_config_bool keep_spools && keep_spools=1
+    if (( ! keep_audio && ! keep_spools )) || ! command -v ffmpeg >/dev/null 2>&1; then
+        (( keep_audio || keep_spools )) && \
+            print -P "${C[yellow]}⚠${C[reset]} keep audio: ffmpeg not found — skipping"
+        rm -f "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw"
+        return 0
+    fi
 
     local base="${actual%.txt}"
     local -a raw=(-f s16le -ar 16000 -ac 1)
@@ -437,10 +471,9 @@ audio_archive_session() {
         done
         [[ -n "$kept" ]] && print -P "${C[green]}✓${C[reset]} Spools kept: ${C[dim]}${kept}${C[reset]}"
     fi
-    # When refine won't run (it normally deletes the spools itself), tidy
-    # now so stale audio can't bleed into the next session.
-    refine_enabled 2>/dev/null || \
-        rm -f "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw"
+    # Spools consumed — tidy so stale audio can't bleed into the next
+    # session (refine_clear_spool at the next start is the backstop).
+    rm -f "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw"
     return 0
 }
 
