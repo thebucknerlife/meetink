@@ -100,9 +100,9 @@ def main() -> int:
     ap.add_argument("--rate", type=int, default=48000)
     ap.add_argument("--timing", required=True)
     ap.add_argument("--me", default="ME")
-    ap.add_argument("--sys-duck", type=float, default=0.15,
+    ap.add_argument("--sys-duck", type=float, default=0.10,
                     help="sys gain INSIDE the user's spans — their remote "
-                         "echo lives there (0.15 ≈ -16 dB; 1.0 disables)")
+                         "echo lives there (0.10 = -20 dB; 1.0 disables)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -122,16 +122,20 @@ def main() -> int:
     extra: list[tuple[float, float]] = []
     run_start = None
     for i in range(n_blocks):
-        exclusive = mic_rms[i] > 0.015 and mic_rms[i] > 4 * sys_rms[i]
+        # Loose on purpose: the mic is AEC-cleaned, so speaker bleed sits
+        # far below real speech — and a too-strict test silenced the user
+        # for 15 s when diarization mislabeled them (the 11:22 robot
+        # zone: transcript span missing AND fallback refusing to open).
+        exclusive = mic_rms[i] > 0.02 and mic_rms[i] > 1.5 * sys_rms[i]
         if exclusive and run_start is None:
             run_start = i
         elif not exclusive and run_start is not None:
-            # ≥0.4 s of mic-exclusive speech opens the mic there too.
-            if i - run_start >= 4:
-                extra.append((run_start * 0.1 - 0.15, i * 0.1 + 0.15))
+            # ≥0.3 s of mic-dominant speech opens the mic there too.
+            if i - run_start >= 3:
+                extra.append((run_start * 0.1 - 0.2, i * 0.1 + 0.2))
             run_start = None
-    if run_start is not None and n_blocks - run_start >= 4:
-        extra.append((run_start * 0.1 - 0.15, n_blocks * 0.1 + 0.15))
+    if run_start is not None and n_blocks - run_start >= 3:
+        extra.append((run_start * 0.1 - 0.2, n_blocks * 0.1 + 0.2))
     if extra:
         log(f"energy fallback opened {sum(e - s for s, e in extra):.0f}s "
             f"of mic-exclusive audio")
@@ -141,6 +145,11 @@ def main() -> int:
     n_sys = os.path.getsize(args.sys_) // 2
     n = max(n_mic, n_sys)
     all_spans = sorted(spans + extra)
+    # The user's remote echo LAGS their speech (device + network path,
+    # 100-600 ms in the field) — the sys duck must outlive the mic span
+    # or the echo tail pops back in right as they finish (field report:
+    # "still some echo" with span-aligned ducking).
+    duck_spans = sorted((s, e + 0.6) for s, e in all_spans)
 
     CHUNK = args.rate * 10
     with open(args.mic, "rb") as fm, open(args.sys_, "rb") as fs, \
@@ -159,7 +168,8 @@ def main() -> int:
             # whole point); inside them it ducks — the user's remote
             # echo comes back through sys and played undamped under
             # their mic voice ("substantially more echo from me").
-            sys_gain = 1.0 - (1.0 - args.sys_duck) * env
+            duck_env = env_for_chunk(duck_spans, pos, take, args.rate)
+            sys_gain = 1.0 - (1.0 - args.sys_duck) * duck_env
             mixed = s * sys_gain + m * env
             # Soft headroom: simultaneous speech can sum past full scale.
             np.clip(mixed, -0.98, 0.98, out=mixed)
