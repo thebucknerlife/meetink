@@ -55,6 +55,36 @@ let archiveRate: Double = 48000
 let spool48Enabled = spoolDir != nil
     && (ProcessInfo.processInfo.environment["MEETINK_SPOOL48"] ?? "off") == "on"
 
+// MARK: - Live echo cancellation (WebRTC AEC3)
+//
+// With speakers instead of headphones, the mic hears everything the
+// speakers play and every remote utterance enters the pipeline twice
+// (field report: the whole meeting duplicated, one copy labeled as the
+// user). We uniquely HAVE the echo reference — the sys stream IS the
+// speaker signal — so run the mic through AEC3 with sys as the far end.
+// Gated twice: MEETINK_LIVE_AEC=on (launcher, live_aec config) and the
+// vendored library present at build time (-D MEETINK_AEC + aec_shim).
+let liveAECWanted = (ProcessInfo.processInfo.environment["MEETINK_LIVE_AEC"] ?? "off") == "on"
+var aecHandle: UnsafeMutableRawPointer? = nil
+
+func aecFeedFar(_ samples: [Float]) {
+#if MEETINK_AEC
+    guard let h = aecHandle, !samples.isEmpty else { return }
+    samples.withUnsafeBufferPointer {
+        mk_aec_feed_far(h, $0.baseAddress, Int32(samples.count))
+    }
+#endif
+}
+
+func aecProcessNear(_ samples: inout [Float]) {
+#if MEETINK_AEC
+    guard let h = aecHandle, !samples.isEmpty else { return }
+    samples.withUnsafeMutableBufferPointer {
+        mk_aec_process_near(h, $0.baseAddress, Int32($0.count))
+    }
+#endif
+}
+
 func int16Data(_ samples: [Float]) -> Data {
     var data = Data(capacity: samples.count * 2)
     for sample in samples {
@@ -955,8 +985,14 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
 
         // Whisper path: 16 kHz. When SCK delivers 16 kHz directly (archive
         // spooling off) this is a straight append, exactly as before.
+        func deliver(_ samples: [Float]) {
+            // The sys stream is the AEC's far-end reference — feed it
+            // before it lands in the transcription buffer.
+            aecFeedFar(samples)
+            buffer.appendSystem(samples)
+        }
         if abs(inputRate - sampleRate) <= 1.0 {
-            buffer.appendSystem(monoSamples)
+            deliver(monoSamples)
             return
         }
         // Downsample with AVAudioConverter (filtered, stateful) — linear
@@ -987,15 +1023,14 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
                     return inBuffer
                 }
                 if status == .haveData, let floatData = outBuffer.floatChannelData {
-                    buffer.appendSystem(Array(UnsafeBufferPointer(
+                    deliver(Array(UnsafeBufferPointer(
                         start: floatData[0], count: Int(outBuffer.frameLength))))
                     return
                 }
             }
         }
         // Converter unavailable — old linear-interp fallback.
-        buffer.appendSystem(resampleLinear(monoSamples, from: inputRate,
-                                           to: sampleRate))
+        deliver(resampleLinear(monoSamples, from: inputRate, to: sampleRate))
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
@@ -1205,6 +1240,20 @@ struct LocalSpeechCapture {
                   + (spool48Enabled ? " + 48 kHz archive" : "") + ")\n", stderr)
         }
 
+#if MEETINK_AEC
+        if liveAECWanted && !simMode {
+            aecHandle = mk_aec_create(Int32(sampleRate))
+            fputs(aecHandle != nil
+                  ? "Live echo cancellation on (WebRTC AEC3, sys as reference)\n"
+                  : "Live echo cancellation requested but AEC3 init failed\n",
+                  stderr)
+        }
+#else
+        if liveAECWanted && !simMode {
+            fputs("live_aec=on but this build has no AEC3 — run `meetink aec install` and rebuild\n", stderr)
+        }
+#endif
+
         var scStream: SCStream? = nil
         var scDelegate: CaptureDelegate? = nil
         if !simMode {
@@ -1370,7 +1419,10 @@ struct LocalSpeechCapture {
                     return inBuffer
                 }
                 if status == .haveData, let floatData = outBuffer.floatChannelData {
-                    let samples = Array(UnsafeBufferPointer(start: floatData[0], count: Int(outBuffer.frameLength)))
+                    var samples = Array(UnsafeBufferPointer(start: floatData[0], count: Int(outBuffer.frameLength)))
+                    // Subtract the speaker bleed (sys is the reference)
+                    // before the gate/whisper/spool ever see it.
+                    aecProcessNear(&samples)
                     audioBuffer.appendMic(samples)
                     updateMicHeartbeat()
                 }

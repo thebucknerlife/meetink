@@ -165,12 +165,40 @@ build_capture() {
     fi
     print -P "  ${C[dim]}using SDK: ${sdk}${C[reset]}"
 
+    # Live echo cancellation (WebRTC AEC3) links in ONLY when the vendored
+    # library is installed (`meetink aec install`). Without it, the same
+    # source builds byte-identical to before — no new hard dependency.
+    local -a aec_args=()
+    local apm_pc="$MK_HOME/webrtc-apm/lib/pkgconfig"
+    if [[ -d "$apm_pc" ]] && command -v pkg-config >/dev/null 2>&1 \
+        && PKG_CONFIG_PATH="$apm_pc:/opt/homebrew/lib/pkgconfig" pkg-config --exists webrtc-audio-processing-2 2>/dev/null; then
+        print -P "  ${C[dim]}AEC3 library found — building with live echo cancellation${C[reset]}"
+        local shim_o="$MK_ROOT/src/capture/aec_shim.o"
+        if [[ ! -f "$shim_o" || "$MK_ROOT/src/capture/aec_shim.cpp" -nt "$shim_o" ]]; then
+            PKG_CONFIG_PATH="$apm_pc:/opt/homebrew/lib/pkgconfig" \
+            clang++ -std=c++17 -O2 -w -c "$MK_ROOT/src/capture/aec_shim.cpp" \
+                -o "$shim_o" \
+                $(PKG_CONFIG_PATH="$apm_pc:/opt/homebrew/lib/pkgconfig" pkg-config --cflags webrtc-audio-processing-2) || {
+                print -P "${C[yellow]}⚠${C[reset]} aec_shim compile failed — building without AEC"
+                shim_o=""
+            }
+        fi
+        if [[ -n "$shim_o" && -f "$shim_o" ]]; then
+            aec_args=(-D MEETINK_AEC
+                      -import-objc-header "$MK_ROOT/src/capture/aec_shim.h"
+                      "$shim_o"
+                      ${=$(PKG_CONFIG_PATH="$apm_pc:/opt/homebrew/lib/pkgconfig" pkg-config --libs webrtc-audio-processing-2)}
+                      -lc++ -framework CoreFoundation)
+        fi
+    fi
+
     swiftc -O -o meetink-capture Sources/main.swift \
         -framework ScreenCaptureKit -framework AVFoundation \
         -framework CoreMedia -framework CoreAudio \
         -parse-as-library \
         -sdk "$sdk" \
-        -target arm64-apple-macosx14.0 || {
+        -target arm64-apple-macosx14.0 \
+        "${aec_args[@]}" || {
             print -P "${C[red]}error:${C[reset]} build failed"
             exit 1
         }
@@ -187,6 +215,41 @@ build_capture() {
     fi
     print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$MK_HOME/bin/meetink-capture${C[reset]}"
     cd - > /dev/null
+}
+
+# --- Vendored WebRTC AEC3 (live echo cancellation) ---
+# Not in Homebrew: built from freedesktop's webrtc-audio-processing into
+# $MK_HOME/webrtc-apm (static lib). build_capture links it automatically
+# when present; without it capture builds exactly as before.
+cmd_aec_install() {
+    print -P "${C[bright_yellow]}▸${C[reset]} Installing WebRTC AEC3 (live echo cancellation)..."
+    if ! command -v brew >/dev/null 2>&1; then
+        print -P "${C[red]}error:${C[reset]} Homebrew required"; return 1
+    fi
+    local dep
+    for dep in meson ninja pkg-config; do
+        command -v "$dep" >/dev/null 2>&1 || brew install -q "$dep" || return 1
+    done
+    brew list abseil >/dev/null 2>&1 || brew install -q abseil || return 1
+    local src="$MK_ROOT/vendor/webrtc-audio-processing"
+    if [[ ! -d "$src" ]]; then
+        mkdir -p "$MK_ROOT/vendor"
+        git clone --depth 1 \
+            https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing.git \
+            "$src" || return 1
+    fi
+    # Their examples don't link on macOS (missing CoreFoundation); we
+    # only need the library.
+    sed -i '' "s|^subdir('examples')|# subdir('examples')  # meetink: library only|" "$src/meson.build" 2>/dev/null || true
+    ( cd "$src" \
+        && meson setup build --prefix="$MK_HOME/webrtc-apm" \
+               -Ddefault_library=static -Dbuildtype=release --wipe \
+        && ninja -C build install ) || {
+        print -P "${C[red]}error:${C[reset]} AEC3 build failed"; return 1
+    }
+    print -P "${C[green]}✓${C[reset]} AEC3 installed — rebuilding capture with live echo cancellation"
+    build_capture
+    print -P "  Enable per-recording with ${C[bright_cyan]}live_aec=on${C[reset]} in ~/.meetink/config"
 }
 
 # --- Build the macOS-native agent ---
@@ -954,12 +1017,18 @@ cmd_start() {
     local spool48=off
     mk_config_bool keep_audio && spool48=on
 
+    # Live echo cancellation (WebRTC AEC3, speakers mode). live_aec=on in
+    # config; the binary also needs the AEC build (meetink aec install).
+    local live_aec=off
+    mk_config_bool live_aec && live_aec=on
+
     MEETINK_MODEL="$MK_MODEL" \
     MEETINK_TRANSCRIPT="$session_file" \
     MEETINK_PROMPT="$MK_PROMPT" \
     MEETINK_ME_NAME="$(me_name_get)" \
     MEETINK_SPOOL_DIR="$spool_env" \
     MEETINK_SPOOL48="$spool48" \
+    MEETINK_LIVE_AEC="$live_aec" \
         "$binary" 2>/tmp/meetink-capture.log &
     echo $! > "$PID_FILE"
     disown 2>/dev/null || true
@@ -1305,6 +1374,7 @@ case "${1:-}" in
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
     _build_capture)    build_capture ;;
+    aec)               case "$2" in install) cmd_aec_install ;; *) print "usage: meetink aec install" ;; esac ;;
     prompt|vocab)
         mkdir -p "${MK_PROMPT:h}"
         [[ -f "$MK_PROMPT" ]] || touch "$MK_PROMPT"
