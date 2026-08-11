@@ -65,20 +65,26 @@ let spool48Enabled = spoolDir != nil
 // Gated twice: MEETINK_LIVE_AEC=on (launcher, live_aec config) and the
 // vendored library present at build time (-D MEETINK_AEC + aec_shim).
 let liveAECWanted = (ProcessInfo.processInfo.environment["MEETINK_LIVE_AEC"] ?? "off") == "on"
+// Two independent cancellers: one at 16 kHz for the transcription path,
+// one at 48 kHz for the archive spools — the playback m4a mixes the
+// archive mic, and leaving it raw kept the speaker bleed (with all its
+// room reverb) audible under the clean sys copy (field report: remote
+// voice "echoy, lots of reverb").
 var aecHandle: UnsafeMutableRawPointer? = nil
+var aecHandle48: UnsafeMutableRawPointer? = nil
 
-func aecFeedFar(_ samples: [Float]) {
+func aecFeedFar(_ samples: [Float], _ handle: UnsafeMutableRawPointer?) {
 #if MEETINK_AEC
-    guard let h = aecHandle, !samples.isEmpty else { return }
+    guard let h = handle, !samples.isEmpty else { return }
     samples.withUnsafeBufferPointer {
         mk_aec_feed_far(h, $0.baseAddress, Int32(samples.count))
     }
 #endif
 }
 
-func aecProcessNear(_ samples: inout [Float]) {
+func aecProcessNear(_ samples: inout [Float], _ handle: UnsafeMutableRawPointer?) {
 #if MEETINK_AEC
-    guard let h = aecHandle, !samples.isEmpty else { return }
+    guard let h = handle, !samples.isEmpty else { return }
     samples.withUnsafeMutableBufferPointer {
         mk_aec_process_near(h, $0.baseAddress, Int32($0.count))
     }
@@ -973,14 +979,14 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
             monoSamples = float32Samples
         }
 
-        // Full-bandwidth archive copy first, straight from the stream.
+        // Full-bandwidth archive copy first, straight from the stream —
+        // it is also the 48 kHz canceller's far-end reference.
         if let archiveSpool {
-            if abs(inputRate - archiveRate) <= 1.0 {
-                archiveSpool.append(monoSamples)
-            } else {
-                archiveSpool.append(resampleLinear(
-                    monoSamples, from: inputRate, to: archiveRate))
-            }
+            let arch = abs(inputRate - archiveRate) <= 1.0
+                ? monoSamples
+                : resampleLinear(monoSamples, from: inputRate, to: archiveRate)
+            aecFeedFar(arch, aecHandle48)
+            archiveSpool.append(arch)
         }
 
         // Whisper path: 16 kHz. When SCK delivers 16 kHz directly (archive
@@ -988,7 +994,7 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
         func deliver(_ samples: [Float]) {
             // The sys stream is the AEC's far-end reference — feed it
             // before it lands in the transcription buffer.
-            aecFeedFar(samples)
+            aecFeedFar(samples, aecHandle)
             buffer.appendSystem(samples)
         }
         if abs(inputRate - sampleRate) <= 1.0 {
@@ -1243,8 +1249,13 @@ struct LocalSpeechCapture {
 #if MEETINK_AEC
         if liveAECWanted && !simMode {
             aecHandle = mk_aec_create(Int32(sampleRate))
+            if spool48Enabled {
+                aecHandle48 = mk_aec_create(Int32(archiveRate))
+            }
             fputs(aecHandle != nil
-                  ? "Live echo cancellation on (WebRTC AEC3, sys as reference)\n"
+                  ? "Live echo cancellation on (WebRTC AEC3, sys as reference"
+                    + (aecHandle48 != nil ? ", 16 kHz + 48 kHz archive" : "")
+                    + ")\n"
                   : "Live echo cancellation requested but AEC3 init failed\n",
                   stderr)
         }
@@ -1422,7 +1433,7 @@ struct LocalSpeechCapture {
                     var samples = Array(UnsafeBufferPointer(start: floatData[0], count: Int(outBuffer.frameLength)))
                     // Subtract the speaker bleed (sys is the reference)
                     // before the gate/whisper/spool ever see it.
-                    aecProcessNear(&samples)
+                    aecProcessNear(&samples, aecHandle)
                     audioBuffer.appendMic(samples)
                     updateMicHeartbeat()
                 }
@@ -1440,8 +1451,12 @@ struct LocalSpeechCapture {
                         return inBuffer
                     }
                     if status48 == .haveData, let fd = out48.floatChannelData {
-                        spool48Mic.append(Array(UnsafeBufferPointer(
-                            start: fd[0], count: Int(out48.frameLength))))
+                        var arch = Array(UnsafeBufferPointer(
+                            start: fd[0], count: Int(out48.frameLength)))
+                        // Clean the archive copy too — the playback m4a
+                        // mixes this stream.
+                        aecProcessNear(&arch, aecHandle48)
+                        spool48Mic.append(arch)
                     }
                 }
             }
