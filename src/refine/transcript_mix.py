@@ -6,8 +6,11 @@ reverb and AEC suppressor chop) under the clean sys copy of every remote
 utterance (field report: "echoy, jumpier"). But we know EXACTLY when the
 user speaks — the refine pass wrote word-level timings. So:
 
-  sys: passes through untouched. It is literally the audio the user
-       heard during the call — the reference for "good".
+  sys: passes through untouched OUTSIDE the user's spans — there it is
+       literally the audio the user heard during the call. INSIDE their
+       spans it ducks (--sys-duck): the user's remote echo comes back
+       through sys, and playing it undamped under their mic voice
+       doubled them ("substantially more echo from me").
   mic: opens only inside the user's own word spans (padded, merged,
        raised-cosine fades), plus an energy fallback that opens it when
        the mic clearly carries exclusive speech the transcript didn't
@@ -41,13 +44,15 @@ def user_spans(timing_path: str, me: str) -> list[tuple[float, float]]:
         for w in line.get("words", []):
             s = float(w.get("s", 0))
             e = max(float(w.get("e", s)), s + 0.30)   # e is often == s
-            pts.append((s - 0.25, e + 0.30))
+            pts.append((s - 0.30, e + 0.45))
     pts.sort()
     merged: list[tuple[float, float]] = []
     for s, e in pts:
-        # ≤0.8 s gaps merge — words inside one utterance; longer pauses
-        # (a line can span a remote monologue) keep the mic closed.
-        if merged and s - merged[-1][1] <= 0.8:
+        # ≤1.5 s gaps merge — Parakeet's word stamps are coarse and tight
+        # gating chopped real speech into robotic fragments (field
+        # report); longer pauses (a line can span a remote monologue)
+        # still close the mic.
+        if merged and s - merged[-1][1] <= 1.5:
             merged[-1] = (merged[-1][0], max(merged[-1][1], e))
         else:
             merged.append((s, e))
@@ -55,7 +60,7 @@ def user_spans(timing_path: str, me: str) -> list[tuple[float, float]]:
 
 
 def env_for_chunk(spans: list[tuple[float, float]], pos: int, take: int,
-                  rate: int, fade_s: float = 0.12) -> np.ndarray:
+                  rate: int, fade_s: float = 0.20) -> np.ndarray:
     """Gain curve for samples [pos, pos+take): 1 inside spans, 0 outside,
     cosine ramps of fade_s OUTSIDE each span edge (the fade adds ramp
     rather than eating the first/last word). Analytic per chunk — a full
@@ -95,6 +100,9 @@ def main() -> int:
     ap.add_argument("--rate", type=int, default=48000)
     ap.add_argument("--timing", required=True)
     ap.add_argument("--me", default="ME")
+    ap.add_argument("--sys-duck", type=float, default=0.15,
+                    help="sys gain INSIDE the user's spans — their remote "
+                         "echo lives there (0.15 ≈ -16 dB; 1.0 disables)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -146,7 +154,13 @@ def main() -> int:
             s = np.zeros(take, dtype=np.float32)
             m[: len(mic)] = mic.astype(np.float32) / 32768.0
             s[: len(sy)] = sy.astype(np.float32) / 32768.0
-            mixed = s + m * env_for_chunk(all_spans, pos, take, args.rate)
+            env = env_for_chunk(all_spans, pos, take, args.rate)
+            # Outside the user's spans sys is UNTOUCHED (that's the
+            # whole point); inside them it ducks — the user's remote
+            # echo comes back through sys and played undamped under
+            # their mic voice ("substantially more echo from me").
+            sys_gain = 1.0 - (1.0 - args.sys_duck) * env
+            mixed = s * sys_gain + m * env
             # Soft headroom: simultaneous speech can sum past full scale.
             np.clip(mixed, -0.98, 0.98, out=mixed)
             fo.write((mixed * 32767.0).astype(np.int16).tobytes())
