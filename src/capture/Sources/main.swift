@@ -1249,13 +1249,10 @@ struct LocalSpeechCapture {
 #if MEETINK_AEC
         if liveAECWanted && !simMode {
             aecHandle = mk_aec_create(Int32(sampleRate))
-            if spool48Enabled {
-                aecHandle48 = mk_aec_create(Int32(archiveRate))
-            }
+            // 16 kHz transcription path ONLY — the archive spools stay
+            // raw for natural playback (see the mic tap comment).
             fputs(aecHandle != nil
-                  ? "Live echo cancellation on (WebRTC AEC3, sys as reference"
-                    + (aecHandle48 != nil ? ", 16 kHz + 48 kHz archive" : "")
-                    + ")\n"
+                  ? "Live echo cancellation on (WebRTC AEC3, sys as reference, transcription path)\n"
                   : "Live echo cancellation requested but AEC3 init failed\n",
                   stderr)
         }
@@ -1451,12 +1448,15 @@ struct LocalSpeechCapture {
                         return inBuffer
                     }
                     if status48 == .haveData, let fd = out48.floatChannelData {
-                        var arch = Array(UnsafeBufferPointer(
-                            start: fd[0], count: Int(out48.frameLength)))
-                        // Clean the archive copy too — the playback m4a
-                        // mixes this stream.
-                        aecProcessNear(&arch, aecHandle48)
-                        spool48Mic.append(arch)
+                        // The archive mic stays RAW: AEC3's residual
+                        // suppressor bakes robotic double-talk artifacts
+                        // into the playback audio (field verdict — the
+                        // user's natural voice beat every cleaned
+                        // variant). The transcript-driven mix gates the
+                        // bleed instead; neural AEC (DTLN) is the
+                        // planned proper fix.
+                        spool48Mic.append(Array(UnsafeBufferPointer(
+                            start: fd[0], count: Int(out48.frameLength))))
                     }
                 }
             }

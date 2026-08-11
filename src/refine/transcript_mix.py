@@ -33,8 +33,23 @@ def log(msg: str) -> None:
     print(f"mix: {msg}", file=sys.stderr, flush=True)
 
 
+def merge_spans(pts: list[tuple[float, float]],
+                gap: float = 1.5) -> list[tuple[float, float]]:
+    """Coalesce spans whose gaps are ≤ gap. EVERY span source must pass
+    through here — v5 merged transcript spans but left the energy
+    fallback's runs fragmented, and the rapid open/close toggling IS the
+    robotic artifact (field report)."""
+    merged: list[tuple[float, float]] = []
+    for s, e in sorted(pts):
+        if merged and s - merged[-1][1] <= gap:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
 def user_spans(timing_path: str, me: str) -> list[tuple[float, float]]:
-    """Merged [start, end] spans of the user's words, padded."""
+    """[start, end] spans of the user's words, padded (unmerged)."""
     with open(timing_path) as f:
         lines = json.load(f).get("lines", [])
     pts: list[tuple[float, float]] = []
@@ -45,18 +60,7 @@ def user_spans(timing_path: str, me: str) -> list[tuple[float, float]]:
             s = float(w.get("s", 0))
             e = max(float(w.get("e", s)), s + 0.30)   # e is often == s
             pts.append((s - 0.30, e + 0.45))
-    pts.sort()
-    merged: list[tuple[float, float]] = []
-    for s, e in pts:
-        # ≤1.5 s gaps merge — Parakeet's word stamps are coarse and tight
-        # gating chopped real speech into robotic fragments (field
-        # report); longer pauses (a line can span a remote monologue)
-        # still close the mic.
-        if merged and s - merged[-1][1] <= 1.5:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-        else:
-            merged.append((s, e))
-    return merged
+    return pts
 
 
 def env_for_chunk(spans: list[tuple[float, float]], pos: int, take: int,
@@ -122,11 +126,12 @@ def main() -> int:
     extra: list[tuple[float, float]] = []
     run_start = None
     for i in range(n_blocks):
-        # Loose on purpose: the mic is AEC-cleaned, so speaker bleed sits
-        # far below real speech — and a too-strict test silenced the user
-        # for 15 s when diarization mislabeled them (the 11:22 robot
-        # zone: transcript span missing AND fallback refusing to open).
-        exclusive = mic_rms[i] > 0.02 and mic_rms[i] > 1.5 * sys_rms[i]
+        # Middle ground: 4x refused to open on the 11:22 mislabel (the
+        # user's echo pumps sys while they talk), 1.5x opened on bleed
+        # for a third of the meeting and ducked the remote side (v5
+        # regression). The mic is raw here — bleed sits ~2.5-8x below
+        # sys — so 2.5x separates the cases.
+        exclusive = mic_rms[i] > 0.02 and mic_rms[i] > 2.5 * sys_rms[i]
         if exclusive and run_start is None:
             run_start = i
         elif not exclusive and run_start is not None:
@@ -144,7 +149,7 @@ def main() -> int:
     n_mic = os.path.getsize(args.mic) // 2
     n_sys = os.path.getsize(args.sys_) // 2
     n = max(n_mic, n_sys)
-    all_spans = sorted(spans + extra)
+    all_spans = merge_spans(spans + extra)
     # The user's remote echo LAGS their speech (device + network path,
     # 100-600 ms in the field) — the sys duck must outlive the mic span
     # or the echo tail pops back in right as they finish (field report:
@@ -175,7 +180,7 @@ def main() -> int:
             np.clip(mixed, -0.98, 0.98, out=mixed)
             fo.write((mixed * 32767.0).astype(np.int16).tobytes())
             pos += take
-    log(f"transcript mix: {len(spans)} user spans, sys passthrough")
+    log(f"transcript mix: {len(all_spans)} merged mic spans, sys passthrough")
     return 0
 
 
