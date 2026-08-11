@@ -717,6 +717,9 @@ class WatchManager:
                 actions=["Skip"],
                 default="Continue",
                 timeout=NOTIFY_TIMEOUT_S,
+                # Hold the warning on screen — one banner-flash is easy
+                # to miss and Skip is only clickable while it's visible.
+                linger=30,
             )
             if response.strip().lower() == "skip":
                 with self._lock:
