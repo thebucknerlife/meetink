@@ -761,6 +761,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var lastInode: UInt64 = 0
     private var lastSize: UInt64 = 0
     private var lastMtime: TimeInterval = 0
+    /// A live-transcript update arrived while the user was scrolled up;
+    /// applied when they return to the bottom (frozen-viewport rule).
+    private var pendingLiveRefresh = false
     private var lastResolvedPath: String = ""
     private var rawText: String = ""
     private var snapshot = TranscriptSnapshot()
@@ -1109,7 +1112,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
             object: scroll.contentView, queue: .main) { [weak self] _ in
-                self?.updateJumpButton()
+                guard let self else { return }
+                self.updateJumpButton()
+                // Back at the bottom edge — apply the live updates that
+                // were held while the user was reading upstream.
+                if self.pendingLiveRefresh, self.pinnedToBottom {
+                    self.pendingLiveRefresh = false
+                    self.refreshIfChanged(force: true)
+                }
             }
 
         self.view = content
@@ -1842,6 +1852,20 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
         if force || inode != lastInode || size != lastSize
             || mtime != lastMtime || resolved != lastResolvedPath {
+            // Frozen viewport: while the user is scrolled up during a
+            // LIVE meeting, the text must not move at all — reading back
+            // through a call is impossible if new lines shift the layout
+            // (field report). Don't ingest the update (snapshot, ranges
+            // and text stay mutually consistent for clicks/edits); the
+            // bounds observer catches up the moment they re-pin.
+            let live = fixedPath == nil && recordingPID() != nil
+                && resolved == lastResolvedPath
+            if live && !force && !pinnedToBottom {
+                pendingLiveRefresh = true
+                updateHeader()
+                return
+            }
+            pendingLiveRefresh = false
             lastInode = inode; lastSize = size; lastMtime = mtime
             lastResolvedPath = resolved
             if let text = try? String(contentsOfFile: resolved, encoding: .utf8) {
@@ -2436,6 +2460,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         if wasPinned {
             textView.scrollToEndOfDocument(nil)
         } else if let origin = savedOrigin {
+            // Lay the new text out fully BEFORE restoring — restoring
+            // against a lazily-sized document clamps the offset and the
+            // view jumps (field report).
+            if let lm = textView.layoutManager, let tc = textView.textContainer {
+                lm.ensureLayout(for: tc)
+            }
             textView.enclosingScrollView?.documentView?.scroll(origin)
         }
         updateJumpButton()

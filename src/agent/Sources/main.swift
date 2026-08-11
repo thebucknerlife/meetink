@@ -418,7 +418,10 @@ func cmdNotify(args: [String]) -> Int32 {
             center.add(UNNotificationRequest(
                 identifier: currentId, content: repost, trigger: nil
             )) { _ in }
-            nextRepost = Date().addingTimeInterval(6.0)
+            // Jittered cadence: two lingering notifications re-posting in
+            // lockstep animate over each other ("they compete"); offset
+            // cycles let both banners sit in the stack.
+            nextRepost = Date().addingTimeInterval(5.5 + Double.random(in: 0...1.5))
         }
     }
 

@@ -243,26 +243,14 @@ def _agent_meeting_active() -> dict:
         return {"active": False, "source": None, "signals": []}
 
 
-# One notification on screen at a time, machine-wide within the daemon:
-# two events at the same minute used to fire concurrent agent processes
-# whose linger re-posts fought each other (field report: "they compete").
-# Serializing here makes them appear one after the other.
-_notify_lock = threading.Lock()
-
-
 def _agent_notify(title: str, body: str, actions: list[str],
                   default: str, timeout: int, linger: int = 0) -> str:
     """Blocking call. Caller usually runs this on a dedicated worker
-    thread because the agent waits up to `timeout` seconds for a click."""
+    thread because the agent waits up to `timeout` seconds for a click.
+    Concurrent calls are fine — simultaneous events stack their banners
+    on screen (each agent process owns its own notification)."""
     if not MK_AGENT.is_file():
         return default
-    with _notify_lock:
-        return _agent_notify_locked(title, body, actions, default,
-                                    timeout, linger)
-
-
-def _agent_notify_locked(title: str, body: str, actions: list[str],
-                         default: str, timeout: int, linger: int) -> str:
     try:
         proc = subprocess.run(
             [str(MK_AGENT), "notify",
