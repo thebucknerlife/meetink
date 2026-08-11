@@ -391,6 +391,16 @@ def _start_recording_subprocess(env_extras: dict[str, str]) -> bool:
     return True
 
 
+def _capture_pid() -> Optional[int]:
+    """PID of a live capture process (whoever started it), else None."""
+    try:
+        pid = int(Path("/tmp/meetink-capture.pid").read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+
 def _stop_recording_subprocess() -> None:
     subprocess.run([str(LAUNCHER), "stop"],
                    check=False, capture_output=True)
@@ -426,6 +436,11 @@ class WatchManager:
         # ~40 s (30 s slow poll + 2 fast confirms — the field report's
         # '43 seconds').
         self._seen_active_this_recording: bool = False
+        # Adopted-recording nudge: a recording the watch did NOT start is
+        # never auto-stopped, but when its meeting app goes away we ask.
+        self._adopted_pid: Optional[int] = None
+        self._adopted_seen_active: bool = False
+        self._adopted_nudged: bool = False
         self._last_calendar_poll: float = 0.0
         self._last_active_poll: float = 0.0
         # Instant detection state. _instant_streak counts consecutive
@@ -573,7 +588,8 @@ class WatchManager:
         # _inactive_streak / _instant_streak counters in lockstep.
         with self._lock:
             in_fast_confirm = (
-                self._currently_recording is not None
+                (self._currently_recording is not None
+                 or self._adopted_seen_active)
                 and self._inactive_streak >= 1
             )
         poll_interval = FAST_END_POLL_S if in_fast_confirm else ACTIVE_POLL_S
@@ -587,6 +603,7 @@ class WatchManager:
             self._maybe_end_recording(now, now_wall)
         else:
             self._maybe_start_instant_recording(now, now_wall)
+            self._maybe_nudge_adopted_recording()
 
         # Expire events whose window has long passed and never recorded.
         with self._lock:
@@ -921,6 +938,56 @@ class WatchManager:
                 )
         if restore_project:
             _project_restore(getattr(self, "_project_before_routing", ""))
+
+    # -- adopted recordings (started manually, not by the watch) -----------
+
+    def _maybe_nudge_adopted_recording(self) -> None:
+        """A capture the watch didn't start is never auto-stopped — a
+        manual start is deliberate, and it may be an in-person recording
+        with no meeting app at all. But when a meeting app WAS active
+        during it and then goes away, ask (persistent notification with
+        Stop/Keep buttons). Re-arms if the app comes back."""
+        pid = _capture_pid()
+        should_nudge = False
+        with self._lock:
+            if pid is None:
+                self._adopted_pid = None
+                self._adopted_seen_active = False
+                self._adopted_nudged = False
+                return
+            if pid != self._adopted_pid:
+                self._adopted_pid = pid
+                self._adopted_seen_active = False
+                self._adopted_nudged = False
+            last = getattr(self, "_last_meeting_active", None) or {}
+            if isinstance(last, dict) and last.get("active"):
+                self._adopted_seen_active = True
+                self._adopted_nudged = False
+                return
+            if (self._adopted_seen_active
+                    and not self._adopted_nudged
+                    and self._inactive_streak >= MEETING_END_QUIET_TICKS):
+                self._adopted_nudged = True
+                should_nudge = True
+        if should_nudge:
+            _wlog(f"adopted recording (pid {pid}): meeting app gone — nudging")
+            threading.Thread(target=self._adopted_nudge_worker,
+                             args=(pid,), daemon=True).start()
+
+    def _adopted_nudge_worker(self, pid: int) -> None:
+        response = _agent_notify(
+            title="Meeting app closed — still recording",
+            body="This recording wasn't started by the watcher, so it won't stop on its own.",
+            actions=["Stop recording", "Keep recording"],
+            default="Keep recording",
+            timeout=300,
+            linger=25,
+        )
+        if "stop" in (response or "").lower():
+            # Only stop if it's still the same capture the nudge was about.
+            if _capture_pid() == pid:
+                _wlog(f"adopted recording (pid {pid}): user chose Stop")
+                _stop_recording_subprocess()
 
     # -- instant-meeting detection ----------------------------------------
 

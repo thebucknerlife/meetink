@@ -1045,6 +1045,14 @@ cmd_stop() {
         diarize_consolidate_transcript "$stop_target"
     fi
 
+    # Forgotten-recording cleanup: a huge silent tail (default 10+ min on
+    # BOTH streams) is trimmed off the spools before anything consumes
+    # them — the m4a stays listenable and refine doesn't transcribe hours
+    # of dead air. Notes what it did in the transcript header + meta.
+    if typeset -f trim_trailing_silence >/dev/null 2>&1; then
+        trim_trailing_silence "$stop_target"
+    fi
+
     # Archive the session audio into the meeting folder when the user asked
     # for it (Settings: keep_audio mixes a listenable .m4a; keep_spools keeps
     # the two raw streams as wavs, replayable via `meetink simulate`). Must

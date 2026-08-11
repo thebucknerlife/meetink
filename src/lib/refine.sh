@@ -153,6 +153,47 @@ refine_session() {
     fi
 }
 
+# Trim a huge silent tail off the session spools (forgotten recordings).
+# Runs from cmd_stop BEFORE audio_archive_session/refine_session so the
+# m4a and the transcription both see the trimmed streams. Leaves a note
+# in the transcript header (refine's --header-from carries it through)
+# and in meta.json (the app's export header reads it).
+trim_trailing_silence() {
+    local actual="$1"
+    [[ -L "$actual" ]] && actual=$(readlink "$actual" 2>/dev/null)
+    [[ -f "$actual" ]] || return 0
+    local mic="${actual:h}/session-mic.raw"
+    local sys="${actual:h}/session-sys.raw"
+    [[ -s "$mic" || -s "$sys" ]] || return 0
+    [[ -x "$MK_PARAKEET_VENV/bin/python" ]] || return 0
+    local cut=$("$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/trim_silence.py" \
+        --mic "$mic" --sys "$sys" 2>>/tmp/meetink-refine.log)
+    [[ "$cut" == <-> ]] && (( cut > 0 )) || return 0
+    print -P "${C[green]}✓${C[reset]} Trimmed $(( cut / 60 ))m of trailing silence"
+    typeset -f mk_activity >/dev/null 2>&1 && \
+        mk_activity "trimmed $(( cut / 60 ))m trailing silence — ${${actual:t}:r}"
+    python3 - "$actual" "$cut" <<'PYEOF9' 2>/dev/null || true
+import json, os, sys
+txt, cut = sys.argv[1], int(sys.argv[2])
+meta = txt[:-4] + ".meta.json"
+d = {}
+if os.path.exists(meta):
+    try:
+        d = json.load(open(meta))
+    except Exception:
+        d = {}
+d["trimmed_trailing_s"] = cut
+json.dump(d, open(meta, "w"), sort_keys=True)
+data = open(txt, errors="replace").read()
+note = (f"# note: trimmed {cut // 60} minutes of trailing silence "
+        "(recording ran past the end of the meeting)\n")
+if "# note: trimmed" not in data:
+    i = data.find("Started:")
+    if i >= 0:
+        open(txt, "w").write(data[:i] + note + data[i:])
+PYEOF9
+}
+
 # --- Audio enhancement (echo cancellation + optional DeepFilterNet) ---
 # enhance.py cross-cancels each stream's echo of the other (numpy NLMS —
 # always available, the parakeet venv has numpy) and, when the enhance

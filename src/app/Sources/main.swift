@@ -1492,6 +1492,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
         lines.append(dateLine)
         let meta = meetingMeta(lastResolvedPath)
+        if let trimmed = meta["trimmed_trailing_s"] as? Int, trimmed >= 60 {
+            lines.append("# Note: \(trimmed / 60) minutes of trailing silence were "
+                + "trimmed (the recording ran past the end of the meeting).")
+        }
         if let event = meta["event"] as? [String: Any] {
             if let t = event["title"] as? String, !t.isEmpty {
                 var ev = "# Calendar event: \(t)"
@@ -4502,10 +4506,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // daemon also carries MEETINK_WATCH_OWNER_PID so it exits by itself
     // if the app dies uncleanly (no orphaned recordings).
     private var watchProcess: Process? = nil
-    // Dead-air detector state: which live session we've already warned
-    // about, and a coarse once-a-minute cadence on the 2 s poll.
-    private var deadAirWarnedPath: String? = nil
-    private var deadAirTick = 0
+    // Long-call guard state (silence detector + duration backstop).
+    private var guardRecordingPath: String? = nil
+    private var guardLogOffset: UInt64 = 0
+    private var lastAudibleAt = Date()
+    private var silenceNotifyInFlight = false
+    private var backstopHoursFired = 0
+    private var backstopInFlight = false
 
     private func reconcileWatchDaemon() {
         let wants = configBool("watch_enabled")
@@ -4747,33 +4754,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = main
     }
 
-    /// A recording that has run 10+ minutes with almost no transcript is
-    /// usually a phantom (forgotten instant-detection, muted mic, dead
-    /// sys stream). One notification per session; checked once a minute.
-    private func checkDeadAir(recording: Bool) {
-        deadAirTick += 1
-        guard recording, deadAirTick % 30 == 0 else {
-            if !recording { deadAirWarnedPath = nil }
+    /// Blocking actionable notification via the agent (call on a
+    /// background queue). Returns the clicked action, or the default on
+    /// timeout / missing agent.
+    private func agentNotify(title: String, body: String, actions: [String],
+                             defaultAction: String, timeout: Int,
+                             linger: Int) -> String {
+        guard let agent = agentPathIfPresent() else { return defaultAction }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: agent)
+        proc.arguments = ["notify", "--title", title, "--body", body,
+                          "--actions", actions.joined(separator: ","),
+                          "--default", defaultAction,
+                          "--timeout", String(timeout),
+                          "--linger", String(linger)]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        do { try proc.run() } catch { return defaultAction }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        let out = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return out.isEmpty ? defaultAction : out
+    }
+
+    /// Long-call guards, evaluated on the 2 s poll while recording:
+    ///
+    /// 1. SILENCE — capture logs a gate line per chunk; "→ transcribe"
+    ///    means a stream had audio. 5 straight minutes without one on
+    ///    EITHER stream → "Still want to record?" with Stop/Keep buttons.
+    ///    Re-arms after every notification, so each new stretch of
+    ///    silence asks again (not once per recording).
+    /// 2. DURATION BACKSTOP — at 4 h (and each hour after) ask the same
+    ///    question. Never auto-stops; the user decides.
+    private func recordingGuards(recording: Bool) {
+        guard recording else {
+            guardRecordingPath = nil
             return
         }
         let live = liveSymlinkPath()
-        guard let target = try? FileManager.default.destinationOfSymbolicLink(atPath: live),
-              target != deadAirWarnedPath,
-              let dur = meetingDuration(target, isLive: true), dur > 600,
-              let text = try? String(contentsOfFile: target, encoding: .utf8) else { return }
-        var lines = 0
-        for l in text.split(separator: "\n") where l.hasPrefix("[") {
-            lines += 1
-            if lines > 3 { return }   // real speech — all good
+        guard let target = try? FileManager.default
+            .destinationOfSymbolicLink(atPath: live) else { return }
+        if target != guardRecordingPath {
+            guardRecordingPath = target
+            guardLogOffset = 0
+            lastAudibleAt = Date()
+            backstopHoursFired = 0
         }
-        deadAirWarnedPath = target
-        guard let agent = agentPathIfPresent() else { return }
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: agent)
-        proc.arguments = ["notify", "--title", "Still recording — hearing anything?",
-                          "--body", "\(Int(dur / 60)) minutes with almost no speech. "
-                          + "Discard from the transcript's ⋯ menu if this is a phantom."]
-        try? proc.run()
+
+        // -- silence, from the capture log's gate lines --
+        if let fh = FileHandle(forReadingAtPath: "/tmp/meetink-capture.log") {
+            defer { try? fh.close() }
+            let size = (try? fh.seekToEnd()) ?? 0
+            if size < guardLogOffset { guardLogOffset = 0 }   // fresh session truncated it
+            if size > guardLogOffset {
+                // Cap the read; at 2 s cadence the appended slice is tiny.
+                let start = max(guardLogOffset, size > 262_144 ? size - 262_144 : 0)
+                try? fh.seek(toOffset: start)
+                let chunk = String(data: fh.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                guardLogOffset = size
+                if chunk.contains("→ transcribe") { lastAudibleAt = Date() }
+            }
+        }
+        let silent = Date().timeIntervalSince(lastAudibleAt)
+        if silent >= 300, !silenceNotifyInFlight {
+            silenceNotifyInFlight = true
+            lastAudibleAt = Date()   // re-arm: continued silence asks again in 5 min
+            let mins = Int(silent / 60)
+            DispatchQueue.global().async { [weak self] in
+                guard let self else { return }
+                let response = self.agentNotify(
+                    title: "Still want to record?",
+                    body: "\(mins) minutes of silence on both streams.",
+                    actions: ["Stop recording", "Keep recording"],
+                    defaultAction: "Keep recording",
+                    timeout: 240, linger: 25)
+                DispatchQueue.main.async {
+                    self.silenceNotifyInFlight = false
+                    if response.lowercased().contains("stop") {
+                        self.stopRecording()
+                    } else {
+                        self.lastAudibleAt = Date()
+                    }
+                }
+            }
+        }
+
+        // -- duration backstop --
+        guard let dur = meetingDuration(target, isLive: true),
+              dur >= 4 * 3600, !backstopInFlight else { return }
+        let stage = Int((dur - 4 * 3600) / 3600)   // 0 at 4 h, 1 at 5 h…
+        guard stage >= backstopHoursFired else { return }
+        backstopInFlight = true
+        let hours = Int(dur / 3600)
+        DispatchQueue.global().async { [weak self] in
+            guard let self else { return }
+            let response = self.agentNotify(
+                title: "Recording for \(hours) hours",
+                body: "Long recordings are usually forgotten ones — still going?",
+                actions: ["Stop recording", "Keep recording"],
+                defaultAction: "Keep recording",
+                timeout: 240, linger: 25)
+            DispatchQueue.main.async {
+                self.backstopHoursFired = stage + 1
+                self.backstopInFlight = false
+                if response.lowercased().contains("stop") {
+                    self.stopRecording()
+                }
+            }
+        }
     }
 
     private func agentPathIfPresent() -> String? {
@@ -4784,7 +4873,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func pollState() {
         reconcileWatchDaemon()
         let recording = recordingPID() != nil
-        checkDeadAir(recording: recording)
+        recordingGuards(recording: recording)
         if recording != lastRecording {
             lastRecording = recording
             updateStatusIcon(recording: recording)
