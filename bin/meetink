@@ -252,6 +252,31 @@ cmd_aec_install() {
     print -P "  Enable per-recording with ${C[bright_cyan]}live_aec=on${C[reset]} in ~/.meetink/config"
 }
 
+# --- DTLN-aec (neural echo removal for the playback mix) ---
+# Models are tiny (~6 MB) but need tensorflow, which needs python <=3.13.
+cmd_dtln_install() {
+    print -P "${C[bright_yellow]}▸${C[reset]} Installing DTLN-aec (neural playback mix)..."
+    local py=""
+    for cand in /opt/homebrew/opt/python@3.13/bin/python3.13 \
+                /opt/homebrew/opt/python@3.12/bin/python3.12; do
+        [[ -x "$cand" ]] && { py="$cand"; break }
+    done
+    if [[ -z "$py" ]]; then
+        print -P "${C[red]}error:${C[reset]} need python 3.12/3.13 (tensorflow): brew install python@3.13"
+        return 1
+    fi
+    [[ -x "$MK_HOME/dtln-venv/bin/python" ]] || "$py" -m venv "$MK_HOME/dtln-venv" || return 1
+    "$MK_HOME/dtln-venv/bin/pip" -q install numpy tensorflow || return 1
+    local src="$MK_ROOT/vendor/DTLN-aec"
+    if [[ ! -d "$src" ]]; then
+        mkdir -p "$MK_ROOT/vendor"
+        git clone --depth 1 https://github.com/breizhn/DTLN-aec.git "$src" || return 1
+    fi
+    mkdir -p "$MK_HOME/dtln"
+    cp "$src"/pretrained_models/*.tflite "$MK_HOME/dtln/" || return 1
+    print -P "${C[green]}✓${C[reset]} DTLN-aec installed — the playback mix upgrades automatically"
+}
+
 # --- Build the macOS-native agent ---
 # meetink-agent is a tiny Swift app-bundle that owns the integrations
 # Python can't easily reach: EventKit (calendar reading) and
@@ -1374,7 +1399,11 @@ case "${1:-}" in
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
     _build_capture)    build_capture ;;
-    aec)               case "$2" in install) cmd_aec_install ;; *) print "usage: meetink aec install" ;; esac ;;
+    aec)               case "$2" in
+                           install)  cmd_aec_install ;;
+                           neural)   cmd_dtln_install ;;
+                           *)        print "usage: meetink aec install|neural" ;;
+                       esac ;;
     prompt|vocab)
         mkdir -p "${MK_PROMPT:h}"
         [[ -f "$MK_PROMPT" ]] || touch "$MK_PROMPT"

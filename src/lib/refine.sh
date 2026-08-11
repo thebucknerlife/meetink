@@ -227,6 +227,39 @@ _mix_enhanced_m4a() {
         && (( $(stat -f%z "$sys48" 2>/dev/null || echo 0) > 96000 )); then
         have48=1
     fi
+    local timing="${out%.m4a}.timing.json"
+
+    # Neural mix (DTLN-aec, preferred when installed): the model runs in
+    # both directions as a DETECTOR — per-block keep-ratios gate the RAW
+    # streams, so kept speech is a bit-true passthrough. The user's
+    # voice needs no labels (the model keeps it wherever it is); sys
+    # suppression is confined to the transcript spans. See
+    # neural_mix.py's docstring for the field verdicts this encodes.
+    local dtln_py="$MK_HOME/dtln-venv/bin/python"
+    if [[ -f "$timing" && -x "$dtln_py" \
+          && -f "$MK_HOME/dtln/dtln_aec_512_1.tflite" \
+          && -s "$mic" && -s "$sys" ]]; then
+        local nmic="$mic" nsys="$sys" nar=16000
+        (( have48 )) && { nmic="$mic48"; nsys="$sys48"; nar=48000; }
+        local nd=$(mktemp -d -t meetink-nmix)
+        if "$dtln_py" "$MK_ROOT/src/refine/neural_mix.py" \
+                --mic16 "$mic" --sys16 "$sys" \
+                --mic "$nmic" --sys "$nsys" --rate $nar \
+                --timing "$timing" --me "$(me_name_get 2>/dev/null || print ME)" \
+                --progress-state /tmp/meetink-postproc.state \
+                --out "$nd/mixed.raw" 2>>/tmp/meetink-refine.log; then
+            local nrc=0
+            ffmpeg -v error -y -f s16le -ar $nar -ac 1 -i "$nd/mixed.raw" \
+                -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || nrc=$?
+            rm -rf "$nd"
+            print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=neural" \
+                >> "$MK_HOME/perf.log" 2>/dev/null || true
+            return $nrc
+        fi
+        rm -rf "$nd"
+        print -P "${C[dim]}  (neural mix bailed — transcript fallback)${C[reset]}"
+    fi
+
     # Transcript-driven mix (the "what I heard on the call" path): sys
     # passes through UNTOUCHED — it is the audio the user heard, so no
     # enhance/DFN coloration — and the mic opens only inside the user's
@@ -234,7 +267,6 @@ _mix_enhanced_m4a() {
     # Requires refine's timing sidecar, which is why the m4a step runs
     # AFTER refine now. Falls back to enhance + sidechain duck when the
     # timing is missing or the gating bails.
-    local timing="${out%.m4a}.timing.json"
     if [[ -f "$timing" && -x "$MK_PARAKEET_VENV/bin/python" ]]; then
         local tmic="$mic" tsys="$sys" tar=16000
         (( have48 )) && { tmic="$mic48"; tsys="$sys48"; tar=48000; }
