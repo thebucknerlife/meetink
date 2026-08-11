@@ -46,7 +46,18 @@ diarize_available() {
 }
 
 diarize_running() {
-    [[ -f "$MK_DIARIZE_PIDFILE" ]] && kill -0 "$(cat "$MK_DIARIZE_PIDFILE")" 2>/dev/null
+    [[ -f "$MK_DIARIZE_PIDFILE" ]] && kill -0 "$(cat "$MK_DIARIZE_PIDFILE")" 2>/dev/null && return 0
+    # Stale pidfile with a live server behind it: a failed re-start (port
+    # collision) can leave its own corpse pid in the file while the older
+    # instance keeps serving :8179 — every probe then reports "not
+    # running" against a healthy server (field case: profile assign
+    # refused after app-rebuild churn). Trust the port, repair the file.
+    local pid=$(pgrep -f "src/diarize/server.py" 2>/dev/null | head -1)
+    if [[ -n "$pid" ]] && curl -s -m 1 "http://127.0.0.1:${MK_DIARIZE_PORT:-8179}/profiles" >/dev/null 2>&1; then
+        echo "$pid" > "$MK_DIARIZE_PIDFILE" 2>/dev/null || true
+        return 0
+    fi
+    return 1
 }
 
 # Persistent on/off toggle (lives in $MK_HOME/config alongside active_model).
