@@ -252,6 +252,70 @@ func applyEventToMeeting(txtPath: String, event e: [String: Any]) -> String {
     return path
 }
 
+/// Agent `events` over a window, on a background queue; completion on
+/// main. Respects hidden_calendars. (Read-to-EOF before waitUntilExit —
+/// the 64 KB pipe-deadlock lesson.)
+func fetchAgentEvents(from: Date, to: Date,
+                      completion: @escaping ([[String: Any]]) -> Void) {
+    let agent = "\(mkHome)/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
+    guard FileManager.default.isExecutableFile(atPath: agent) else {
+        completion([]); return
+    }
+    let iso = ISO8601DateFormatter()
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: agent)
+    var args = ["events", "--from", iso.string(from: from),
+                "--to", iso.string(from: to)]
+    if let hidden = configValue("hidden_calendars"), !hidden.isEmpty {
+        args += ["--hidden-calendars", hidden]
+    }
+    proc.arguments = args
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    DispatchQueue.global().async {
+        var events: [[String: Any]] = []
+        do {
+            try proc.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            events = (try? JSONSerialization.jsonObject(with: data)
+                      as? [[String: Any]]) ?? []
+        } catch {}
+        DispatchQueue.main.async { completion(events) }
+    }
+}
+
+/// `meetink start`, then stamp a calendar event on the fresh session —
+/// but only once the live symlink MOVES (stamping earlier would link
+/// the previous meeting). Used by the Today page and the menu bar.
+func startRecordingAndLinkEvent(_ e: [String: Any],
+                                completion: (() -> Void)? = nil) {
+    guard let launcher = launcherPath() else { completion?(); return }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: launcher)
+    proc.arguments = ["start"]
+    var env = ProcessInfo.processInfo.environment
+    env["MEETINK_NO_TAIL"] = "1"
+    proc.environment = env
+    let live = liveSymlinkPath()
+    let before = try? FileManager.default.destinationOfSymbolicLink(atPath: live)
+    DispatchQueue.global().async {
+        defer { DispatchQueue.main.async { completion?() } }
+        do { try proc.run() } catch { return }
+        proc.waitUntilExit()
+        var dest: String? = nil
+        for _ in 0..<30 {
+            dest = try? FileManager.default.destinationOfSymbolicLink(atPath: live)
+            if recordingPID() != nil, let d = dest, d != before { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard recordingPID() != nil, let d = dest, d != before else { return }
+        let resolved = d.hasPrefix("/") ? d
+            : (live as NSString).deletingLastPathComponent + "/" + d
+        _ = applyEventToMeeting(txtPath: resolved, event: e)
+    }
+}
+
 /// True when this transcript is the one the capture binary is writing
 /// RIGHT NOW. It matters because capture re-opens the transcript BY PATH
 /// on every append — move the file or its folder and every later chunk
@@ -682,6 +746,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let statusDot = NSTextField(labelWithString: "●")
     private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
     private let folderButton = NSButton(title: "Open Folder", target: nil, action: nil)
+    /// Event link as a dropdown in the header bar: shows the linked
+    /// calendar event (or "No Event"); clicking lists the day's events.
+    private let eventButton = NSButton(title: "No Event", target: nil, action: nil)
     private let downloadButton = NSButton(title: "Download Transcript", target: nil, action: nil)
     private let reprocessButton = NSButton(title: "Reprocess", target: nil, action: nil)
     private let menuButton = NSButton(title: "", target: nil, action: nil)
@@ -785,6 +852,17 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         reprocessButton.toolTip = "Re-run transcription, diarization and audio "
             + "enhancement on this meeting's kept audio"
         reprocessButton.isHidden = true
+        eventButton.bezelStyle = .rounded
+        eventButton.controlSize = .small
+        eventButton.font = NSFont.systemFont(ofSize: 11)
+        eventButton.image = NSImage(systemSymbolName: "calendar",
+                                    accessibilityDescription: "Calendar event")
+        eventButton.imagePosition = .imageLeading
+        eventButton.lineBreakMode = .byTruncatingTail
+        eventButton.widthAnchor.constraint(lessThanOrEqualToConstant: 220).isActive = true
+        eventButton.target = self
+        eventButton.action = #selector(linkEvent)
+        eventButton.toolTip = "Link this meeting to a calendar event"
         downloadButton.bezelStyle = .rounded
         downloadButton.controlSize = .small
         downloadButton.font = NSFont.systemFont(ofSize: 11)
@@ -799,6 +877,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         strip.addArrangedSubview(statusDot)
         strip.addArrangedSubview(headerField)
         strip.addArrangedSubview(NSView())
+        strip.addArrangedSubview(eventButton)
         strip.addArrangedSubview(reprocessButton)
         strip.addArrangedSubview(folderButton)
         strip.addArrangedSubview(downloadButton)
@@ -1243,18 +1322,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
         let liveRecording = fixedPath == nil && recordingPID() != nil
         if liveRecording {
-            // Linking while live is safe: it writes meta + header lines
-            // only, and the physical rename waits for /stop (capture
-            // appends by path — see isLiveRecording).
-            if !lastResolvedPath.isEmpty {
-                add("Link Event…", #selector(linkEvent))
-                menu.addItem(.separator())
-            }
             add("Discard Recording…", #selector(discardRecording))
         } else if !lastResolvedPath.isEmpty {
-            // Even an empty/broken transcript can be linked or deleted —
-            // gating on content left the button silently dead.
-            add("Link Event…", #selector(linkEvent))
+            // Event linking moved to the header's calendar dropdown.
             add("Relabel Speakers (fast)…", #selector(relabelSpeakers))
             menu.addItem(.separator())
             add("Delete Meeting…", #selector(deleteMeeting))
@@ -1337,9 +1407,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         proc.arguments = eventArgs
         let pipe = Pipe()
         proc.standardOutput = pipe
-        menuButton.isEnabled = false
+        eventButton.isEnabled = false
         DispatchQueue.global().async { [weak self] in
-            defer { DispatchQueue.main.async { self?.menuButton.isEnabled = true } }
+            defer { DispatchQueue.main.async { self?.eventButton.isEnabled = true } }
             do { try proc.run() } catch { return }
             // Read to EOF BEFORE waitUntilExit — a day's events with
             // attendees overflows the 64 KB pipe buffer, the agent blocks
@@ -1357,6 +1427,16 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private func showEventMenu(_ events: [[String: Any]], near start: Date) {
         fetchedEvents = events
         let menu = NSMenu()
+        // "No Event" unlinks (tag -1). Checkmarked when nothing is linked.
+        let none = NSMenuItem(title: "No Event",
+                              action: #selector(eventPicked(_:)), keyEquivalent: "")
+        none.target = self
+        none.tag = -1
+        if (meetingMeta(lastResolvedPath)["event"] as? [String: Any]) == nil {
+            none.state = .on
+        }
+        menu.addItem(none)
+        menu.addItem(.separator())
         if events.isEmpty {
             menu.addItem(NSMenuItem(
                 title: "No calendar events found (is calendar access granted?)",
@@ -1365,14 +1445,24 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let iso = ISO8601DateFormatter()
         let tf = DateFormatter()
         tf.dateFormat = "h:mm a"
-        // Chronological list; the event nearest the recording start is
-        // checkmarked so the eye lands on it.
-        var nearest = -1
-        var best = Double.infinity
-        for (i, e) in events.enumerated() {
-            guard let d = iso.date(from: (e["start"] as? String) ?? "") else { continue }
-            let dist = abs(d.timeIntervalSince(start))
-            if dist < best { best = dist; nearest = i }
+        // Chronological list. The LINKED event gets the checkmark; with
+        // nothing linked, the event nearest the recording start does
+        // (so the eye lands on the likely pick).
+        let linked = meetingMeta(lastResolvedPath)["event"] as? [String: Any]
+        var marked = -1
+        if let linked {
+            marked = events.firstIndex(where: {
+                ($0["start"] as? String) == (linked["start"] as? String)
+                    && ($0["title"] as? String) == (linked["title"] as? String)
+            }) ?? -1
+        }
+        if marked < 0 && linked == nil {
+            var best = Double.infinity
+            for (i, e) in events.enumerated() {
+                guard let d = iso.date(from: (e["start"] as? String) ?? "") else { continue }
+                let dist = abs(d.timeIntervalSince(start))
+                if dist < best { best = dist; marked = i }
+            }
         }
         for (i, e) in events.enumerated() {
             let when = iso.date(from: (e["start"] as? String) ?? "")
@@ -1381,15 +1471,21 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 action: #selector(eventPicked(_:)), keyEquivalent: "")
             item.target = self
             item.tag = i
-            if i == nearest { item.state = .on }
+            if i == marked { item.state = .on }
             menu.addItem(item)
         }
         menu.popUp(positioning: nil,
-                   at: NSPoint(x: 0, y: menuButton.bounds.height + 4),
-                   in: menuButton)
+                   at: NSPoint(x: 0, y: eventButton.bounds.height + 4),
+                   in: eventButton)
     }
 
     @objc private func eventPicked(_ sender: NSMenuItem) {
+        if sender.tag == -1 {
+            // Unlink: drop the event record; the title and headers stay.
+            setMeetingMeta(lastResolvedPath, "event", NSNull())
+            refreshIfChanged(force: true)
+            return
+        }
         guard sender.tag >= 0, sender.tag < fetchedEvents.count else { return }
         let e = fetchedEvents[sender.tag]
         let newPath = applyEventToMeeting(txtPath: lastResolvedPath, event: e)
@@ -2390,6 +2486,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
            !lastResolvedPath.isEmpty {
             let name = meetingDisplayName(lastResolvedPath)
             if titleField.stringValue != name { titleField.stringValue = name }
+        }
+        // Event dropdown label follows the linked event.
+        eventButton.isHidden = lastResolvedPath.isEmpty
+        if !lastResolvedPath.isEmpty {
+            let linked = (meetingMeta(lastResolvedPath)["event"]
+                          as? [String: Any])?["title"] as? String
+            let label = (linked?.isEmpty == false) ? linked! : "No Event"
+            if eventButton.title != label { eventButton.title = label }
         }
         updateSpeakersPanel()
     }
@@ -3828,41 +3932,21 @@ final class TodayViewController: NSViewController {
         fetchEvents()
     }
 
-    /// Agent `events` over the whole local day (read-to-EOF before
-    /// waitUntilExit — the pipe-deadlock lesson applies here too).
+    /// Agent `events` over the whole local day.
     private func fetchEvents() {
         guard !fetching else { return }
-        let agent = "\(mkHome)/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
-        guard FileManager.default.isExecutableFile(atPath: agent) else { return }
         fetching = true
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: agent)
         let dayStart = Calendar.current.startOfDay(for: Date())
-        var args = ["events",
-                    "--from", iso.string(from: dayStart),
-                    "--to", iso.string(from: dayStart.addingTimeInterval(24 * 3600))]
-        if let hidden = configValue("hidden_calendars"), !hidden.isEmpty {
-            args += ["--hidden-calendars", hidden]
-        }
-        proc.arguments = args
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        DispatchQueue.global().async { [weak self] in
-            defer { DispatchQueue.main.async { self?.fetching = false } }
-            do { try proc.run() } catch { return }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-            let all = (try? JSONSerialization.jsonObject(with: data)
-                       as? [[String: Any]]) ?? []
+        fetchAgentEvents(from: dayStart,
+                         to: dayStart.addingTimeInterval(24 * 3600)) { [weak self] all in
+            guard let self else { return }
+            self.fetching = false
             // Only meetings with other attendees — solo calendar blocks
             // (focus time, reminders) aren't recordable conversations.
-            let meetings = all.filter {
+            self.events = all.filter {
                 (($0["attendees"] as? [[String: String]]) ?? []).count >= 2
             }
-            DispatchQueue.main.async {
-                self?.events = meetings
-                self?.rebuildRows()
-            }
+            self.rebuildRows()
         }
     }
 
@@ -3951,11 +4035,10 @@ final class TodayViewController: NSViewController {
                 : (liveSymlinkPath() as NSString).deletingLastPathComponent + "/" + dest
         }()
 
-        // The scroll anchor is the 3rd-most-recent past event: the whole
-        // day is in the document, but the page opens with just that much
-        // history above the fold. With ≤3 past events everything already
-        // fits from the top — no anchor, no scroll.
-        let anchorEvent = past.count > 3 ? past[past.count - 3] : nil
+        // The scroll anchor is the FIRST current/future event: the past
+        // renders above it (scroll up for history), but the page opens
+        // on what's happening now and next. No past events → no scroll.
+        let anchorEvent = past.isEmpty ? nil : upcoming.first
         scrollAnchor = nil
         for (section, list) in [("Earlier", past), ("Up next", upcoming)] where !list.isEmpty {
             let label = NSTextField(labelWithString: section)
@@ -4010,6 +4093,11 @@ final class TodayViewController: NSViewController {
         box.layer?.backgroundColor = isNow
             ? NSColor.controlAccentColor.withAlphaComponent(0.13).cgColor
             : NSColor.quaternaryLabelColor.withAlphaComponent(0.08).cgColor
+        // Uniform row height — button-less (past) and badge-bearing (now)
+        // rows otherwise fit to different intrinsic sizes.
+        let minHeight = box.heightAnchor.constraint(greaterThanOrEqualToConstant: 58)
+        minHeight.priority = NSLayoutConstraint.Priority(999)
+        minHeight.isActive = true
 
         let tf = DateFormatter()
         tf.dateFormat = "h:mm a"
@@ -4095,43 +4183,14 @@ final class TodayViewController: NSViewController {
         rowActions[id]?()
     }
 
-    /// `meetink start`, then stamp the calendar event on the fresh
-    /// session (meta + headers; the rename waits for /stop). Mirrors
-    /// what the watch does for its own event starts.
+    /// Start + link via the shared helper; the local state just drives
+    /// the "Starting…" button.
     private func startRecording(for e: [String: Any]) {
-        guard let launcher = launcherPath() else { return }
         startingEventStart = (e["start"] as? String) ?? ""
         rebuildRows()
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: launcher)
-        proc.arguments = ["start"]
-        var env = ProcessInfo.processInfo.environment
-        env["MEETINK_NO_TAIL"] = "1"
-        proc.environment = env
-        let live = liveSymlinkPath()
-        // The symlink still points at the PREVIOUS session until
-        // cmd_start retargets it — stamping the event before it moves
-        // would link the wrong meeting.
-        let before = try? FileManager.default.destinationOfSymbolicLink(atPath: live)
-        DispatchQueue.global().async { [weak self] in
-            defer {
-                DispatchQueue.main.async {
-                    self?.startingEventStart = nil
-                    self?.rebuildRows()
-                }
-            }
-            do { try proc.run() } catch { return }
-            proc.waitUntilExit()
-            var dest: String? = nil
-            for _ in 0..<30 {
-                dest = try? FileManager.default.destinationOfSymbolicLink(atPath: live)
-                if recordingPID() != nil, let d = dest, d != before { break }
-                Thread.sleep(forTimeInterval: 0.5)
-            }
-            guard recordingPID() != nil, let d = dest, d != before else { return }
-            let resolved = d.hasPrefix("/") ? d
-                : (live as NSString).deletingLastPathComponent + "/" + d
-            _ = applyEventToMeeting(txtPath: resolved, event: e)
+        startRecordingAndLinkEvent(e) { [weak self] in
+            self?.startingEventStart = nil
+            self?.rebuildRows()
         }
     }
 }
@@ -4506,6 +4565,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // daemon also carries MEETINK_WATCH_OWNER_PID so it exits by itself
     // if the app dies uncleanly (no orphaned recordings).
     private var watchProcess: Process? = nil
+    // Today's events for the menu bar's "Start … Recording" rows —
+    // refreshed every 5 min off the poll; never fetched menu-open-time
+    // (the agent call takes seconds).
+    private var cachedEvents: [[String: Any]] = []
+    private var lastEventsFetch = Date.distantPast
+
     // Long-call guard state (silence detector + duration backstop).
     private var guardRecordingPath: String? = nil
     private var guardLogOffset: UInt64 = 0
@@ -4879,6 +4944,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateStatusIcon(recording: recording)
             rebuildMenu()
         }
+        if Date().timeIntervalSince(lastEventsFetch) > 300 {
+            lastEventsFetch = Date()
+            fetchAgentEvents(from: Date().addingTimeInterval(-6 * 3600),
+                             to: Date().addingTimeInterval(12 * 3600)) { [weak self] events in
+                self?.cachedEvents = events
+                self?.rebuildMenu()
+            }
+        }
+    }
+
+    /// Events happening right now (or starting within 15 min) that have
+    /// other attendees — the menu bar offers one-click linked starts.
+    private func currentAttendeeEvents() -> [[String: Any]] {
+        let iso = ISO8601DateFormatter()
+        let now = Date()
+        return cachedEvents.filter { e in
+            guard (((e["attendees"] as? [[String: String]]) ?? []).count >= 2),
+                  let start = (e["start"] as? String).flatMap({ iso.date(from: $0) })
+            else { return false }
+            let end = (e["end"] as? String).flatMap { iso.date(from: $0) }
+                ?? start.addingTimeInterval(3600)
+            return start.addingTimeInterval(-15 * 60) <= now && now <= end
+        }
     }
 
     private func updateStatusIcon(recording: Bool) {
@@ -4908,12 +4996,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         let toggle = NSMenuItem(
-            title: recording ? "Stop Recording" : "Start Recording",
+            title: recording ? "Stop Recording" : "Start New Recording",
             action: recording ? #selector(stopRecording) : #selector(startRecording),
             keyEquivalent: "")
         toggle.target = self
         toggle.isEnabled = launcherPath() != nil
         menu.addItem(toggle)
+
+        // One-click linked starts for whatever is on the calendar right
+        // now (multiple rows when events overlap).
+        if !recording {
+            for e in currentAttendeeEvents() {
+                let title = (e["title"] as? String) ?? "(untitled)"
+                let item = NSMenuItem(
+                    title: "Start “\(title)” Recording",
+                    action: #selector(startEventRecording(_:)),
+                    keyEquivalent: "")
+                item.target = self
+                item.representedObject = e
+                item.isEnabled = launcherPath() != nil
+                menu.addItem(item)
+            }
+        }
 
         menu.addItem(.separator())
         let show = NSMenuItem(title: "Open Meetink",
@@ -4976,6 +5080,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func stopRecording() { runLauncher("stop") }
+
+    @objc private func startEventRecording(_ sender: NSMenuItem) {
+        guard let e = sender.representedObject as? [String: Any] else { return }
+        startRecordingAndLinkEvent(e) { [weak self] in self?.rebuildMenu() }
+    }
     @objc private func showAppAction() { showApp() }
 
     @objc private func transcribeAudio() { showApp(page: 2) }

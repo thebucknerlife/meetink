@@ -243,12 +243,26 @@ def _agent_meeting_active() -> dict:
         return {"active": False, "source": None, "signals": []}
 
 
+# One notification on screen at a time, machine-wide within the daemon:
+# two events at the same minute used to fire concurrent agent processes
+# whose linger re-posts fought each other (field report: "they compete").
+# Serializing here makes them appear one after the other.
+_notify_lock = threading.Lock()
+
+
 def _agent_notify(title: str, body: str, actions: list[str],
                   default: str, timeout: int, linger: int = 0) -> str:
     """Blocking call. Caller usually runs this on a dedicated worker
     thread because the agent waits up to `timeout` seconds for a click."""
     if not MK_AGENT.is_file():
         return default
+    with _notify_lock:
+        return _agent_notify_locked(title, body, actions, default,
+                                    timeout, linger)
+
+
+def _agent_notify_locked(title: str, body: str, actions: list[str],
+                         default: str, timeout: int, linger: int) -> str:
     try:
         proc = subprocess.run(
             [str(MK_AGENT), "notify",
@@ -703,6 +717,14 @@ class WatchManager:
 
         e.status = EventStatus.NOTIFIED
         e.notified_at = _now()
+
+        # No other attendees = nothing to warn about — a solo block with
+        # a meeting link still records per the usual rules, but the 1-min
+        # banner is pure noise (field report: notifications for events
+        # without attendees).
+        if len(e.attendees) < 2:
+            _wlog(f"'{e.title}': notification suppressed (no other attendees)")
+            return
 
         body_parts = [f"In 1 min: {e.title}"]
         if e.project:
