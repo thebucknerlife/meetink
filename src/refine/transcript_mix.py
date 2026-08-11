@@ -24,9 +24,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import enhance  # gcc_phat_delay + residual_echo_gate (16 kHz analysis)
 
 
 def log(msg: str) -> None:
@@ -105,8 +109,12 @@ def main() -> int:
     ap.add_argument("--timing", required=True)
     ap.add_argument("--me", default="ME")
     ap.add_argument("--sys-duck", type=float, default=0.10,
-                    help="sys gain INSIDE the user's spans — their remote "
-                         "echo lives there (0.10 = -20 dB; 1.0 disables)")
+                    help="sys gain inside the user's spans (1.0 disables)")
+    ap.add_argument("--echo-gate", action="store_true",
+                    help="global residual echo gate on sys. ONLY sane on "
+                         "an echo-cancelled mic: with raw bleed the gate "
+                         "reads the whole remote side as 'echo' and ducked "
+                         "90%% of a real meeting (field incident)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -131,7 +139,11 @@ def main() -> int:
         # for a third of the meeting and ducked the remote side (v5
         # regression). The mic is raw here — bleed sits ~2.5-8x below
         # sys — so 2.5x separates the cases.
-        exclusive = mic_rms[i] > 0.02 and mic_rms[i] > 2.5 * sys_rms[i]
+        # Floor 0.012 (2x the user's measured noise floor): quieter
+        # utterances that the transcript missed used to fall through and
+        # leave their voice present only as the naked sys echo. The 2.5x
+        # ratio still keeps bleed out.
+        exclusive = mic_rms[i] > 0.012 and mic_rms[i] > 2.5 * sys_rms[i]
         if exclusive and run_start is None:
             run_start = i
         elif not exclusive and run_start is not None:
@@ -145,7 +157,29 @@ def main() -> int:
         log(f"energy fallback opened {sum(e - s for s, e in extra):.0f}s "
             f"of mic-exclusive audio")
 
-    import os
+    # The user's remote echo in sys — everywhere, not just inside the
+    # detected spans: a missed span used to leave their voice present
+    # ONLY as the naked echo copy ("I've got echo on my side"). The
+    # residual echo gate ducks exactly the sys blocks that match the
+    # DELAY-SHIFTED mic envelope at echo-plausible levels; genuinely
+    # remote speech passes untouched, so the remote side's passthrough
+    # verdict survives. Analysis runs at 16 kHz (decimated copies),
+    # gains map back to the stream rate by time.
+    def analysis16(path: str) -> np.ndarray:
+        data = np.fromfile(path, dtype=np.int16).astype(np.float32) / 32768.0
+        step = args.rate // 16000
+        return data[::step].copy() if step > 1 else data
+
+    gate_gains = None
+    if args.echo_gate:
+        mic16 = analysis16(args.mic)
+        sys16 = analysis16(args.sys_)
+        delay = enhance.gcc_phat_delay(mic16, sys16)
+        if delay >= 0:
+            _, gate_gains = enhance.residual_echo_gate(mic16, sys16, delay)
+            if gate_gains is not None:
+                log(f"echo gate armed (delay {delay / 16.0:.0f} ms)")
+
     n_mic = os.path.getsize(args.mic) // 2
     n_sys = os.path.getsize(args.sys_) // 2
     n = max(n_mic, n_sys)
@@ -175,6 +209,11 @@ def main() -> int:
             # their mic voice ("substantially more echo from me").
             duck_env = env_for_chunk(duck_spans, pos, take, args.rate)
             sys_gain = 1.0 - (1.0 - args.sys_duck) * duck_env
+            if gate_gains is not None:
+                # Map the 16 kHz 50 ms gate blocks onto this chunk.
+                idx = ((np.arange(take) + pos) // (args.rate // 20))
+                idx = np.minimum(idx, len(gate_gains) - 1)
+                sys_gain = sys_gain * gate_gains[idx]
             mixed = s * sys_gain + m * env
             # Soft headroom: simultaneous speech can sum past full scale.
             np.clip(mixed, -0.98, 0.98, out=mixed)
