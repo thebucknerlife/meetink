@@ -64,6 +64,13 @@ func configBool(_ key: String) -> Bool {
 /// Rewrite one key=value line in ~/.meetink/config, preserving every other
 /// line. Same file the launcher and REPL read — the Settings page is just
 /// another writer of the shared config surface.
+/// Interface zoom for the reading surfaces (⌘+/⌘-/⌘0), persisted as
+/// ui_zoom in the config. Fonts multiply by this and round.
+var uiZoom: CGFloat = {
+    let v = Double(configValue("ui_zoom") ?? "") ?? 1.0
+    return CGFloat(min(1.8, max(0.7, v)))
+}()
+
 func configSetValue(_ key: String, _ value: String) {
     let path = "\(mkHome)/config"
     var lines = ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
@@ -692,6 +699,20 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var snapshot = TranscriptSnapshot()
     private var colorMap: [String: NSColor] = [:]
 
+    // --- Chat with the transcript ---
+    // Collapsed to a single bar; expands to a small log + input. Sits
+    // directly above the player bar for recordings, and at the window
+    // bottom for the live view (the collapsed player bar is 0pt there).
+    private let chatPanel = NSStackView()
+    private let chatToggle = NSButton()
+    private let chatBody = NSStackView()
+    private let chatLogScroll = NSScrollView()
+    private let chatLog = NSTextView()
+    private let chatField = NSTextField()
+    private var chatHistory: [(q: String, a: String)] = []
+    private var chatPending: String? = nil
+    private var chatBusy = false
+
     // --- Playback (archived transcripts with a kept .m4a only) ---
     private var player: AVAudioPlayer? = nil
     private var audioPath: String? = nil
@@ -904,9 +925,58 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         playerBarHeight?.priority = NSLayoutConstraint.Priority(999)
         playerBarHeight?.isActive = true
 
+        // --- Chat panel ---
+        let chatDivider = NSBox()
+        chatDivider.boxType = .separator
+        chatToggle.title = "Ask about this meeting…"
+        if let bubble = NSImage(systemSymbolName: "bubble.left",
+                                accessibilityDescription: "Chat") {
+            chatToggle.image = bubble
+            chatToggle.imagePosition = .imageLeading
+        }
+        chatToggle.isBordered = false
+        chatToggle.alignment = .left
+        chatToggle.font = NSFont.systemFont(ofSize: 12)
+        chatToggle.contentTintColor = .secondaryLabelColor
+        chatToggle.target = self
+        chatToggle.action = #selector(chatToggleClicked)
+        chatLog.isEditable = false
+        chatLog.drawsBackground = false
+        chatLog.textContainerInset = NSSize(width: 4, height: 6)
+        chatLog.autoresizingMask = [.width]
+        chatLog.isVerticallyResizable = true
+        chatLog.textContainer?.widthTracksTextView = true
+        chatLogScroll.documentView = chatLog
+        chatLogScroll.hasVerticalScroller = true
+        chatLogScroll.drawsBackground = false
+        // 999, not required — same graceful-collapse rule as the player
+        // bar's height (a required conflict breaks random constraints).
+        let chatLogHeight = chatLogScroll.heightAnchor.constraint(equalToConstant: 170)
+        chatLogHeight.priority = NSLayoutConstraint.Priority(999)
+        chatLogHeight.isActive = true
+        chatField.placeholderString = "Ask — answers use the transcript as it is right now"
+        chatField.target = self
+        chatField.action = #selector(chatSend)
+        chatBody.orientation = .vertical
+        chatBody.alignment = .width
+        chatBody.spacing = 6
+        chatBody.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 8, right: 8)
+        chatBody.addArrangedSubview(chatLogScroll)
+        chatBody.addArrangedSubview(chatField)
+        chatBody.isHidden = true
+        chatPanel.orientation = .vertical
+        chatPanel.alignment = .width
+        chatPanel.spacing = 2
+        chatPanel.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
+        chatPanel.addArrangedSubview(chatDivider)
+        chatPanel.addArrangedSubview(chatToggle)
+        chatPanel.addArrangedSubview(chatBody)
+        chatPanel.translatesAutoresizingMaskIntoConstraints = false
+
         content.addSubview(header)
         content.addSubview(divider)
         content.addSubview(playerBar)
+        content.addSubview(chatPanel)
         content.addSubview(speakersScroll)
         content.addSubview(panelDivider)
         content.addSubview(scroll)
@@ -927,7 +997,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             scroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: panelDivider.leadingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: playerBar.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: chatPanel.topAnchor),
+            chatPanel.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            chatPanel.trailingAnchor.constraint(equalTo: panelDivider.leadingAnchor),
+            chatPanel.bottomAnchor.constraint(equalTo: playerBar.topAnchor),
             panelDivider.topAnchor.constraint(equalTo: divider.bottomAnchor),
             panelDivider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             panelDivider.widthAnchor.constraint(equalToConstant: 7),
@@ -1000,8 +1073,104 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     }
 
     func show(path: String?) {
+        // A different meeting is a different conversation.
+        if path != fixedPath {
+            chatHistory.removeAll()
+            chatPending = nil
+            renderChatLog()
+        }
         fixedPath = path
         refreshIfChanged(force: true)
+    }
+
+    /// Re-render the transcript at the current uiZoom (⌘+/⌘-).
+    func zoomChanged() {
+        render(empty: snapshot.blocks.isEmpty)
+    }
+
+    // MARK: chat with the transcript
+
+    @objc private func chatToggleClicked() {
+        chatBody.isHidden.toggle()
+        if !chatBody.isHidden {
+            view.window?.makeFirstResponder(chatField)
+        }
+    }
+
+    @objc private func chatSend() {
+        let q = chatField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty, !chatBusy, let launcher = launcherPath(),
+              !lastResolvedPath.isEmpty else { return }
+        let path = lastResolvedPath
+        chatBusy = true
+        chatField.isEnabled = false
+        chatField.stringValue = ""
+        chatPending = q
+        renderChatLog()
+        // Fold recent turns into the question so follow-ups have context —
+        // cmd_ask itself is single-shot. The transcript is re-read by the
+        // CLI on every call, which is what makes live chat live.
+        var question = q
+        if !chatHistory.isEmpty {
+            let hist = chatHistory.suffix(3)
+                .map { "Q: \($0.q)\nA: \($0.a)" }.joined(separator: "\n")
+            question = "Earlier in this chat:\n\(hist)\n\nNew question: \(q)"
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["ask", "--plain", "--file", path, question]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        DispatchQueue.global().async { [weak self] in
+            var answer = ""
+            do {
+                try proc.run()
+                // Read to EOF BEFORE waitUntilExit (64 KB pipe deadlock).
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                answer = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            } catch {}
+            if answer.isEmpty {
+                answer = "(no answer — is the claude CLI or a local LLM configured? See /tmp/meetink-*.log)"
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.chatHistory.append((q: q, a: answer))
+                self.chatPending = nil
+                self.chatBusy = false
+                self.chatField.isEnabled = true
+                self.renderChatLog()
+                self.view.window?.makeFirstResponder(self.chatField)
+            }
+        }
+    }
+
+    private func renderChatLog() {
+        let out = NSMutableAttributedString()
+        let size = round(12 * uiZoom)
+        let qAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: size),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        let aAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: size),
+            .foregroundColor: NSColor.labelColor,
+        ]
+        for turn in chatHistory {
+            out.append(NSAttributedString(string: "\(turn.q)\n", attributes: qAttrs))
+            out.append(NSAttributedString(string: "\(turn.a)\n\n", attributes: aAttrs))
+        }
+        if let pending = chatPending {
+            out.append(NSAttributedString(string: "\(pending)\n", attributes: qAttrs))
+            out.append(NSAttributedString(
+                string: "thinking…\n",
+                attributes: [.font: NSFont.systemFont(ofSize: size),
+                             .foregroundColor: NSColor.tertiaryLabelColor]))
+        }
+        chatLog.textStorage?.setAttributedString(out)
+        chatLog.scrollToEndOfDocument(nil)
     }
 
     private var pinnedToBottom: Bool {
@@ -2093,8 +2262,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         updatePlayerAvailability()
         let wasPinned = pinnedToBottom
         let out = NSMutableAttributedString()
-        let bodyFont = NSFont.systemFont(ofSize: 13)
-        let monoFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        let bodyFont = NSFont.systemFont(ofSize: round(13 * uiZoom))
+        let monoFont = NSFont.monospacedDigitSystemFont(ofSize: round(11 * uiZoom),
+                                                        weight: .regular)
 
         if empty {
             out.append(NSAttributedString(
@@ -2109,7 +2279,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
             for block in snapshot.blocks {
                 var speakerAttrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.boldSystemFont(ofSize: 13),
+                    .font: NSFont.boldSystemFont(ofSize: round(13 * uiZoom)),
                     .foregroundColor: color(for: block.speaker),
                     .paragraphStyle: headerPara,
                 ]
@@ -4480,6 +4650,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showApp()
     }
 
+    @objc private func zoomIn() { adjustZoom(0.1) }
+    @objc private func zoomOut() { adjustZoom(-0.1) }
+    @objc private func zoomReset() { adjustZoom(1.0 - uiZoom) }
+
+    private func adjustZoom(_ delta: CGFloat) {
+        uiZoom = min(1.8, max(0.7, uiZoom + delta))
+        configSetValue("ui_zoom", String(format: "%.1f", uiZoom))
+        mainWC?.readerVC.zoomChanged()
+    }
+
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls where url.scheme == "meetink" {
             if url.host == "transcribe" {
@@ -4535,6 +4715,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         findNext.tag = Int(NSTextFinder.Action.nextMatch.rawValue)
         editMenu.addItem(findNext)
         editItem.submenu = editMenu
+
+        let viewItem = NSMenuItem()
+        main.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        let zi = NSMenuItem(title: "Zoom In", action: #selector(zoomIn), keyEquivalent: "+")
+        zi.target = self
+        viewMenu.addItem(zi)
+        // ⌘= is what fingers actually press for "⌘+" on ANSI keyboards —
+        // a hidden twin that still answers its key equivalent.
+        let ziAlt = NSMenuItem(title: "Zoom In", action: #selector(zoomIn), keyEquivalent: "=")
+        ziAlt.target = self
+        ziAlt.isHidden = true
+        ziAlt.allowsKeyEquivalentWhenHidden = true
+        viewMenu.addItem(ziAlt)
+        let zo = NSMenuItem(title: "Zoom Out", action: #selector(zoomOut), keyEquivalent: "-")
+        zo.target = self
+        viewMenu.addItem(zo)
+        let zr = NSMenuItem(title: "Actual Size", action: #selector(zoomReset), keyEquivalent: "0")
+        zr.target = self
+        viewMenu.addItem(zr)
+        viewItem.submenu = viewMenu
 
         let windowItem = NSMenuItem()
         main.addItem(windowItem)

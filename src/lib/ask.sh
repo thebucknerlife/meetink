@@ -55,6 +55,19 @@ _ask_context_files() {
 }
 
 cmd_ask() {
+    # --file <path>: ask about a SPECIFIC transcript (the app's chat panel
+    # passes the open meeting). --plain: suppress the human decoration so
+    # stdout is exactly the answer (machine consumers).
+    local tx_override=""
+    typeset -g _ASK_PLAIN=0
+    while [[ "$1" == --* ]]; do
+        case "$1" in
+            --file)  tx_override="$2"; shift 2 ;;
+            --plain) _ASK_PLAIN=1; shift ;;
+            --)      shift; break ;;
+            *)       shift ;;
+        esac
+    done
     local question="$*"
     if [[ -z "$question" ]]; then
         print -P "${C[red]}usage:${C[reset]} /ask <question>"
@@ -77,6 +90,7 @@ cmd_ask() {
     fi
 
     local tx_path=$(_ask_transcript_path)
+    [[ -n "$tx_override" && -f "$tx_override" ]] && tx_path="$tx_override"
     local me=$(me_name_get 2>/dev/null)
     local project=$(project_active_get 2>/dev/null)
     local context_text=$(_ask_context_files)
@@ -161,8 +175,7 @@ _ask_claude() {
     else
         model="claude-sonnet-4-6"
     fi
-    print -P "${C[dim]}Asking ${model}...${C[reset]}"
-    print -P ""
+    (( ${_ASK_PLAIN:-0} )) || { print -P "${C[dim]}Asking ${model}...${C[reset]}"; print -P ""; }
     # Same slimming flags as titling: no built-in tools, no MCP — keeps the
     # call fast (~5-10s on Sonnet) and avoids "Prompt is too long" on Haiku
     # when the user has many plugins loaded.
@@ -171,7 +184,7 @@ _ask_claude() {
         --tools "" \
         --strict-mcp-config \
         "$prompt" </dev/null
-    print -P ""
+    (( ${_ASK_PLAIN:-0} )) || print -P ""
 }
 
 _ask_local() {
@@ -199,8 +212,7 @@ _ask_local() {
     # that we filter out below.
     local system_prompt="You answer questions about a meeting transcript. Be concise and grounded only in the transcript and provided context. If the transcript doesn't contain enough information, say so plainly rather than guessing."
     local active=$(local_llm_active_get 2>/dev/null)
-    print -P "${C[dim]}Asking ${active}...${C[reset]}"
-    print -P ""
+    (( ${_ASK_PLAIN:-0} )) || { print -P "${C[dim]}Asking ${active}...${C[reset]}"; print -P ""; }
     # Why mlx-lm vs llama.cpp: 30-60% faster on Apple Silicon (native Metal +
     # ANE integration). max-tokens 512 leaves room for a multi-paragraph
     # answer; temp 0.4 a touch higher than titles for natural prose while
@@ -237,8 +249,7 @@ _ask_lmstudio() {
     fi
     local model=$(lmstudio_model_resolve 2>/dev/null)
     local system_prompt="You answer questions about a meeting transcript. Be concise and grounded only in the transcript and provided context. If the transcript doesn't contain enough information, say so plainly rather than guessing."
-    print -P "${C[dim]}Asking ${model}...${C[reset]}"
-    print -P ""
+    (( ${_ASK_PLAIN:-0} )) || { print -P "${C[dim]}Asking ${model}...${C[reset]}"; print -P ""; }
     _generate_lmstudio "$system_prompt" "$user_prompt" 512 0.4
     print -P ""
 }
