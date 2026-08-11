@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from transcript_mix import merge_spans, user_spans  # transcript spans
+from transcript_mix import env_for_chunk, merge_spans, user_spans
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -126,6 +126,51 @@ def dtln_aec(mic: np.ndarray, lpb: np.ndarray, model_prefix: str,
     return out_file[(block_len - block_shift):(block_len - block_shift) + n]
 
 
+def mask_transfer_48k(raw16: np.ndarray, clean16: np.ndarray,
+                      raw48_path: str, out_path: str) -> None:
+    """Apply DTLN's separation to the 48 kHz stream at SAMPLE level.
+
+    Block-level gains could not separate mixed blocks — a 50 ms block
+    holding both the user's voice and remote bleed passed in full, and
+    the bleed rode along under the clean sys copy (field verdict: "echo
+    worse, on both sides"). This transfers the model's time-frequency
+    mask instead: |STFT(clean)|/|STFT(raw)| at 16 kHz maps 1:1 onto the
+    lowest 257 bins of a 48 kHz STFT (frame 1536/hop 384 = the same
+    31.25 Hz bins as frame 512/hop 128 at 16 kHz); bins above 8 kHz
+    scale with the frame's broadband mask (voice presence).
+    Chunked OLA so long meetings never load fully."""
+    F16, H16 = 512, 128
+    F48, H48 = 1536, 384
+    win16 = np.hanning(F16).astype(np.float32)
+    win48 = np.hanning(F48).astype(np.float32)
+    n48 = os.path.getsize(raw48_path) // 2
+    frames = max(0, (min(len(raw16), len(clean16)) - F16) // H16)
+
+    with open(raw48_path, "rb") as fi, open(out_path, "wb") as fo:
+        raw48 = np.frombuffer(fi.read(), dtype=np.int16).astype(np.float32) / 32768.0
+        out48 = np.zeros(len(raw48), dtype=np.float32)
+        norm = np.zeros(len(raw48), dtype=np.float32)
+        for t in range(frames):
+            o16 = t * H16
+            o48 = t * H48
+            if o48 + F48 > len(raw48):
+                break
+            S_raw = np.fft.rfft(raw16[o16:o16 + F16] * win16)
+            S_cln = np.fft.rfft(clean16[o16:o16 + F16] * win16)
+            mask = np.clip(np.abs(S_cln) / (np.abs(S_raw) + 1e-7), 0.0, 1.0)
+            S48 = np.fft.rfft(raw48[o48:o48 + F48] * win48)
+            full = np.empty(F48 // 2 + 1, dtype=np.float32)
+            full[:257] = mask
+            # Highs follow the frame's voiced-band mask energy.
+            full[257:] = float(np.clip(mask[10:200].mean() * 1.2, 0.0, 1.0))
+            seg = np.fft.irfft(S48 * full).astype(np.float32) * win48
+            out48[o48:o48 + F48] += seg
+            norm[o48:o48 + F48] += win48 * win48
+        np.divide(out48, np.maximum(norm, 1e-3), out=out48)
+        np.clip(out48, -0.98, 0.98, out=out48)
+        fo.write((out48 * 32767.0).astype(np.int16).tobytes())
+
+
 def gain_curve(raw: np.ndarray, clean: np.ndarray,
                floor: float = 0.03) -> np.ndarray:
     """Per-50ms-block gains: how much of each block the model kept.
@@ -200,39 +245,47 @@ def main() -> int:
 
     mic_clean = dtln_aec(mic16, sys16, args.model, "mic")
     log("mic direction done (bleed removal)")
-    # Reference = the CLEANED mic (user-only): see module docstring.
-    sys_clean = dtln_aec(sys16, mic_clean.astype(np.float32), args.model, "sys")
-    log("sys direction done (echo removal)")
 
-    mic_g = gain_curve(mic16, mic_clean)
-    sys_g = gain_curve(sys16, sys_clean)
+    # The mic track IS the separation, at sample level and 48 kHz —
+    # block gains passed mixed blocks whole and the bleed rode along
+    # under the clean sys copy ("echo worse, on both sides").
+    progress("applying separation to the archive mic")
+    mic_sep = args.out + ".micsep.raw"
+    mask_transfer_48k(mic16, mic_clean.astype(np.float32), args.mic, mic_sep)
+    log("mic separation transferred to playback rate")
 
-    # Confine sys suppression to the user's TRANSCRIPT spans (+0.8 s
-    # tail for the echo's lag). Everywhere else sys is forced to exact
-    # 1.0 — the remote side's proven-best passthrough. Inside the spans
-    # the neural ratio decides per block: the user's echo collapses,
-    # genuine overlap speech survives. Energy-derived activity masks were
-    # tried twice and blanketed ~90% of a real meeting (silence blocks,
-    # residual bleed); the transcript is the reliable span source, and a
-    # MISSED span is harmless here — the neural mic gains keep the
-    # user's voice without labels, so their direct voice always masks
-    # the (then unsuppressed) echo, matching the original mix's feel.
-    B = 16000 // 20
-    dil = np.zeros(len(sys_g), dtype=bool)
+    # sys: the v6 recipe the user rated best — bit-true passthrough
+    # outside their transcript spans, a uniform deep duck inside them
+    # (+1.0 s tail for the echo's lag). No model in this path: the sys
+    # direction misjudged echo blocks as keep-speech and let them
+    # through at full level. A missed span stays harmless — the
+    # separated mic carries the user's voice label-free, masking the
+    # unsuppressed echo.
+    spans = []
     if args.timing and os.path.isfile(args.timing):
         spans = merge_spans(user_spans(args.timing, args.me))
-        for s_t, e_t in spans:
-            a = max(0, int(s_t / 0.05) - 4)
-            b = min(len(dil), int((e_t + 0.8) / 0.05))
-            if a < b:
-                dil[a:b] = True
-    sys_g = np.where(dil, sys_g, 1.0).astype(np.float32)
-    log(f"gains: mic passthrough {(mic_g >= 1.0).mean()*100:.0f}%, "
-        f"sys passthrough {(sys_g >= 1.0).mean()*100:.0f}% "
-        f"(suppression confined to {dil.mean()*100:.0f}% transcript-active)")
+    duck_spans = [(s0, e0 + 1.0) for s0, e0 in spans]
+    DUCK = 0.08
 
-    apply_and_sum(args.mic, args.sys_, args.rate, mic_g, sys_g, args.out)
-    log("neural mix complete")
+    n = max(os.path.getsize(mic_sep) // 2, os.path.getsize(args.sys_) // 2)
+    CHUNK = args.rate * 10
+    with open(mic_sep, "rb") as fm, open(args.sys_, "rb") as fs,          open(args.out, "wb") as fo:
+        pos = 0
+        while pos < n:
+            take = min(CHUNK, n - pos)
+            mic = np.frombuffer(fm.read(take * 2), dtype=np.int16)
+            sy = np.frombuffer(fs.read(take * 2), dtype=np.int16)
+            m = np.zeros(take, dtype=np.float32)
+            sv = np.zeros(take, dtype=np.float32)
+            m[: len(mic)] = mic.astype(np.float32) / 32768.0
+            sv[: len(sy)] = sy.astype(np.float32) / 32768.0
+            env = env_for_chunk(duck_spans, pos, take, args.rate) if duck_spans                 else np.zeros(take, dtype=np.float32)
+            mixed = m + sv * (1.0 - (1.0 - DUCK) * env)
+            np.clip(mixed, -0.98, 0.98, out=mixed)
+            fo.write((mixed * 32767.0).astype(np.int16).tobytes())
+            pos += take
+    os.unlink(mic_sep)
+    log("neural mix complete (separated mic + v6 sys)")
     return 0
 
 
