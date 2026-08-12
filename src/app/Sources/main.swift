@@ -747,6 +747,66 @@ final class DropContainerView: NSView {
 
 // MARK: - Transcript page (live or archived)
 
+/// Waveform scrubber: the playback bar's slider drawn as the audio's
+/// actual peaks, so silence and speech are visible at a glance. Click
+/// or drag anywhere to seek; the played portion tints with the system
+/// accent color. Shows a plain hairline until peaks finish computing.
+final class WaveformScrubberView: NSView {
+    var peaks: [Float] = [] { didSet { needsDisplay = true } }
+    var progress: Double = 0 { didSet { needsDisplay = true } }
+    var onSeek: ((Double) -> Void)? = nil
+    private(set) var isDragging = false
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: 26)
+    }
+
+    private func fraction(for event: NSEvent) -> Double {
+        let x = convert(event.locationInWindow, from: nil).x
+        return max(0, min(1, Double(x / max(bounds.width, 1))))
+    }
+    override func mouseDown(with event: NSEvent) {
+        isDragging = true
+        progress = fraction(for: event)
+        onSeek?(progress)
+    }
+    override func mouseDragged(with event: NSEvent) {
+        progress = fraction(for: event)
+        onSeek?(progress)
+    }
+    override func mouseUp(with event: NSEvent) { isDragging = false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard bounds.width > 4 else { return }
+        let midY = bounds.midY
+        let halfH = bounds.height / 2 - 1
+        let playX = bounds.width * CGFloat(progress)
+        let played = NSColor.controlAccentColor
+        let rest = NSColor.tertiaryLabelColor
+        if peaks.isEmpty {
+            played.setFill()
+            NSRect(x: 0, y: midY - 0.5, width: playX, height: 1).fill()
+            rest.setFill()
+            NSRect(x: playX, y: midY - 0.5,
+                   width: bounds.width - playX, height: 1).fill()
+        } else {
+            let barW: CGFloat = 2, gap: CGFloat = 1
+            let n = max(1, Int(bounds.width / (barW + gap)))
+            for i in 0..<n {
+                let x = CGFloat(i) * (barW + gap)
+                let lo = peaks.count * i / n
+                let hi = min(peaks.count, max(lo + 1, peaks.count * (i + 1) / n))
+                let pk = CGFloat(peaks[lo..<hi].max() ?? 0)
+                let h = max(1.5, pk * halfH * 2)
+                (x + barW / 2 <= playX ? played : rest).setFill()
+                NSRect(x: x, y: midY - h / 2, width: barW, height: h).fill()
+            }
+        }
+        played.setFill()
+        NSRect(x: max(0, playX - 0.5), y: 0, width: 1, height: bounds.height).fill()
+    }
+}
+
 final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                                       NSTableViewDataSource, NSTableViewDelegate,
                                       NSTextFieldDelegate {
@@ -765,13 +825,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var currentSpeakingName: String? = nil
     private let statusDot = NSTextField(labelWithString: "●")
     private let copyButton = NSButton(title: "Copy All", target: nil, action: nil)
-    private let folderButton = NSButton(title: "Open Folder", target: nil, action: nil)
     /// Event link as a dropdown in the header bar: shows the linked
     /// calendar event (or "No Event"); clicking lists the day's events.
     private let eventButton = NSButton(title: "No Event", target: nil, action: nil)
     private let downloadButton = NSButton(title: "Download Transcript", target: nil, action: nil)
-    private let reprocessButton = NSButton(title: "Reprocess", target: nil, action: nil)
     private let menuButton = NSButton(title: "", target: nil, action: nil)
+    /// Reprocess lives in the … menu; the flag disables its item mid-run.
+    private var reprocessRunning = false
     private var fetchedEvents: [[String: Any]] = []
     /// Wired by MainWindowController: after Delete, go back to Meetings.
     var onMeetingDeleted: (() -> Void)? = nil
@@ -811,12 +871,19 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let playerBar = NSStackView()
     private let playButton = NSButton(title: "", target: nil, action: nil)
     private let timeLabel = NSTextField(labelWithString: "")
-    private let scrubber = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let scrubber = WaveformScrubberView()
+    /// audioStamp of the file whose peaks are loaded/loading — skips
+    /// recomputation on re-renders of the same audio.
+    private var waveformStamp = ""
     private var playerBarHeight: NSLayoutConstraint? = nil
     private let noAudioLabel = NSTextField(labelWithString: "No audio available — enable “Keep audio recording” in Settings")
     private var playTimer: Timer? = nil
     private var lineRanges: [Int: NSRange] = [:]     // line index -> text range
     private var lineOffsets: [Double] = []           // line index -> seconds into audio
+    /// Line index -> seconds where the line's speech ENDS (last word's
+    /// "e" from timing.json). Lets the highlight return to a long line
+    /// after a short interjection inside it finishes.
+    private var lineEnds: [Double] = []
     private var highlightedRange: NSRange? = nil
     private func color(for speaker: String) -> NSColor {
         colorMap[speaker] ?? speakerColor(speaker)
@@ -858,25 +925,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         headerField.lineBreakMode = .byTruncatingTail
         headerField.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        folderButton.bezelStyle = .rounded
-        folderButton.controlSize = .small
-        folderButton.font = NSFont.systemFont(ofSize: 11)
-        folderButton.target = self
-        folderButton.action = #selector(openFolder)
         menuButton.bezelStyle = .rounded
         menuButton.controlSize = .small
         menuButton.image = NSImage(systemSymbolName: "ellipsis.circle",
                                    accessibilityDescription: "More actions")
         menuButton.target = self
         menuButton.action = #selector(showActionsMenu)
-        reprocessButton.bezelStyle = .rounded
-        reprocessButton.controlSize = .small
-        reprocessButton.font = NSFont.systemFont(ofSize: 11)
-        reprocessButton.target = self
-        reprocessButton.action = #selector(reprocess)
-        reprocessButton.toolTip = "Re-run transcription, diarization and audio "
-            + "enhancement on this meeting's kept audio"
-        reprocessButton.isHidden = true
         eventButton.bezelStyle = .rounded
         eventButton.controlSize = .small
         eventButton.font = NSFont.systemFont(ofSize: 11)
@@ -903,10 +957,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         strip.addArrangedSubview(headerField)
         strip.addArrangedSubview(NSView())
         strip.addArrangedSubview(eventButton)
-        strip.addArrangedSubview(reprocessButton)
-        strip.addArrangedSubview(folderButton)
-        strip.addArrangedSubview(downloadButton)
         strip.addArrangedSubview(copyButton)
+        strip.addArrangedSubview(downloadButton)
         strip.addArrangedSubview(menuButton)
 
         let divider = NSBox()
@@ -997,9 +1049,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         playButton.isBordered = false
         timeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         timeLabel.textColor = .secondaryLabelColor
-        scrubber.target = self
-        scrubber.action = #selector(scrubbed)
-        scrubber.controlSize = .small
+        scrubber.onSeek = { [weak self] frac in
+            guard let self, let p = self.player else { return }
+            self.seek(to: frac * p.duration, andPlay: false)
+        }
         playerBar.orientation = .horizontal
         playerBar.spacing = 10
         playerBar.edgeInsets = NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12)
@@ -1359,8 +1412,15 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             // Event linking moved to the header's calendar dropdown.
             add("Relabel Speakers (fast)…", #selector(relabelSpeakers))
             if audioPath != nil {
+                add(reprocessRunning ? "Reprocessing…" : "Reprocess",
+                    #selector(reprocess))
+                menu.items.last?.isEnabled = !reprocessRunning
+                menu.items.last?.toolTip = "Re-run transcription, diarization "
+                    + "and audio enhancement on this meeting's kept audio"
                 add("Download Audio…", #selector(downloadAudio))
             }
+            add("Open Folder", #selector(openFolder))
+            add("Rename…", #selector(renameFromMenu))
             menu.addItem(.separator())
             add("Delete Meeting…", #selector(deleteMeeting))
         } else {
@@ -1547,9 +1607,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// preferred, m4a fallback — cmd_reprocess). The transcript reloads by
     /// itself through the file watcher as the refine rewrites it.
     @objc private func reprocess() {
-        guard let launcher = launcherPath(), !lastResolvedPath.isEmpty else { return }
-        reprocessButton.isEnabled = false
-        reprocessButton.title = "Reprocessing…"
+        guard let launcher = launcherPath(), !lastResolvedPath.isEmpty,
+              !reprocessRunning else { return }
+        reprocessRunning = true
         let path = lastResolvedPath
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launcher)
@@ -1563,8 +1623,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
                              encoding: .utf8) ?? ""
             DispatchQueue.main.async {
-                self?.reprocessButton.isEnabled = true
-                self?.reprocessButton.title = "Reprocess"
+                self?.reprocessRunning = false
                 self?.refreshIfChanged(force: true)
                 // Exit code only — substring-matching 'error' false-positived
                 // on successful runs.
@@ -1584,6 +1643,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard !lastResolvedPath.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting(
             [URL(fileURLWithPath: lastResolvedPath)])
+    }
+
+    /// Menu "Rename…": the editable title field IS the rename UI —
+    /// focus it with everything selected so typing replaces the name.
+    @objc private func renameFromMenu() {
+        guard !titleField.isHidden else { return }
+        view.window?.makeFirstResponder(titleField)
+        titleField.currentEditor()?.selectAll(nil)
     }
 
     /// Save a copy of the transcript wherever the user picks — the save
@@ -1797,6 +1864,16 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             seek(to: lineOffsets[idx], andPlay: true)
             return true
         }
+        // Timestamp click: flip wall-clock ↔ elapsed everywhere. The
+        // preference is global (UserDefaults), so every meeting renders
+        // with the last-chosen style.
+        if let url = link as? URL, url.scheme == "meetink-stamp" {
+            UserDefaults.standard.set(
+                !UserDefaults.standard.bool(forKey: "timestampsElapsed"),
+                forKey: "timestampsElapsed")
+            render(empty: snapshot.lines.isEmpty && rawText.isEmpty)
+            return true
+        }
         guard let url = link as? URL, url.scheme == "meetink-assign" else { return false }
         // Label travels percent-encoded in ?label= (it can be anything:
         // "Speaker 3", "GREG", "ADRIANA 2"). The old host-only form
@@ -1811,28 +1888,101 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         return true
     }
 
+    // Inline assignment: a context menu anchored under the speaker's
+    // row instead of a modal window. The meeting's own named speakers
+    // come first — the usual case is "Speaker 4 is one of the people
+    // already here", so it's arrow-down + Enter. Below them, a free
+    // text field with profile autocompletion (Enter assigns), plus
+    // Assign/Cancel buttons. Esc closes the menu natively.
+    private var assignMenuLabel: String? = nil
+    private var assignCombo: NSComboBox? = nil
+    private var assignMenu: NSMenu? = nil
+
     private func promptForName(label: String) {
-        let alert = NSAlert()
         let isUnnamed = label.hasPrefix("Speaker ") || label == "THEM"
-        alert.messageText = isUnnamed ? "Who is \(label)?" : "Reassign \(label)?"
-        alert.informativeText = "Names the speaker, rewrites the transcript, and "
-            + "enrolls their voice when the session's voice data is still available."
-        alert.addButton(withTitle: isUnnamed ? "Assign" : "Reassign")
-        alert.addButton(withTitle: "Cancel")
-        let combo = NSComboBox(frame: NSRect(x: 0, y: 0, width: 220, height: 25))
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let header = NSMenuItem(title: isUnnamed ? "Who is \(label)?" : "Reassign \(label) to…",
+                                action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+
+        let names = speakers.map(\.name).filter {
+            $0 != label && $0 != "THEM" && $0 != "ME"
+                && !$0.hasPrefix("Speaker ")
+        }
+        for name in names {
+            let item = NSMenuItem(title: name,
+                                  action: #selector(assignMenuPicked(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = name
+            menu.addItem(item)
+        }
+        if !names.isEmpty { menu.addItem(.separator()) }
+
+        let combo = NSComboBox(frame: NSRect(x: 0, y: 0, width: 168, height: 25))
         combo.addItems(withObjectValues: enrolledProfiles())
-        combo.placeholderString = "Name"
+        combo.placeholderString = "Name…"
         combo.completes = true
-        combo.numberOfVisibleItems = 16
+        combo.numberOfVisibleItems = 12
         combo.delegate = ComboAutoOpen.shared
-        alert.accessoryView = combo
-        alert.window.initialFirstResponder = combo
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        combo.target = self
+        combo.action = #selector(assignComboEntered)   // Enter in the field
+        let assignBtn = NSButton(title: isUnnamed ? "Assign" : "Reassign",
+                                 target: self, action: #selector(assignComboEntered))
+        assignBtn.bezelStyle = .rounded
+        assignBtn.controlSize = .small
+        let cancelBtn = NSButton(title: "Cancel", target: self,
+                                 action: #selector(assignMenuCancel))
+        cancelBtn.bezelStyle = .rounded
+        cancelBtn.controlSize = .small
+        let fieldRow = NSStackView(views: [combo, assignBtn, cancelBtn])
+        fieldRow.orientation = .horizontal
+        fieldRow.spacing = 6
+        fieldRow.frame = NSRect(x: 14, y: 3, width: 306, height: 26)
+        let holder = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 32))
+        holder.addSubview(fieldRow)
+        let fieldItem = NSMenuItem()
+        fieldItem.view = holder
+        menu.addItem(fieldItem)
+
+        assignMenuLabel = label
+        assignCombo = combo
+        assignMenu = menu
+
+        // Anchor right under the speaker's row in the panel; fall back
+        // to the panel's origin when the row isn't visible (e.g. the
+        // transcript's assign links for a hidden row).
+        var at = NSPoint(x: 8, y: 8)
+        if let rowIdx = panelRows.firstIndex(where: {
+            if case .speaker(let n, _, _) = $0 { return n == label }
+            return false
+        }), rowIdx < speakersTable.numberOfRows {
+            let r = speakersTable.rect(ofRow: rowIdx)
+            at = NSPoint(x: r.minX + 8, y: r.maxY + 2)
+        }
+        menu.popUp(positioning: nil, at: at, in: speakersTable)
+    }
+
+    @objc private func assignMenuPicked(_ sender: NSMenuItem) {
+        guard let label = assignMenuLabel,
+              let name = sender.representedObject as? String else { return }
+        runAssign(label: label, name: name)
+    }
+
+    @objc private func assignComboEntered() {
+        guard let label = assignMenuLabel, let combo = assignCombo else { return }
         let name = combo.stringValue.trimmingCharacters(in: .whitespaces)
         // Only path-hostile input is rejected — "Greg (AE)", "Jean-Luc"
         // and "J.R." are all legitimate names.
         guard !name.isEmpty, !name.contains("/"), !name.hasPrefix(".") else { return }
+        assignMenu?.cancelTracking()
         runAssign(label: label, name: name)
+    }
+
+    @objc private func assignMenuCancel() {
+        assignMenu?.cancelTracking()
     }
 
     private func runAssign(label: String, name: String) {
@@ -1952,6 +2102,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             player?.stop()
             player = try? AVAudioPlayer(contentsOf: URL(fileURLWithPath: candidate))
             player?.prepareToPlay()
+            loadWaveform(path: candidate, stamp: stamp)
             buildLineOffsets(base: base)
             if let pending = pendingSampleSpeaker {
                 pendingSampleSpeaker = nil
@@ -1971,7 +2122,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             ? NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12) : NSEdgeInsets()
         for v in playerBar.arrangedSubviews { v.isHidden = (audioPath == nil) }
         noAudioLabel.isHidden = !(archived && audioPath == nil)
-        reprocessButton.isHidden = !(archived && audioPath != nil)
         titleField.isHidden = !archived
         if archived, view.window?.firstResponder != titleField.currentEditor() {
             titleField.stringValue = meetingDisplayName(lastResolvedPath)
@@ -1979,16 +2129,63 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         updatePlayerUI()
     }
 
+    /// Downsample the audio into ~1000 peak buckets for the scrubber,
+    /// off the main thread (an hour of 48 kHz audio decodes in about a
+    /// second). sqrt-scaled so quiet speech stays visible next to loud.
+    private func loadWaveform(path: String, stamp: String) {
+        guard stamp != waveformStamp else { return }
+        waveformStamp = stamp
+        scrubber.peaks = []
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let buckets = 1000
+            var peaks = [Float](repeating: 0, count: buckets)
+            guard let file = try? AVAudioFile(forReading: URL(fileURLWithPath: path)),
+                  file.length > 0,
+                  let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                             frameCapacity: 1 << 18) else { return }
+            let total = file.length
+            var frame: AVAudioFramePosition = 0
+            while frame < total {
+                buf.frameLength = 0
+                do { try file.read(into: buf) } catch { break }
+                guard buf.frameLength > 0, let ch = buf.floatChannelData?[0] else { break }
+                for i in 0..<Int(buf.frameLength) {
+                    let b = min(buckets - 1,
+                                Int((frame + AVAudioFramePosition(i)) * AVAudioFramePosition(buckets) / total))
+                    let v = abs(ch[i])
+                    if v > peaks[b] { peaks[b] = v }
+                }
+                frame += AVAudioFramePosition(buf.frameLength)
+            }
+            let mx = max(peaks.max() ?? 1, 0.001)
+            let scaled = peaks.map { min(Float(1), sqrtf($0 / mx)) }
+            DispatchQueue.main.async {
+                guard let self, self.waveformStamp == stamp else { return }
+                self.scrubber.peaks = scaled
+            }
+        }
+    }
+
     /// Per-line seconds into the audio. Primary source: the refine pass's
     /// timing sidecar (exact spool-timeline offsets). Fallback: wall-clock
     /// line stamps minus the Started header.
     private func buildLineOffsets(base: String) {
         lineOffsets = []
+        lineEnds = []
         if let data = FileManager.default.contents(atPath: base + ".timing.json"),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let arr = obj["lines"] as? [[String: Any]],
            arr.count == snapshot.lines.count {
             lineOffsets = arr.map { ($0["t"] as? Double) ?? 0 }
+            lineEnds = arr.map {
+                (($0["words"] as? [[String: Any]]) ?? [])
+                    .compactMap { $0["e"] as? Double }.max() ?? 0
+            }
+            // Word-less entries (edited lines): span to the next start.
+            for i in 0..<lineEnds.count where lineEnds[i] <= lineOffsets[i] {
+                lineEnds[i] = i + 1 < lineOffsets.count
+                    ? lineOffsets[i + 1] : .greatestFiniteMagnitude
+            }
             return
         }
         func daySeconds(_ hms: String) -> Double? {
@@ -2028,10 +2225,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     }
     @objc private func back10() { seek(to: (player?.currentTime ?? 0) - 10, andPlay: false) }
     @objc private func fwd10() { seek(to: (player?.currentTime ?? 0) + 10, andPlay: false) }
-    @objc private func scrubbed() {
-        guard let player else { return }
-        seek(to: scrubber.doubleValue * player.duration, andPlay: false)
-    }
 
     private func stopPlayback() {
         player?.stop()
@@ -2068,8 +2261,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                              : String(format: "%02d:%02d", s / 60, s % 60)
         }
         timeLabel.stringValue = "\(fmt(p.currentTime)) / \(fmt(p.duration))"
-        if !scrubber.isHighlighted, p.duration > 0 {
-            scrubber.doubleValue = p.currentTime / p.duration
+        if !scrubber.isDragging, p.duration > 0 {
+            scrubber.progress = p.currentTime / p.duration
         }
     }
 
@@ -2080,6 +2273,20 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         // Last line whose offset <= t.
         var idx = -1
         for (i, off) in lineOffsets.enumerated() { if off <= t { idx = i } else { break } }
+        // A short interjection ("right") lands INSIDE someone's long
+        // sentence: once it ends, hand the highlight back to the latest
+        // earlier line still spanning t instead of sticking on the
+        // interjection until the next line starts.
+        if idx >= 0, idx < lineEnds.count, lineEnds[idx] < t {
+            var j = idx - 1
+            while j >= 0, j >= idx - 8 {
+                if lineOffsets[j] <= t, j < lineEnds.count, lineEnds[j] >= t {
+                    idx = j
+                    break
+                }
+                j -= 1
+            }
+        }
         guard idx >= 0, let range = lineRanges[idx] else { return }
         if let old = highlightedRange, old == range { return }
         if let old = highlightedRange {
@@ -2423,6 +2630,26 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         return cell
     }
 
+    /// Block timestamp as displayed: the wall-clock "HH:mm:ss" from the
+    /// file, or — when the global toggle is on — time into the meeting
+    /// ("3:45"). Imports have no Started header; their stamps are already
+    /// relative, so elapsed mode just reformats them.
+    private func displayStamp(_ hms: String) -> String {
+        guard UserDefaults.standard.bool(forKey: "timestampsElapsed") else { return hms }
+        let p = hms.split(separator: ":").compactMap { Int($0) }
+        guard p.count == 3 else { return hms }
+        var d = p[0] * 3600 + p[1] * 60 + p[2]
+        if let started = snapshot.startedAt {
+            let c = Calendar.current.dateComponents(
+                [.hour, .minute, .second], from: started)
+            d -= c.hour! * 3600 + c.minute! * 60 + c.second!
+            if d < -3600 { d += 86400 }                 // crossed midnight
+            d = max(0, d)
+        }
+        return d >= 3600 ? String(format: "%d:%02d:%02d", d / 3600, (d / 60) % 60, d % 60)
+                         : String(format: "%d:%02d", d / 60, d % 60)
+    }
+
     private func render(empty: Bool) {
         colorMap = speakerColorMap(snapshot)
         // Hidden speakers read as annotations, not participants — dark
@@ -2467,21 +2694,26 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     .foregroundColor: NSColor.tertiaryLabelColor,
                     .paragraphStyle: headerPara,
                 ]
-                // With audio available, the NAME and TIMESTAMP both mean
-                // "play from here" — renaming lives in the speakers panel.
+                // With audio available, the NAME means "play from here" —
+                // renaming lives in the speakers panel.
                 if audioPath != nil, let first = block.parts.first,
                    let purl = URL(string: "meetink-play://\(first.line)") {
                     speakerAttrs[.link] = purl
                     speakerAttrs[.toolTip] = "Play from here"
                     speakerAttrs[.underlineStyle] = 0
                     speakerAttrs[.cursor] = NSCursor.pointingHand
-                    stampAttrs[.link] = purl
-                    stampAttrs[.toolTip] = "Play from here"
+                }
+                // The TIMESTAMP toggles wall-clock ↔ elapsed display
+                // (a global preference), audio or not.
+                if let surl = URL(string: "meetink-stamp://toggle") {
+                    stampAttrs[.link] = surl
+                    stampAttrs[.toolTip] = "Switch between wall-clock and "
+                        + "elapsed time"
                     stampAttrs[.cursor] = NSCursor.pointingHand
                 }
                 out.append(NSAttributedString(string: block.speaker, attributes: speakerAttrs))
                 out.append(NSAttributedString(
-                    string: "  \(block.timestamp)\n", attributes: stampAttrs))
+                    string: "  \(displayStamp(block.timestamp))\n", attributes: stampAttrs))
                 for (pi, part) in block.parts.enumerated() {
                     let runStart = out.length
                     let sep = pi == block.parts.count - 1 ? "\n" : " "
