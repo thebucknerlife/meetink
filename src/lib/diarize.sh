@@ -435,9 +435,10 @@ diarize_whitelist() {
         # Use python for the tokenisation + matching so we share the
         # same word-boundary semantics as the watcher's
         # _match_attendees_to_profiles. zsh string-munging would diverge.
-        local matched=$("$MK_PY_VENV/bin/python" - "$txt" "$MK_DIARIZE_PORT" 2>/dev/null <<'PY'
-import json, re, sys, urllib.request
+        local matched=$("$MK_PY_VENV/bin/python" - "$txt" "$MK_DIARIZE_PORT" "$MK_DIARIZE_PROFILES" 2>/dev/null <<'PY'
+import json, os, re, sys, urllib.request
 txt_path, port = sys.argv[1], sys.argv[2]
+profiles_dir = sys.argv[3] if len(sys.argv) > 3 else ""
 attendees = ""
 try:
     with open(txt_path, encoding="utf-8") as f:
@@ -461,6 +462,22 @@ for tok in re.split(r"[\s.,@+\-_/]+", attendees.lower()):
     if tok:
         haystack.add(tok)
 matched = [p for p in profile_names if p.lower() in haystack]
+# Exact email->profile links (profiles/emails.json, written by the
+# app's attendee sidebar) beat token matching: "jd@ae.studio" can't
+# token-match a profile named "John Doe", but the link knows.
+try:
+    with open(os.path.join(profiles_dir, "emails.json"), encoding="utf-8") as f:
+        email_map = {str(k).lower(): str(v) for k, v in json.load(f).items()}
+except Exception:
+    email_map = {}
+if email_map:
+    enrolled_low = {p.lower(): p for p in profile_names}
+    for raw in attendees.split(","):
+        linked = email_map.get(raw.strip().lower())
+        if linked and linked.lower() in enrolled_low:
+            name = enrolled_low[linked.lower()]
+            if name not in matched:
+                matched.append(name)
 print(",".join(matched))
 PY
 )
@@ -1307,9 +1324,10 @@ _maybe_refresh_whitelist_from_attendees() {
     [[ -f "$txt" ]] || return 0
     grep -q "^# attendees:" "$txt" 2>/dev/null || return 0
 
-    local matched=$("$MK_PY_VENV/bin/python" - "$txt" "$MK_DIARIZE_PORT" 2>/dev/null <<'PY'
-import json, re, sys, urllib.request
+    local matched=$("$MK_PY_VENV/bin/python" - "$txt" "$MK_DIARIZE_PORT" "$MK_DIARIZE_PROFILES" 2>/dev/null <<'PY'
+import json, os, re, sys, urllib.request
 txt_path, port = sys.argv[1], sys.argv[2]
+profiles_dir = sys.argv[3] if len(sys.argv) > 3 else ""
 attendees = ""
 try:
     with open(txt_path, encoding="utf-8") as f:
@@ -1333,6 +1351,22 @@ for tok in re.split(r"[\s.,@+\-_/]+", attendees.lower()):
     if tok:
         haystack.add(tok)
 matched = [p for p in profile_names if p.lower() in haystack]
+# Exact email->profile links (profiles/emails.json, written by the
+# app's attendee sidebar) beat token matching: "jd@ae.studio" can't
+# token-match a profile named "John Doe", but the link knows.
+try:
+    with open(os.path.join(profiles_dir, "emails.json"), encoding="utf-8") as f:
+        email_map = {str(k).lower(): str(v) for k, v in json.load(f).items()}
+except Exception:
+    email_map = {}
+if email_map:
+    enrolled_low = {p.lower(): p for p in profile_names}
+    for raw in attendees.split(","):
+        linked = email_map.get(raw.strip().lower())
+        if linked and linked.lower() in enrolled_low:
+            name = enrolled_low[linked.lower()]
+            if name not in matched:
+                matched.append(name)
 # Print one of:
 #   "<n1>,<n2>"  — at least one match
 #   ""           — header present but no enrolled profiles in attendees

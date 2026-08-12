@@ -329,22 +329,51 @@ def _list_diarize_profiles() -> list[str]:
         return []
 
 
+def _profile_email_map() -> dict:
+    """email (lowercased) → profile name, from profiles/emails.json —
+    the links the app's attendee sidebar writes. The exact join between
+    calendar attendees and voice profiles; token matching below stays as
+    the fallback for unlinked emails."""
+    path = os.path.join(
+        os.environ.get("MEETINK_HOME", os.path.expanduser("~/.meetink")),
+        "profiles", "emails.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return {str(k).lower(): str(v) for k, v in json.load(f).items()}
+    except Exception:
+        return {}
+
+
 def _match_attendees_to_profiles(attendees: list) -> list[str]:
-    """Pick the subset of enrolled profiles whose name appears as a
-    token in any attendee's name or email. Token = anything separated by
-    whitespace, dots, @, plus, hyphen, underscore. Word-boundary match
-    avoids false-positives like 'alex' matching 'alexandra'."""
+    """Pick the subset of enrolled profiles expected in a meeting with
+    these attendees: exact email→profile links first (emails.json), then
+    profiles whose name appears as a token in any attendee's name or
+    email. Token = anything separated by whitespace, dots, @, plus,
+    hyphen, underscore — word-boundary match avoids false-positives like
+    'alex' matching 'alexandra'."""
     import re
     profile_names = _list_diarize_profiles()
     if not profile_names or not attendees:
         return []
+    enrolled_low = {p.lower(): p for p in profile_names}
+    matched: list[str] = []
+    email_map = _profile_email_map()
+    for a in attendees:
+        linked = email_map.get((a.get("email", "") or "").lower())
+        if linked and linked.lower() in enrolled_low:
+            name = enrolled_low[linked.lower()]
+            if name not in matched:
+                matched.append(name)
     haystack: set[str] = set()
     for a in attendees:
         for v in (a.get("name", ""), a.get("email", "")):
             for tok in re.split(r"[\s.,@+\-_/]+", v.lower()):
                 if tok:
                     haystack.add(tok)
-    return [p for p in profile_names if p.lower() in haystack]
+    for p in profile_names:
+        if p.lower() in haystack and p not in matched:
+            matched.append(p)
+    return matched
 
 
 # ---------------------------------------------------------------------------

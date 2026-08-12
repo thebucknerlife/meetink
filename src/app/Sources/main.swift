@@ -163,6 +163,36 @@ func enrolledProfiles() -> [String] {
         .sorted()
 }
 
+// MARK: - Profile ↔ email links
+//
+// Calendar attendees are emails; voice profiles are names. One shared
+// map joins them: email (lowercased) → profile name, so a profile can
+// carry many emails but an email belongs to one profile. Stored as
+// profiles/emails.json — the whitelist derivation in the launcher reads
+// the same file to know exactly who is in an event's meeting.
+
+func profileEmailMapPath() -> String { "\(mkHome)/profiles/emails.json" }
+
+func profileEmailMap() -> [String: String] {
+    guard let data = FileManager.default.contents(atPath: profileEmailMapPath()),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+    else { return [:] }
+    return obj
+}
+
+func setProfileEmail(_ email: String, profile: String) {
+    var map = profileEmailMap()
+    // Canonical profile casing — "ed" links as "Ed" (the same
+    // case-insensitive rule the diarize server applies to assignment).
+    let low = profile.lowercased()
+    let canonical = enrolledProfiles().first { $0.lowercased() == low } ?? profile
+    map[email.lowercased()] = canonical
+    if let data = try? JSONSerialization.data(withJSONObject: map,
+                                              options: [.sortedKeys]) {
+        try? data.write(to: URL(fileURLWithPath: profileEmailMapPath()))
+    }
+}
+
 // MARK: - The M mark
 
 /// The bundled logo mark for the menu bar: black M + alpha at 18 pt
@@ -964,8 +994,17 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private enum PanelRow {
         case speaker(name: String, fraction: Double, hidden: Bool)
         case toggle(count: Int)
+        // Attendee section: the event's invitees (emails), each linked
+        // to a voice profile or awaiting a link — the join that lets
+        // future meetings know exactly whose voices to expect.
+        case attendeeHeader(unassigned: Int, total: Int)
+        case attendee(email: String, profile: String?)
     }
     private var panelRows: [PanelRow] = []
+    private var attendeesExpanded =
+        UserDefaults.standard.bool(forKey: "attendeesExpanded")
+    /// Cache key so the panel only reloads when attendees/links change.
+    private var lastAttendeesKey = ""
     private var speakers: [(name: String, fraction: Double)] = []
     private var showHiddenSpeakers = false
     private var speakersWidthConstraint: NSLayoutConstraint? = nil
@@ -2414,10 +2453,18 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
     private func updateSpeakersPanel() {
         let fresh = snapshot.talkShare.map { (name: $0.speaker, fraction: $0.fraction) }
+        // Attendees/links change rarely (event link, a new email link) —
+        // fold them into the same only-on-change rule so a reload can't
+        // eat a mid-flight click.
+        let map = profileEmailMap()
+        let attKey = meetingAttendees()
+            .map { "\($0)=\(map[$0] ?? "")" }.joined(separator: ",")
         // Reload only on change — a reload mid-click would eat the click.
         if fresh.map(\.name) != speakers.map(\.name)
-            || fresh.map({ Int($0.fraction * 100) }) != speakers.map({ Int($0.fraction * 100) }) {
+            || fresh.map({ Int($0.fraction * 100) }) != speakers.map({ Int($0.fraction * 100) })
+            || attKey != lastAttendeesKey {
             speakers = fresh
+            lastAttendeesKey = attKey
             rebuildPanelRows()
         }
     }
@@ -2425,6 +2472,26 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// Visible speakers first (shares renormalized WITHOUT the hidden
     /// ones — the Zoom announcer shouldn't own 4% of a meeting), then a
     /// collapsible "Hidden (n)" section.
+    /// The linked event's human attendees (rooms and resources filtered
+    /// out by the @ requirement), lowercased. Meta event first, then the
+    /// transcript's "# attendees:" header.
+    private func meetingAttendees() -> [String] {
+        guard !lastResolvedPath.isEmpty else { return [] }
+        if let ev = meetingMeta(lastResolvedPath)["event"] as? [String: Any],
+           let list = ev["attendees"] as? [String] {
+            let emails = list.filter { $0.contains("@") }.map { $0.lowercased() }
+            if !emails.isEmpty { return emails }
+        }
+        for line in rawText.components(separatedBy: "\n")
+        where line.hasPrefix("# attendees:") {
+            return line.dropFirst("# attendees:".count)
+                .components(separatedBy: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+                .filter { $0.contains("@") }
+        }
+        return []
+    }
+
     private func rebuildPanelRows() {
         let hiddenNames = hiddenSpeakerNames()
         let visible = speakers.filter { !hiddenNames.contains($0.name.uppercased()) }
@@ -2441,6 +2508,25 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 }
             }
         }
+        // Attendee section: unassigned (no linked profile) first — those
+        // are the ones asking for a click — then the linked ones.
+        let attendees = meetingAttendees()
+        if !attendees.isEmpty {
+            let map = profileEmailMap()
+            let entries = attendees.map { (email: $0, profile: map[$0]) }
+            let unassigned = entries.filter { $0.profile == nil }
+            rows.append(.attendeeHeader(unassigned: unassigned.count,
+                                        total: entries.count))
+            if attendeesExpanded {
+                for e in unassigned.sorted(by: { $0.email < $1.email }) {
+                    rows.append(.attendee(email: e.email, profile: nil))
+                }
+                for e in entries.filter({ $0.profile != nil })
+                    .sorted(by: { $0.email < $1.email }) {
+                    rows.append(.attendee(email: e.email, profile: e.profile))
+                }
+            }
+        }
         panelRows = rows
         speakersTable.reloadData()
     }
@@ -2452,6 +2538,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         case .toggle:
             showHiddenSpeakers.toggle()
             rebuildPanelRows()
+        case .attendeeHeader:
+            attendeesExpanded.toggle()
+            UserDefaults.standard.set(attendeesExpanded, forKey: "attendeesExpanded")
+            rebuildPanelRows()
+        case .attendee(let email, _):
+            promptForAttendeeLink(email: email, anchorRow: row)
         case .speaker(let name, _, _):
             // With audio: clicking a name hops to their next segment after
             // the playhead. Renaming is the pencil button. Without audio
@@ -2462,6 +2554,43 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 promptForName(label: name)
             }
         }
+    }
+
+    /// Link a calendar attendee (email) to a voice profile — the same
+    /// popover as speaker assignment: this meeting's named speakers
+    /// first (the attendee is almost certainly one of them), then the
+    /// full profile list behind the text field. The link is global
+    /// (profiles/emails.json), so every future event with this email
+    /// knows whose voice to expect.
+    private func promptForAttendeeLink(email: String, anchorRow: Int) {
+        assignPopover?.close()
+        let named = speakers.map(\.name).filter {
+            $0 != "THEM" && $0 != "ME" && !$0.hasPrefix("Speaker ")
+        }
+        let pop = NSPopover()
+        pop.behavior = .transient
+        let vc = AssignPopoverVC(
+            header: "Who is \(email)?",
+            assignTitle: "Link",
+            inMeeting: named,
+            onAssign: { [weak self] name in
+                self?.assignPopover?.close()
+                self?.assignPopover = nil
+                let trimmed = name.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.isEmpty, !trimmed.contains("/"),
+                      !trimmed.hasPrefix(".") else { return }
+                setProfileEmail(email, profile: trimmed)
+                self?.rebuildPanelRows()
+            },
+            onClose: { [weak self] in
+                self?.assignPopover?.close()
+                self?.assignPopover = nil
+            })
+        pop.contentViewController = vc
+        assignPopover = pop
+        pop.show(relativeTo: speakersTable.rect(ofRow: anchorRow),
+                 of: speakersTable, preferredEdge: .maxY)
+        vc.view.window?.makeFirstResponder(vc.keyView)
     }
 
     @objc private func pencilClicked(_ sender: NSButton) {
@@ -2711,6 +2840,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             ])
         }
         guard row < panelRows.count else { return cell }
+        // Cells are reused across row types — reset what other types set.
+        nameField.lineBreakMode = .byTruncatingTail
+        nameField.font = NSFont.boldSystemFont(ofSize: 12)
+        cell.layer?.backgroundColor = NSColor.clear.cgColor
         switch panelRows[row] {
         case .toggle(let count):
             nameField.stringValue = (showHiddenSpeakers ? "▾ Hidden" : "▸ Hidden")
@@ -2720,6 +2853,29 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 + "announcer) — click to show"
             pctField.stringValue = ""
             cell.subviews.last?.isHidden = true   // no pencil on the toggle
+        case .attendeeHeader(let unassigned, let total):
+            nameField.stringValue = (attendeesExpanded ? "▾ Attendees" : "▸ Attendees")
+                + " (\(total))" + (unassigned > 0 ? " · \(unassigned) unlinked" : "")
+            nameField.textColor = .tertiaryLabelColor
+            nameField.toolTip = "The calendar event's invitees — link each "
+                + "email to a voice profile so future meetings know whose "
+                + "voices to expect"
+            pctField.stringValue = ""
+            cell.subviews.last?.isHidden = true
+        case .attendee(let email, let profile):
+            nameField.font = NSFont.systemFont(ofSize: 11)
+            if let profile {
+                nameField.stringValue = "\(email) → \(profile)"
+                nameField.lineBreakMode = .byTruncatingMiddle
+                nameField.textColor = .tertiaryLabelColor
+                nameField.toolTip = "Linked to \(profile) — click to change"
+            } else {
+                nameField.stringValue = email
+                nameField.textColor = .secondaryLabelColor
+                nameField.toolTip = "Click to link this attendee to a voice profile"
+            }
+            pctField.stringValue = ""
+            cell.subviews.last?.isHidden = true
         case .speaker(let name, let fraction, let hidden):
             nameField.stringValue = name
             nameField.textColor = hidden ? .tertiaryLabelColor : color(for: name)
