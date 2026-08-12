@@ -228,6 +228,9 @@ def main() -> int:
     ap.add_argument("--timing", help="timing.json — confines sys suppression "
                     "to the user's spans; omit = sys full passthrough")
     ap.add_argument("--me", default="ME")
+    ap.add_argument("--mode", choices=["spans", "cleanmix"], default="spans",
+                    help="cleanmix: sys raw + separated mic + level match, "
+                         "no ducks, no transcript — the weak-speakers mix")
     ap.add_argument("--out", required=True)
     ap.add_argument("--progress-state")
     args = ap.parse_args()
@@ -245,6 +248,51 @@ def main() -> int:
 
     mic_clean = dtln_aec(mic16, sys16, args.model, "mic")
     log("mic direction done (bleed removal)")
+
+    if args.mode == "cleanmix":
+        # Weak-speakers mix: pristine sys + the separated mic, one
+        # static gain each, soft headroom. No ducks (the user's echo in
+        # sys is below the weak bleed by construction), no transcript.
+        mic_sep = args.out + ".micsep.raw"
+        mask_transfer_48k(mic16, mic_clean.astype(np.float32), args.mic, mic_sep)
+
+        def gain16(x: np.ndarray, target: float = 0.07) -> float:
+            B_ = RATE // 10
+            nb_ = len(x) // B_
+            if nb_ < 20:
+                return 1.0
+            r_ = np.sqrt((x[: nb_ * B_].reshape(nb_, B_) ** 2).mean(axis=1))
+            act = r_[r_ > 0.01]
+            if len(act) < 10:
+                return 1.0
+            return float(np.clip(target / max(float(np.percentile(act, 75)), 1e-4),
+                                 0.25, 4.0))
+
+        gm = gain16(mic_clean)
+        gs = gain16(sys16)
+        log(f"cleanmix level match: mic x{gm:.2f}, sys x{gs:.2f}")
+        n2 = max(os.path.getsize(mic_sep) // 2, os.path.getsize(args.sys_) // 2)
+        CH = args.rate * 10
+        with open(mic_sep, "rb") as fm2, open(args.sys_, "rb") as fs2, \
+             open(args.out, "wb") as fo2:
+            pos2 = 0
+            while pos2 < n2:
+                take2 = min(CH, n2 - pos2)
+                mm = np.frombuffer(fm2.read(take2 * 2), dtype=np.int16)
+                ss = np.frombuffer(fs2.read(take2 * 2), dtype=np.int16)
+                a2 = np.zeros(take2, dtype=np.float32)
+                b2 = np.zeros(take2, dtype=np.float32)
+                a2[: len(mm)] = mm.astype(np.float32) / 32768.0
+                b2[: len(ss)] = ss.astype(np.float32) / 32768.0
+                mixed2 = a2 * gm + b2 * gs
+                over2 = np.abs(mixed2) > 0.85
+                mixed2[over2] = np.sign(mixed2[over2]) * (
+                    0.85 + 0.13 * np.tanh((np.abs(mixed2[over2]) - 0.85) / 0.13))
+                fo2.write((mixed2 * 32767.0).astype(np.int16).tobytes())
+                pos2 += take2
+        os.unlink(mic_sep)
+        log("neural clean-mix complete (weak-speakers)")
+        return 0
 
     # The mic track IS the separation, at sample level and 48 kHz —
     # block gains passed mixed blocks whole and the bleed rode along

@@ -30,6 +30,15 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from enhance import gcc_phat_delay, residual_echo_gate
 
+# Exit code signalling "weak-speakers": an acoustic sys→mic path exists
+# but the bleed is too quiet for mic-only (remote side would be faint
+# and roomy) AND too audible for a plain sum (it layers under clean sys
+# as reverb — field case: 0/61 windows detected, sum ran, remote voices
+# sounded like echo-y rooms). The caller renders sys + neurally-cleaned
+# mic instead; weak bleed is exactly where the neural residual is
+# negligible relative to sys.
+EXIT_WEAK_SPEAKERS = 3
+
 RATE = 16000
 WIN_S = 15           # mode-detection window
 RATIO_THRESHOLD = 0.15
@@ -132,6 +141,26 @@ def main() -> int:
         switches = sum(1 for i in range(1, len(modes)) if modes[i] != modes[i - 1])
         log(f"modes: {sum(modes)}/{len(modes)} windows speakers, "
             f"{switches} device switch(es)")
+        # Weak-speakers check: the energy-ratio detector reads quiet
+        # speakers as "headphones", but a real acoustic path means the
+        # sum would layer bleed reverb under clean sys. Coherence (a
+        # gcc delay peak) is the path evidence the ratio test misses.
+        if not any(modes) and float(np.abs(sys16).mean()) > 1e-4:
+            delay = gcc_phat_delay(sys16, mic16, max_delay_s=0.6)
+            if delay >= 0:
+                B = RATE // 10
+                nb = min(len(mic16), len(sys16)) // B
+                m = np.sqrt((mic16[:nb*B].reshape(nb, B)**2).mean(axis=1))
+                s_ = np.sqrt((sys16[:nb*B].reshape(nb, B)**2).mean(axis=1))
+                loud = s_ > max(0.02, float(np.percentile(s_[s_ > 0.001], 75)) * 0.5) \
+                    if (s_ > 0.001).sum() > 50 else s_ > 0.05
+                if loud.sum() > 20:
+                    ratio = float(np.median(m[loud] / s_[loud]))
+                    if ratio > 0.02:
+                        log(f"weak-speakers: acoustic path at "
+                            f"{delay/16.0:.0f} ms, bleed ratio {ratio:.3f} "
+                            f"— deferring to neural clean-mix")
+                        return EXIT_WEAK_SPEAKERS
 
     # Echo gate for the SUM segments only (twice-guarded, as shipped).
     gains = None

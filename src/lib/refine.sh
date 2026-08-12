@@ -273,14 +273,32 @@ _mix_enhanced_m4a() {
         local pmic="$mic" psys="$sys" par=16000
         (( have48 )) && { pmic="$mic48"; psys="$sys48"; par=48000; }
         local pd=$(mktemp -d -t meetink-pmix)
+        # ANALYSIS streams must be RAW: the 16 kHz transcription spools
+        # carry the live-AEC3-cleaned mic, so the speaker bleed the mode
+        # detector / echo gate / DTLN reference math need to see has
+        # already been removed from them (field case: a speakers meeting
+        # detected 0/61 windows on the cleaned spools and 61/61 on the
+        # raw archive — the sum ran and layered bleed reverb under sys).
+        local amic="$mic" asys="$sys"
+        if (( have48 )); then
+            if ffmpeg -v error -y -f s16le -ar 48000 -ac 1 -i "$mic48" \
+                    -ar 16000 -f s16le "$pd/analysis-mic.raw" 2>>/tmp/meetink-refine.log \
+               && ffmpeg -v error -y -f s16le -ar 48000 -ac 1 -i "$sys48" \
+                    -ar 16000 -f s16le "$pd/analysis-sys.raw" 2>>/tmp/meetink-refine.log; then
+                amic="$pd/analysis-mic.raw"
+                asys="$pd/analysis-sys.raw"
+            fi
+        fi
         local dmic=$(_denoise_mic "$pmic" $par "$pd")
         local -a fm=()
         [[ "$mix_mode" == "mic" || "$mix_mode" == "split" ]] && fm=(--force-mode "$mix_mode")
-        if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/playback_mix.py" \
-                --mic16 "$mic" --sys16 "$sys" \
+        "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/playback_mix.py" \
+                --mic16 "$amic" --sys16 "$asys" \
                 --mic "$dmic" --sys "$psys" --rate $par \
                 "${fm[@]}" \
-                --out "$pd/mixed.raw" 2>>/tmp/meetink-refine.log; then
+                --out "$pd/mixed.raw" 2>>/tmp/meetink-refine.log
+        local pmrc=$?
+        if (( pmrc == 0 )); then
             local prc=0
             ffmpeg -v error -y -f s16le -ar $par -ac 1 -i "$pd/mixed.raw" \
                 -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || prc=$?
@@ -288,6 +306,42 @@ _mix_enhanced_m4a() {
             print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=playback" \
                 >> "$MK_HOME/perf.log" 2>/dev/null || true
             return $prc
+        fi
+        # rc 3 = weak-speakers: an acoustic path exists but the bleed is
+        # too quiet for mic-only and too audible for a plain sum. Render
+        # pristine sys + the DTLN-separated mic instead (weak bleed =
+        # negligible neural residual). Needs the dtln venv; without it,
+        # mic-only is the safer of the two bad options.
+        if (( pmrc == 3 )); then
+            local dtln_py="$MK_HOME/dtln-venv/bin/python"
+            if [[ -x "$dtln_py" && -f "$MK_HOME/dtln/dtln_aec_512_1.tflite" ]] \
+                && "$dtln_py" "$MK_ROOT/src/refine/neural_mix.py" \
+                    --mode cleanmix \
+                    --mic16 "$amic" --sys16 "$asys" \
+                    --mic "$dmic" --sys "$psys" --rate $par \
+                    --progress-state /tmp/meetink-postproc.state \
+                    --out "$pd/mixed.raw" 2>>/tmp/meetink-refine.log; then
+                local crc=0
+                ffmpeg -v error -y -f s16le -ar $par -ac 1 -i "$pd/mixed.raw" \
+                    -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || crc=$?
+                rm -rf "$pd"
+                print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=cleanmix" \
+                    >> "$MK_HOME/perf.log" 2>/dev/null || true
+                return $crc
+            fi
+            if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/playback_mix.py" \
+                    --mic16 "$amic" --sys16 "$asys" \
+                    --mic "$dmic" --sys "$psys" --rate $par \
+                    --force-mode mic \
+                    --out "$pd/mixed.raw" 2>>/tmp/meetink-refine.log; then
+                local mrc2=0
+                ffmpeg -v error -y -f s16le -ar $par -ac 1 -i "$pd/mixed.raw" \
+                    -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || mrc2=$?
+                rm -rf "$pd"
+                print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=mic-weak" \
+                    >> "$MK_HOME/perf.log" 2>/dev/null || true
+                return $mrc2
+            fi
         fi
         rm -rf "$pd"
         print -P "${C[dim]}  (playback mix bailed — fallback)${C[reset]}"
