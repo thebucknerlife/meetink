@@ -87,6 +87,11 @@ EXPIRE_AFTER_END_S = 600      # 10 min past end with no record = expired
 # inactive poll after End is almost always real.
 FAST_END_POLL_S = 5.0
 MEETING_END_QUIET_TICKS = 2
+# While a recording is running (but no end is suspected yet), poll faster
+# than the idle 30 s: the user leaving must be NOTICED quickly for the
+# fast-confirm cadence to matter, and a 5-10 s gap between back-to-back
+# meetings in the same app is invisible to a 30 s cadence.
+RECORDING_POLL_S = 10.0
 
 # Instant-meeting detection.
 #   CONFIRM_TICKS    — consecutive active polls before fire. 1 = 30 s of
@@ -504,6 +509,17 @@ class WatchManager:
         }
         self._skip_cooldown_until: float = 0.0
         self._end_cooldown_until: float = 0.0
+        # Presence source of the CURRENT recording ("zoom", "meet", ...)
+        # — end-detection is per-source, so another app's meeting can't
+        # keep this recording alive. None = generic (manual/fallback).
+        self._recording_source: "str | None" = None
+        # Which source the end-cooldown belongs to: a new meeting in a
+        # DIFFERENT app right after a stop is a real new meeting, not a
+        # wrap-up blip of the old one.
+        self._end_cooldown_source: "str | None" = None
+        # Last time a poll saw the recording's meeting absent — the
+        # "presence gap" evidence the conflict auto-switch requires.
+        self._last_presence_gap_ts: float = 0.0
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -523,6 +539,8 @@ class WatchManager:
             self._instant_pending = False
             self._skip_cooldown_until = 0.0
             self._end_cooldown_until = 0.0
+            self._recording_source = None
+            self._end_cooldown_source = None
             self._thread = threading.Thread(
                 target=self._loop, name="meetink-watch", daemon=True,
             )
@@ -637,12 +655,15 @@ class WatchManager:
         # recording) and instant-detection (idle) consume it. Maintains
         # _inactive_streak / _instant_streak counters in lockstep.
         with self._lock:
-            in_fast_confirm = (
-                (self._currently_recording is not None
-                 or self._adopted_seen_active)
-                and self._inactive_streak >= 1
-            )
-        poll_interval = FAST_END_POLL_S if in_fast_confirm else ACTIVE_POLL_S
+            recording_ish = (self._currently_recording is not None
+                             or self._adopted_seen_active)
+            in_fast_confirm = recording_ish and self._inactive_streak >= 1
+        # Three gears: 5 s while confirming a suspected end, 10 s while
+        # recording (leaves and short between-meeting gaps get noticed),
+        # 30 s idle (battery).
+        poll_interval = (FAST_END_POLL_S if in_fast_confirm
+                         else RECORDING_POLL_S if recording_ish
+                         else ACTIVE_POLL_S)
         if now_wall - self._last_active_poll > poll_interval:
             self._poll_meeting_active()
 
@@ -677,13 +698,38 @@ class WatchManager:
         with self._lock:
             self._last_active_poll = time.time()
             self._last_meeting_active = result
-            if result.get("active"):
+            active = bool(result.get("active"))
+            # End-detection presence is PER-SOURCE once a recording
+            # carries one: a different app's meeting must not keep this
+            # recording alive (field case: joining Zoom while the Meet
+            # recording wound down reset the countdown — the Meet
+            # recording never stopped, the Zoom meeting never started).
+            present = active
+            if active and self._currently_recording is not None \
+                    and self._recording_source:
+                labels = {sig.split(":", 1)[-1]
+                          for sig in (result.get("signals") or [])}
+                # A bare camera signal can't be attributed to an app —
+                # benefit of the doubt ONLY when nothing else is
+                # identifiable (protects against a browser-scan hiccup
+                # mid-call without letting the NEW app's camera keep the
+                # OLD recording alive).
+                present = (self._recording_source in labels
+                           or labels == {"camera"})
+            if present:
                 self._inactive_streak = 0
-                self._instant_streak += 1
                 if self._currently_recording is not None:
                     self._seen_active_this_recording = True
             else:
                 self._inactive_streak += 1
+                self._last_presence_gap_ts = time.time()
+            # The instant-start streak follows RAW activity: while an
+            # old recording winds down per-source, the new meeting's
+            # streak is already building, so the follow-on start fires
+            # on the first poll after the stop.
+            if active:
+                self._instant_streak += 1
+            else:
                 self._instant_streak = 0
 
     # -- calendar refresh ---------------------------------------------------
@@ -803,7 +849,8 @@ class WatchManager:
     # fallback ask, and the "another meeting is starting" conflict alert.
 
     def _begin_event_recording(self, ev: WatchedEvent,
-                               armed: bool = False) -> bool:
+                               armed: bool = False,
+                               source: "str | None" = None) -> bool:
         """Shared start path for every identified-event start (presence
         match, fallback ask, conflict switch). Handles project routing,
         diarize sensitivity, the attendee whitelist, and state marking.
@@ -826,6 +873,7 @@ class WatchManager:
                 ev.status = EventStatus.RECORDING
                 ev.recorded_at = _now()
                 self._currently_recording = ev.id
+                self._recording_source = source or ev.detected_source
                 self._seen_active_this_recording = armed
                 self._inactive_streak = 0
                 self._last_active_poll = time.time()
@@ -945,6 +993,8 @@ class WatchManager:
                 ev = self._events[recording_id]
                 ev.status = EventStatus.COMPLETED
                 was_instant = ev.detected_source is not None
+            ended_source = self._recording_source
+            self._recording_source = None
             self._currently_recording = None
             self._inactive_streak = 0
             self._instant_streak = 0
@@ -958,6 +1008,7 @@ class WatchManager:
                 self._end_cooldown_until = (
                     time.time() + INSTANT_END_COOLDOWN_S
                 )
+                self._end_cooldown_source = ended_source
         if restore_project:
             _project_restore(getattr(self, "_project_before_routing", ""))
 
@@ -983,8 +1034,12 @@ class WatchManager:
     def _maybe_conflict_alert(self, now: datetime) -> None:
         """ANY active recording (auto, manual, adopted) + a different
         attendee-event reaching its start time → ask whether to switch.
-        Never switches silently, never kills the current recording
-        without a click — meetings running long stay protected."""
+        One carve-out (auto mode): when the current recording's event is
+        already OVER and a presence gap was observed around the new
+        event's start — the user demonstrably hopped meetings — switch
+        without asking. A meeting running long shows no gap and no
+        ended event, so it still always asks; nothing dies without
+        either a click or hard evidence."""
         if _capture_pid() is None:
             return
         with self._lock:
@@ -1016,6 +1071,43 @@ class WatchManager:
             ev.conflict_asked = True
         current_desc = (cur_ev.title if cur_ev
                         else (cur_title or "the current recording"))
+
+        # AUTO-mode back-to-back hop: the current recording's event has
+        # ended AND a presence gap was seen around the new event's start
+        # (the user actually left — a 5-10 s hop between Zoom meetings
+        # shows up as one inactive poll at the recording cadence).
+        # Both facts together = switch silently; either missing = ask.
+        if _watch_mode() == "auto":
+            cur_end = None
+            if cur_ev is not None and cur_ev.detected_source is None:
+                cur_end = cur_ev.end
+            elif cur_title:
+                for e in self._events.values():
+                    if (e.title == cur_title
+                            and e.start.isoformat()[:16] == cur_start):
+                        cur_end = e.end
+                        break
+            with self._lock:
+                gap_ts = self._last_presence_gap_ts
+            try:
+                gap_near_start = gap_ts >= ev.start.timestamp() - 90
+            except Exception:
+                gap_near_start = False
+            if cur_end is not None and gap_near_start \
+                    and now >= cur_end - timedelta(seconds=120):
+                _wlog(f"conflict: '{current_desc}' ended + presence gap "
+                      f"seen — auto-switching to '{ev.title}'")
+
+                def switch_worker():
+                    self._switch_recording(ev)
+                    _agent_notify(
+                        title="Switched recording",
+                        body=f"“{ev.title}” — previous meeting ended.",
+                        actions=["OK"], default="OK", timeout=1, linger=0,
+                    )
+                threading.Thread(target=switch_worker, daemon=True).start()
+                return
+
         _wlog(f"conflict: '{ev.title}' starting while recording "
               f"'{current_desc}' — asking")
 
@@ -1046,6 +1138,7 @@ class WatchManager:
             if old_id and old_id in self._events:
                 self._events[old_id].status = EventStatus.COMPLETED
             self._currently_recording = None
+            self._recording_source = None
             self._inactive_streak = 0
         try:
             subprocess.Popen([str(LAUNCHER), "stop"],
@@ -1191,7 +1284,14 @@ class WatchManager:
                 return
             if now_wall < self._skip_cooldown_until:
                 return
-            if now_wall < self._end_cooldown_until:
+            if now_wall < self._end_cooldown_until and (
+                self._end_cooldown_source is None
+                or (self._last_meeting_active.get("source") or "")
+                    == self._end_cooldown_source
+            ):
+                # Cooldown only guards re-detection of the SAME app's
+                # wrap-up blips — a different app right after a stop is
+                # a genuinely new meeting.
                 return
             if self._instant_streak < INSTANT_CONFIRM_TICKS:
                 return
@@ -1250,7 +1350,8 @@ class WatchManager:
                         if self._currently_recording is not None:
                             return
                     # Presence seen → end-detection armed at birth.
-                    self._begin_event_recording(ev, armed=True)
+                    self._begin_event_recording(ev, armed=True,
+                                                source=source)
                 finally:
                     with self._lock:
                         self._instant_pending = False
