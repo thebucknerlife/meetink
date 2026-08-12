@@ -229,6 +229,49 @@ _mix_enhanced_m4a() {
     fi
     local timing="${out%.m4a}.timing.json"
 
+    # SPEAKERS-MODE: when the mic clearly carries the system audio
+    # (strong bleed path), the mic stream alone IS the meeting — one
+    # copy of every voice, echo impossible by construction. Every
+    # layered mix doubled somebody (the entire v2-v9 saga); the user's
+    # verdict on the raw mic spool: "the best version". mix_mode=auto
+    # (default) detects it; =mic / =split force either path.
+    local mix_mode=$(grep '^mix_mode=' "$MK_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+    local mic_only=0
+    if [[ "$mix_mode" == "mic" ]]; then
+        mic_only=1
+    elif [[ "$mix_mode" != "split" && -s "$mic" && -s "$sys" \
+            && -x "$MK_PARAKEET_VENV/bin/python" ]]; then
+        mic_only=$("$MK_PARAKEET_VENV/bin/python" - "$mic" "$sys" <<'PYEOF7' 2>/dev/null || print 0
+import sys as _s
+import numpy as np
+mic = np.fromfile(_s.argv[1], dtype=np.int16).astype(np.float32) / 32768.0
+sy = np.fromfile(_s.argv[2], dtype=np.int16).astype(np.float32) / 32768.0
+n = min(len(mic), len(sy))
+B = 1600  # 100 ms at 16 kHz
+nb = n // B
+if nb < 50:
+    print(0); raise SystemExit
+m = np.sqrt((mic[:nb*B].reshape(nb, B)**2).mean(axis=1))
+s = np.sqrt((sy[:nb*B].reshape(nb, B)**2).mean(axis=1))
+loud = s > 0.05
+# Speakers: the mic tracks the system audio at a substantial fraction.
+# Headphone leak sits far below 0.15.
+print(1 if loud.sum() > 20 and float(np.median(m[loud] / s[loud])) > 0.15 else 0)
+PYEOF7
+)
+    fi
+    if (( mic_only )) && [[ -s "$mic" ]]; then
+        local monly="$mic" mar=16000
+        (( have48 )) && { monly="$mic48"; mar=48000; }
+        local mrc=0
+        ffmpeg -v error -y -f s16le -ar $mar -ac 1 -i "$monly" \
+            -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || mrc=$?
+        print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=mic-only" \
+            >> "$MK_HOME/perf.log" 2>/dev/null || true
+        (( mrc == 0 )) && print -P "${C[dim]}  (speakers-mode meeting — mic stream is the mix)${C[reset]}"
+        return $mrc
+    fi
+
     # Neural mix (DTLN-aec, preferred when installed): the model runs in
     # both directions as a DETECTOR — per-block keep-ratios gate the RAW
     # streams, so kept speech is a bit-true passthrough. The user's
