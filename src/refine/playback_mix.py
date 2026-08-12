@@ -197,6 +197,7 @@ def main() -> int:
         # In-person recording: no system audio at all → pure mic-only.
         sys16 = np.zeros(len(mic16), dtype=np.float32)
 
+    log("progress 5 analyzing")
     route = load_route(args.route)
     if route:
         log(f"route journal: {len(route)} event(s), "
@@ -247,6 +248,7 @@ def main() -> int:
                                 f"clean-mix")
                             return EXIT_WEAK_SPEAKERS
 
+    log("progress 15 echo-gate")
     # Echo gate for the SUM segments only (twice-guarded, as shipped).
     gains = None
     if not all(modes):
@@ -261,6 +263,7 @@ def main() -> int:
                 else:
                     log(f"echo gate armed (delay {delay/16.0:.0f} ms)")
 
+    log("progress 25 rendering")
     mic_gain = stream_gain(mic16)
     sys_gain = stream_gain(sys16)
     log(f"level match: mic x{mic_gain:.2f}, sys x{sys_gain:.2f}")
@@ -299,10 +302,15 @@ def main() -> int:
     B_hi = args.rate // 20
     CHUNK = args.rate * 10
     sys_src = args.sys_ if fsize(args.sys_) else os.devnull
+    last_pct = 25
     with open(args.mic, "rb") as fm, open(sys_src, "rb") as fs, \
          open(args.out, "wb") as fo:
         pos = 0
         while pos < n:
+            pct = 25 + int(70 * pos / max(1, n))
+            if pct >= last_pct + 5:
+                log(f"progress {pct} rendering")
+                last_pct = pct
             take = min(CHUNK, n - pos)
             mic = np.frombuffer(fm.read(take * 2), dtype=np.int16)
             sy = np.frombuffer(fs.read(take * 2), dtype=np.int16)

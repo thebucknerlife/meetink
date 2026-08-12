@@ -628,6 +628,17 @@ func postprocState() -> String? {
           let m = attrs[.modificationDate] as? Date,
           Date().timeIntervalSince(m) < 1800,
           let txt = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+    // Ghost guard: the pipeline records its shell pid next to the state
+    // file. Dead writer = the run was killed mid-flight (app relaunch,
+    // crash) and this status would otherwise sit on screen forever
+    // (field report: "denoising mic" for 7 minutes after the mix had
+    // already finished).
+    if let pidTxt = try? String(contentsOfFile: "/tmp/meetink-postproc.pid",
+                                encoding: .utf8),
+       let pid = Int32(pidTxt.trimmingCharacters(in: .whitespacesAndNewlines)),
+       kill(pid, 0) != 0 {
+        return nil
+    }
     let line = txt.trimmingCharacters(in: .whitespacesAndNewlines)
     return line.isEmpty ? nil : line
 }
@@ -1068,8 +1079,18 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// calendar event (or "No Event"); clicking lists the day's events.
     private let eventButton = NSButton(title: "No Event", target: nil, action: nil)
     private let menuButton = NSButton(title: "", target: nil, action: nil)
-    /// Reprocess lives in the … menu; the flag disables its item mid-run.
-    private var reprocessRunning = false
+    /// Third header row: post-processing narration ("mixing audio —
+    /// rendering 45% (step 3/3)"), visible only while a run is live.
+    private let processingField = NSTextField(labelWithString: "")
+    /// Reprocess lives in the … menu; "running" is derived from the
+    /// postproc marker files (the run is a detached process now).
+    private var reprocessRunning: Bool {
+        guard postprocState() != nil, let target = postprocPath(),
+              !lastResolvedPath.isEmpty else { return false }
+        return target == lastResolvedPath
+            || (target as NSString).deletingLastPathComponent
+               == (lastResolvedPath as NSString).deletingLastPathComponent
+    }
     private var fetchedEvents: [[String: Any]] = []
     /// Wired by MainWindowController: after Delete, go back to Meetings.
     var onMeetingDeleted: (() -> Void)? = nil
@@ -1156,8 +1177,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let titleSpacer = NSView()
         titleSpacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1),
                                               for: .horizontal)
-        let titleRow = NSStackView(views: [titleField, titleSpacer,
-                                           eventButton, copyButton, menuButton])
+        let titleRow = NSStackView(views: [titleField, titleSpacer])
         titleRow.orientation = .horizontal
         titleRow.spacing = 8
         // Long titles truncate with "…" instead of shoving the buttons:
@@ -1166,7 +1186,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         titleField.setContentCompressionResistancePriority(
             NSLayoutConstraint.Priority(740), for: .horizontal)
 
-        let header = NSStackView(views: [titleRow, strip])
+        processingField.font = NSFont.monospacedDigitSystemFont(ofSize: 11,
+                                                                weight: .regular)
+        processingField.textColor = .systemOrange
+        processingField.lineBreakMode = .byTruncatingTail
+        processingField.isHidden = true
+        let header = NSStackView(views: [titleRow, strip, processingField])
         header.orientation = .vertical
         header.alignment = .leading
         header.spacing = 2
@@ -1206,6 +1231,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         strip.addArrangedSubview(statusDot)
         strip.addArrangedSubview(headerField)
         strip.addArrangedSubview(NSView())
+        strip.addArrangedSubview(eventButton)
+        strip.addArrangedSubview(copyButton)
+        strip.addArrangedSubview(menuButton)
 
         let divider = NSBox()
         divider.boxType = .separator
@@ -1880,34 +1908,21 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func reprocess() {
         guard let launcher = launcherPath(), !lastResolvedPath.isEmpty,
               !reprocessRunning else { return }
-        reprocessRunning = true
         let path = lastResolvedPath
+        // DETACHED, no pipes: the old Process+Pipe setup made the
+        // reprocess a dependent of the app — relaunching the app closed
+        // the pipe and the pipeline died of SIGPIPE mid-run (field case:
+        // stale "denoising mic" status, m4a written but cleanup never
+        // ran). nohup + no fds = the run outlives the app; progress and
+        // completion surface through the postproc status row and the
+        // "Reprocess done" notification.
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: launcher)
-        proc.arguments = ["reprocess", path]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-        DispatchQueue.global().async { [weak self] in
-            do { try proc.run() } catch { return }
-            proc.waitUntilExit()
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
-                             encoding: .utf8) ?? ""
-            DispatchQueue.main.async {
-                self?.reprocessRunning = false
-                self?.refreshIfChanged(force: true)
-                // Exit code only — substring-matching 'error' false-positived
-                // on successful runs.
-                if proc.terminationStatus != 0 {
-                    let alert = NSAlert()
-                    alert.messageText = "Reprocess failed (exit \(proc.terminationStatus))"
-                    alert.informativeText = out.replacingOccurrences(
-                        of: #"\u{1B}\[[0-9;]*m"#, with: "", options: .regularExpression)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    alert.runModal()
-                }
-            }
-        }
+        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        let q = path.replacingOccurrences(of: "'", with: "'\\''")
+        proc.arguments = ["-c",
+            "nohup '\(launcher)' reprocess '\(q)' "
+            + ">>/tmp/meetink-reprocess.log 2>&1 &"]
+        try? proc.run()
     }
 
     @objc private func openFolder() {
@@ -3251,8 +3266,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
            target == lastResolvedPath
            || (target as NSString).deletingLastPathComponent
               == (lastResolvedPath as NSString).deletingLastPathComponent {
-            parts.append("post-processing… \(pp)")
+            processingField.stringValue = "post-processing… \(pp)"
+            processingField.isHidden = false
             statusDot.textColor = .systemOrange
+        } else {
+            processingField.isHidden = true
         }
         if fixedPath == nil && !recording && snapshot.lines.isEmpty {
             parts = ["not recording"]

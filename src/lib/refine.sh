@@ -104,6 +104,7 @@ refine_session() {
 
     _refine_lock
     print -- "$actual" > /tmp/meetink-postproc.path
+    print -- $$ > /tmp/meetink-postproc.pid
     # Stream progress into the postproc state file so the app's status bar
     # can narrate ("post-processing… identifying speakers 43% (step 2/3)").
     # rc comes from pipestatus[1] — the pipeline's last command is the
@@ -220,17 +221,53 @@ _denoise_mic() {
     if [[ "$v" == "off" || "$v" == "false" || ! -x "$dfn" || ! -s "$in" ]]; then
         print -- "$in"; return 0
     fi
-    print -- "mixing audio — denoising mic (capped DeepFilterNet) (step 3/3)" \
+    print -- "mixing audio — denoising mic ~0% (step 3/3)" \
         > /tmp/meetink-postproc.state 2>/dev/null
-    if ffmpeg -v error -y -f s16le -ar $rate -ac 1 -i "$in" "$td/dn-in.wav" 2>>/tmp/meetink-refine.log \
-        && "$dfn" "$td/dn-in.wav" -o "$td" --atten-lim 12 >>/tmp/meetink-refine.log 2>&1 \
-        && [[ -f "$td/dn-in_DeepFilterNet3.wav" ]] \
+    local drc=1
+    if ffmpeg -v error -y -f s16le -ar $rate -ac 1 -i "$in" "$td/dn-in.wav" 2>>/tmp/meetink-refine.log; then
+        # DFN prints nothing until it finishes, but its realtime factor
+        # is stable (~0.04 on this hardware) — an elapsed/expected
+        # estimate is honest enough to prove it hasn't hung. Capped at
+        # ~95% so it never claims done early.
+        local audio_s=$(( $(stat -f%z "$in" 2>/dev/null || echo 0) / (2 * rate) ))
+        local expect=$(( audio_s / 18 ))
+        (( expect < 6 )) && expect=6
+        "$dfn" "$td/dn-in.wav" -o "$td" --atten-lim 12 >>/tmp/meetink-refine.log 2>&1 &
+        local dpid=$! dt0=$SECONDS dpct=0
+        while kill -0 $dpid 2>/dev/null; do
+            sleep 2
+            dpct=$(( (SECONDS - dt0) * 100 / expect ))
+            (( dpct > 95 )) && dpct=95
+            print -- "mixing audio — denoising mic ~${dpct}% (step 3/3)" \
+                > /tmp/meetink-postproc.state 2>/dev/null
+        done
+        wait $dpid 2>/dev/null; drc=$?
+    fi
+    if (( drc == 0 )) && [[ -f "$td/dn-in_DeepFilterNet3.wav" ]] \
         && ffmpeg -v error -y -i "$td/dn-in_DeepFilterNet3.wav" -f s16le -ar $rate -ac 1 \
                "$td/dn-mic.raw" 2>>/tmp/meetink-refine.log; then
         print -- "$td/dn-mic.raw"
     else
         print -- "$in"   # denoise is best-effort, never blocks the mix
     fi
+}
+
+# Run playback_mix.py with its stderr streamed into the refine log AND
+# the postproc state file ("playback-mix: progress N label" lines become
+# "mixing audio — label N%"), so the app's status row moves during the
+# render instead of sitting on one string for minutes.
+_pmix_run() {
+    "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/playback_mix.py" "$@" \
+        2>&1 >/dev/null | while IFS= read -r line; do
+        print -r -- "$line" >> /tmp/meetink-refine.log
+        case "$line" in
+            ("playback-mix: progress "*)
+                local -a w=(${=line})
+                print -- "mixing audio — ${w[4]:-rendering} ${w[3]}% (step 3/3)" \
+                    > /tmp/meetink-postproc.state 2>/dev/null ;;
+        esac
+    done
+    return ${pipestatus[1]}
 }
 
 # Mix two raw spools into a listenable m4a: enhance (best-effort), then
@@ -300,11 +337,10 @@ _mix_enhanced_m4a() {
         local rjson="${mic:h}/route.jsonl"
         [[ -s "$rjson" ]] || rjson="${out%.m4a}.route.jsonl"
         [[ -s "$rjson" ]] && fm+=(--route "$rjson")
-        "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/playback_mix.py" \
-                --mic16 "$amic" --sys16 "$asys" \
+        _pmix_run --mic16 "$amic" --sys16 "$asys" \
                 --mic "$dmic" --sys "$psys" --rate $par \
                 "${fm[@]}" \
-                --out "$pd/mixed.raw" 2>>/tmp/meetink-refine.log
+                --out "$pd/mixed.raw"
         local pmrc=$?
         if (( pmrc == 0 )); then
             local prc=0
@@ -337,11 +373,10 @@ _mix_enhanced_m4a() {
                     >> "$MK_HOME/perf.log" 2>/dev/null || true
                 return $crc
             fi
-            if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/playback_mix.py" \
-                    --mic16 "$amic" --sys16 "$asys" \
+            if _pmix_run --mic16 "$amic" --sys16 "$asys" \
                     --mic "$dmic" --sys "$psys" --rate $par \
                     --force-mode mic \
-                    --out "$pd/mixed.raw" 2>>/tmp/meetink-refine.log; then
+                    --out "$pd/mixed.raw"; then
                 local mrc2=0
                 ffmpeg -v error -y -f s16le -ar $par -ac 1 -i "$pd/mixed.raw" \
                     -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || mrc2=$?
@@ -460,7 +495,7 @@ postproc_kill() {
     pkill -9 -f "src/refine/pyannote_diar.py" 2>/dev/null || true
     pkill -9 -f "enhance-venv/bin/deepFilter" 2>/dev/null || true
     rm -rf /tmp/meetink-refine.lock
-    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
 }
 
 # Listening copy for an IMPORT: single stream, so no echo cancellation
@@ -694,6 +729,7 @@ cmd_reprocess() {
     local state=/tmp/meetink-postproc.state
     print -- "starting (step 1/3)" > "$state"
     print -- "$actual" > /tmp/meetink-postproc.path
+    print -- $$ > /tmp/meetink-postproc.pid
     local rc=0
     "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log | \
         while IFS= read -r line; do
@@ -741,12 +777,12 @@ cmd_reprocess() {
         fi
     else
         rm -rf "$tmpdir"
-        rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+        rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
         print -P "${C[red]}error:${C[reset]} reprocess failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
         return 1
     fi
     rm -rf "$tmpdir"
-    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
     typeset -f mk_notify >/dev/null 2>&1 && \
         mk_notify "Reprocess done" "${${actual:t}:r}"
 }
@@ -772,6 +808,7 @@ cmd_relabel() {
     local state=/tmp/meetink-postproc.state
     print -- "relabeling speakers (fast)" > "$state"
     print -- "$actual" > /tmp/meetink-postproc.path
+    print -- $$ > /tmp/meetink-postproc.pid
     local rc=0
     "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" \
         --relabel "$actual" --me "${me:-ME}" --out "$tmp" \
@@ -860,7 +897,7 @@ cmd_refine() {
     _refine_unlock
     if (( rc != 0 )); then
         rm -rf "$sess_dir"   # no ghost meeting from a failed import
-        rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+        rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
         print -P "${C[red]}error:${C[reset]} transcription failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
         return 1
     fi
@@ -905,7 +942,7 @@ cmd_refine() {
         title_session_file "$out"
     fi
 
-    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
     # Machine-readable final location (titling may have renamed the file).
     # Tracked by INODE, not via live.txt: with two imports in flight the
     # symlink points wherever the later one left it — mv preserves the

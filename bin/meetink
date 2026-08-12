@@ -1115,6 +1115,7 @@ cmd_stop() {
     # (field incident: the L10 leadership call).
     print -- "$stop_target" > /tmp/meetink-postproc.path
     print -- "stopping (step 1/3)" > /tmp/meetink-postproc.state
+    print -- $$ > /tmp/meetink-postproc.pid
     # Inode survives folder renames — the recovery handle if a rename
     # lands despite the marker (e.g. a reconciler poll already mid-swing).
     local stop_ino=$(stat -f %i "$stop_target" 2>/dev/null)
@@ -1222,7 +1223,7 @@ cmd_stop() {
         fi
     fi
 
-    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
     mk_notify "Meeting ready" "${${stop_target:t}:r} — transcript and audio processed"
     mk_activity "meeting ready — ${${stop_target:t}:r}"
 
