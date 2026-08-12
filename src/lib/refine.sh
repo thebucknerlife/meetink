@@ -278,14 +278,39 @@ PYEOF7
         return $mrc
     fi
 
-    # Neural mix (DTLN-aec, preferred when installed): the model runs in
-    # both directions as a DETECTOR — per-block keep-ratios gate the RAW
-    # streams, so kept speech is a bit-true passthrough. The user's
-    # voice needs no labels (the model keeps it wherever it is); sys
-    # suppression is confined to the transcript spans. See
-    # neural_mix.py's docstring for the field verdicts this encodes.
+    # Headphone mix: the streams are already the clean separation (no
+    # bleed in the mic), so the mix is raw mic + sys with ONLY the
+    # targeted residual-echo gate for the user's remote echo. The heavy
+    # neural path ran on an AirPods field test and manufactured every
+    # artifact it existed to prevent (mask-transfer "glass jar" on a
+    # clean voice, span-duck pumping, hard-clip distortion) — with no
+    # bleed there is nothing for it to do. DTLN (neural_mix.py) stays
+    # available behind mix_mode=neural for future bleed-y edge cases.
+    if [[ -x "$MK_PARAKEET_VENV/bin/python" && -s "$mic" && -s "$sys" \
+          && "$mix_mode" != "neural" ]]; then
+        local nmic="$mic" nsys="$sys" nar=16000
+        (( have48 )) && { nmic="$mic48"; nsys="$sys48"; nar=48000; }
+        local nd=$(mktemp -d -t meetink-hmix)
+        if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/headphone_mix.py" \
+                --mic16 "$mic" --sys16 "$sys" \
+                --mic "$nmic" --sys "$nsys" --rate $nar \
+                --out "$nd/mixed.raw" 2>>/tmp/meetink-refine.log; then
+            local nrc=0
+            ffmpeg -v error -y -f s16le -ar $nar -ac 1 -i "$nd/mixed.raw" \
+                -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || nrc=$?
+            rm -rf "$nd"
+            print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=headphone" \
+                >> "$MK_HOME/perf.log" 2>/dev/null || true
+            return $nrc
+        fi
+        rm -rf "$nd"
+        print -P "${C[dim]}  (headphone mix bailed — fallback)${C[reset]}"
+    fi
+
+    # DTLN neural mix — opt-in via mix_mode=neural (see headphone mix
+    # comment above for why it is no longer the default).
     local dtln_py="$MK_HOME/dtln-venv/bin/python"
-    if [[ -f "$timing" && -x "$dtln_py" \
+    if [[ "$mix_mode" == "neural" && -f "$timing" && -x "$dtln_py" \
           && -f "$MK_HOME/dtln/dtln_aec_512_1.tflite" \
           && -s "$mic" && -s "$sys" ]]; then
         local nmic="$mic" nsys="$sys" nar=16000
