@@ -42,3 +42,4 @@ __pycache__/
 *~
 .~lock.*
 vendor/
+src/capture/aec_shim.o
