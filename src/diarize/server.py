@@ -680,6 +680,55 @@ def _save(name: str) -> None:
     )
 
 
+# Raw enrollment audio, kept alongside the embedding profiles so a
+# future embedding-model upgrade can RE-EMBED every profile from the
+# exact audio that built it (embeddings are model-specific; without the
+# audio, a model swap means re-enrolling everyone from scratch). Rolling
+# cap per profile; 0 disables.
+PROFILE_AUDIO_KEEP = int(os.environ.get("MEETINK_PROFILE_AUDIO_KEEP", "20"))
+
+
+def _save_profile_audio(name: str, samples: np.ndarray) -> None:
+    if PROFILE_AUDIO_KEEP <= 0:
+        return
+    try:
+        import wave
+        d = PROFILES_DIR / "audio" / name
+        d.mkdir(parents=True, exist_ok=True)
+        clip = samples[: 16000 * 10]           # cap 10 s per snippet
+        path = d / f"{int(time.time() * 1000)}.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(
+                (np.clip(clip, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+        stale = sorted(d.glob("*.wav"))[:-PROFILE_AUDIO_KEEP]
+        for f in stale:
+            f.unlink()
+    except Exception as e:
+        print(f"warning: profile audio save failed for {name}: {e}",
+              file=sys.stderr)
+
+
+def _move_profile_audio(src_name: str, dst_name: str) -> None:
+    """Keep the audio dir in lockstep with profile renames (merge =
+    move the snippets in; the rolling cap prunes on the next save)."""
+    try:
+        src = PROFILES_DIR / "audio" / src_name
+        if not src.is_dir():
+            return
+        dst = PROFILES_DIR / "audio" / dst_name
+        if not dst.exists():
+            src.rename(dst)
+        else:
+            for f in src.glob("*.wav"):
+                f.rename(dst / f.name)
+            src.rmdir()
+    except Exception:
+        pass
+
+
 def _canonical_profile_name(name: str) -> str:
     """The existing profile whose name matches case-insensitively, else
     the name as given. Assigning "ED" while "Ed" is enrolled must train
@@ -1599,6 +1648,7 @@ class Handler(BaseHTTPRequestHandler):
                         runner_up,
                     ):
                         resp["auto_trained"] = True
+                        _save_profile_audio(resp["speaker"], samples)
                         print(
                             f"auto-train: {resp['speaker']} += sample "
                             f"(confidence={resp.get('confidence')}, "
@@ -2098,6 +2148,7 @@ class Handler(BaseHTTPRequestHandler):
                 # case-insensitive filesystem.
                 if src_name.lower() == dst_name.lower():
                     profiles[dst_name] = profiles.pop(src_name)
+                    _move_profile_audio(src_name, dst_name)
                     # Unlink BEFORE saving: overwriting through the old
                     # name keeps the old on-disk casing, and _load_all
                     # keys by file stem — the recase would silently
@@ -2148,6 +2199,7 @@ class Handler(BaseHTTPRequestHandler):
                 # filesystem src.npz can resolve to the very file _save
                 # just wrote for dst.
                 profiles.pop(src_name, None)
+                _move_profile_audio(src_name, dst_name)
                 dst_file = PROFILES_DIR / f"{dst_name}.npz"
                 for ext in (".npz", ".npy"):
                     p = PROFILES_DIR / f"{src_name}{ext}"
@@ -2247,6 +2299,7 @@ class Handler(BaseHTTPRequestHandler):
                         "floor": PROFILE_OUTLIER_FLOOR,
                     })
                     return
+                _save_profile_audio(name, samples)
                 print(
                     f"enrolled: {name} ({len(samples) / 16000:.1f}s, "
                     f"total={count}, best_sim={best_sim:.3f})",
@@ -2275,6 +2328,12 @@ class Handler(BaseHTTPRequestHandler):
                     removed = True
             if removed:
                 profiles.pop(name, None)
+                try:
+                    import shutil
+                    shutil.rmtree(PROFILES_DIR / "audio" / name,
+                                  ignore_errors=True)
+                except Exception:
+                    pass
                 print(f"removed: {name}", file=sys.stderr)
                 self._json(200, {"ok": True, "removed": name})
             else:
