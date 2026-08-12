@@ -356,6 +356,18 @@ func cmdNotify(args: [String]) -> Int32 {
         content.interruptionLevel = .timeSensitive
     }
 
+    // With ALERTS style (user-set in System Settings → Notifications)
+    // the banner persists until engaged — the linger re-posting below
+    // would only cause visible churn, so it is skipped entirely. The
+    // re-post dance is a banner-style workaround, not the good path.
+    var styleIsAlert = false
+    let styleSem = DispatchSemaphore(value: 0)
+    center.getNotificationSettings { settings in
+        styleIsAlert = settings.alertStyle == .alert
+        styleSem.signal()
+    }
+    styleSem.wait()
+
     let identifier = UUID().uuidString
     let request = UNNotificationRequest(
         identifier: identifier,
@@ -400,12 +412,18 @@ func cmdNotify(args: [String]) -> Int32 {
     let deadline = Date().addingTimeInterval(timeoutSecs)
     let lingerEnd = Date().addingTimeInterval(lingerSecs)
     var currentId = identifier
-    var nextRepost = Date().addingTimeInterval(6.0)
+    var reposts = 0
+    var nextRepost = Date().addingTimeInterval(18.0)
     while delegate.clicked == nil && Date() < deadline {
         RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
-        if lingerSecs > 0, delegate.clicked == nil,
+        // Banner-style linger: a GENTLE re-post (every ~20 s, capped) —
+        // the old 6 s remove-then-add cycle strobed ("popping up,
+        // dismissing, popping up again"). New banner posts BEFORE the
+        // old one is removed so there is never a visible gap.
+        if !styleIsAlert, lingerSecs > 0, reposts < 4,
+           delegate.clicked == nil,
            Date() >= nextRepost, Date() < lingerEnd {
-            center.removeDeliveredNotifications(withIdentifiers: [currentId])
+            let previousId = currentId
             let repost = UNMutableNotificationContent()
             repost.title = title
             repost.body = body
@@ -417,11 +435,11 @@ func cmdNotify(args: [String]) -> Int32 {
             currentId = UUID().uuidString
             center.add(UNNotificationRequest(
                 identifier: currentId, content: repost, trigger: nil
-            )) { _ in }
-            // Jittered cadence: two lingering notifications re-posting in
-            // lockstep animate over each other ("they compete"); offset
-            // cycles let both banners sit in the stack.
-            nextRepost = Date().addingTimeInterval(5.5 + Double.random(in: 0...1.5))
+            )) { _ in
+                center.removeDeliveredNotifications(withIdentifiers: [previousId])
+            }
+            reposts += 1
+            nextRepost = Date().addingTimeInterval(18.0 + Double.random(in: 0...4))
         }
     }
 

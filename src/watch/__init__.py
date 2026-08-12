@@ -728,11 +728,16 @@ class WatchManager:
         if e.project:
             body_parts.append(f"→ {e.project}")
         body = "  ".join(body_parts)
+        # In notify mode nothing auto-records — the old "auto-record"
+        # title was misleading there, and the separate record-confirm
+        # asks when presence appears.
+        warn_title = ("meetink — auto-record" if _watch_mode() == "auto"
+                      else "Upcoming meeting")
 
         ev = e  # capture for the closure
         def worker():
             response = _agent_notify(
-                title="meetink — auto-record",
+                title=warn_title,
                 body=body,
                 actions=["Skip"],
                 default="Continue",
