@@ -1628,12 +1628,21 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         } else if !lastResolvedPath.isEmpty {
             // Event linking moved to the header's calendar dropdown.
             add("Relabel Speakers (fast)…", #selector(relabelSpeakers))
-            if audioPath != nil {
+            // Reprocess needs SOURCE audio, which is the m4a or the kept
+            // stems — the stems can exist without the m4a when the stop
+            // pipeline died before the archive step (field incident:
+            // renamed-folder race), and reprocess is exactly the fix.
+            let stemBase = (lastResolvedPath as NSString).deletingPathExtension
+            let hasStems = FileManager.default.fileExists(atPath: stemBase + ".mic.wav")
+                || FileManager.default.fileExists(atPath: stemBase + ".sys.wav")
+            if audioPath != nil || hasStems {
                 add(reprocessRunning ? "Reprocessing…" : "Reprocess",
                     #selector(reprocess))
                 menu.items.last?.isEnabled = !reprocessRunning
                 menu.items.last?.toolTip = "Re-run transcription, diarization "
                     + "and audio enhancement on this meeting's kept audio"
+            }
+            if audioPath != nil {
                 add("Download Audio…", #selector(downloadAudio))
             }
             add("Open Folder", #selector(openFolder))

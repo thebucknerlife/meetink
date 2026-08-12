@@ -1105,6 +1105,29 @@ cmd_stop() {
     # spools — 'my recording died after 15 seconds, no audio').
     local stop_target="$MK_TRANSCRIPT"
     [[ -L "$stop_target" ]] && stop_target=$(readlink "$stop_target" 2>/dev/null)
+    # Claim the post-processing marker BEFORE killing capture. The app
+    # defers pending renames (event linked mid-call) while a postproc is
+    # in flight — but the marker used to appear only when refine started,
+    # leaving a gap right after capture death where the app's reconciler
+    # renamed the folder out from under this pipeline's resolved paths.
+    # Every stage then soft-no-op'd on the stale path and the stop
+    # "completed" in one second with no refine, no m4a, spools stranded
+    # (field incident: the L10 leadership call).
+    print -- "$stop_target" > /tmp/meetink-postproc.path
+    print -- "stopping (step 1/3)" > /tmp/meetink-postproc.state
+    # Inode survives folder renames — the recovery handle if a rename
+    # lands despite the marker (e.g. a reconciler poll already mid-swing).
+    local stop_ino=$(stat -f %i "$stop_target" 2>/dev/null)
+    _stop_retarget() {
+        [[ -f "$stop_target" ]] && return 0
+        [[ -n "$stop_ino" ]] || return 1
+        local by_ino=$(find "$MK_TRANSCRIPTS_DIR" -maxdepth 2 -name '*.txt' \
+            -inum "$stop_ino" 2>/dev/null | head -1)
+        if [[ -n "$by_ino" && -f "$by_ino" ]]; then
+            stop_target="$by_ino"
+            print -- "$stop_target" > /tmp/meetink-postproc.path
+        fi
+    }
     local pid=$(cat "$PID_FILE")
     if kill -0 "$pid" 2>/dev/null; then
         print -P "${C[dim]}Stopping recording...${C[reset]}"
@@ -1135,6 +1158,7 @@ cmd_stop() {
     # clusters the diarize-server merged mid-session leave stale
     # "Speaker <x>" labels on lines written before the merge. See
     # diarize_consolidate_transcript in src/lib/diarize.sh.
+    _stop_retarget
     if typeset -f diarize_consolidate_transcript >/dev/null 2>&1; then
         diarize_consolidate_transcript "$stop_target"
     fi
@@ -1152,6 +1176,7 @@ cmd_stop() {
     # inference so names are inferred from the better text, and refine's
     # sentence-level /identify calls have already populated the session
     # clusters that inference checks.
+    _stop_retarget
     if typeset -f refine_session >/dev/null 2>&1; then
         refine_session "$stop_target"
     fi
@@ -1160,6 +1185,7 @@ cmd_stop() {
     # gates the mic by the user's word timings, which only exist once
     # refine has written the timing sidecar. This step is the spools'
     # last consumer and deletes them on every path.
+    _stop_retarget
     if typeset -f audio_archive_session >/dev/null 2>&1; then
         audio_archive_session "$stop_target"
     fi
@@ -1170,6 +1196,7 @@ cmd_stop() {
     # see named speakers. Conservative by design; disable with
     # MEETINK_INFER_NAMES=off or infer_names=false in config.
     print -- "generating names, title and summary (step 3/3)" > /tmp/meetink-postproc.state
+    _stop_retarget
     if typeset -f infer_speaker_names >/dev/null 2>&1; then
         infer_speaker_names "$stop_target"
     fi
@@ -1178,8 +1205,8 @@ cmd_stop() {
     # tiny LLM aren't installed). title_session_file may rename the file and
     # update the live.txt symlink target.
     # Track OUR session by inode across titling's rename — never via the
-    # live symlink, which a newer recording may already own.
-    local stop_ino=""
+    # live symlink, which a newer recording may already own. (stop_ino was
+    # computed up front; refresh it in case trim/refine swapped the inode.)
     if [[ -n "$stop_target" && -f "$stop_target" ]]; then
         stop_ino=$(stat -f %i "$stop_target" 2>/dev/null)
         # Rule 3: recordings without a linked event get one inferred from
