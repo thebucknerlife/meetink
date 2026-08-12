@@ -968,6 +968,131 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
 
 // MARK: - Stream Delegate
 
+// MARK: - Output route journal
+//
+// The OS knows whether headphones or speakers are in use — read the
+// default output device's name/transport and journal every change with
+// a spool-timeline timestamp. The playback mix uses this as a STRONG
+// PRIOR for its speakers/headphones decision; acoustic evidence remains
+// the confirmation and the fallback, because the route can be
+// uninformative: a Bluetooth SPEAKER looks like headphones by
+// transport, and VIRTUAL devices (Krisp Speaker, BlackHole, Loopback,
+// aggregates) hide the physical endpoint entirely — those classify as
+// "unknown" and the acoustic path decides.
+
+func currentOutputRoute() -> (name: String, kind: String) {
+    var deviceId = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &size, &deviceId) == noErr,
+          deviceId != 0 else { return ("unknown", "unknown") }
+
+    var name: CFString = "" as CFString
+    var nameSize = UInt32(MemoryLayout<CFString>.size)
+    var nameAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceNameCFString,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    withUnsafeMutablePointer(to: &name) { ptr in
+        _ = AudioObjectGetPropertyData(deviceId, &nameAddr, 0, nil,
+                                       &nameSize, ptr)
+    }
+    let deviceName = name as String
+    let lowered = deviceName.lowercased()
+
+    // Virtual/routing software: the physical endpoint is invisible.
+    let virtualName = ["krisp", "blackhole", "loopback", "soundflower",
+                       "aggregate", "multi-output", "virtual"]
+        .contains { lowered.contains($0) }
+
+    var transport: UInt32 = 0
+    var tSize = UInt32(MemoryLayout<UInt32>.size)
+    var tAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyTransportType,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    _ = AudioObjectGetPropertyData(deviceId, &tAddr, 0, nil, &tSize, &transport)
+
+    if virtualName || transport == kAudioDeviceTransportTypeVirtual
+        || transport == kAudioDeviceTransportTypeAggregate {
+        return (deviceName, "unknown")
+    }
+
+    let headphoneName = ["airpod", "pod", "bud", "headphone", "headset",
+                         "wh-", "wf-", "quietcomfort"]
+        .contains { lowered.contains($0) }
+    var kind = "unknown"
+    switch transport {
+    case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE:
+        // Bluetooth is usually headphones, but BT speakers exist —
+        // name is the tiebreak, and the acoustic check can override.
+        kind = headphoneName ? "headphones" : "unknown"
+    case kAudioDeviceTransportTypeBuiltIn:
+        // The built-in output flips its data source between internal
+        // speakers and the headphone jack.
+        var src: UInt32 = 0
+        var sSize = UInt32(MemoryLayout<UInt32>.size)
+        var sAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDataSource,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectGetPropertyData(deviceId, &sAddr, 0, nil,
+                                      &sSize, &src) == noErr,
+           src == 0x6864_706E {  // 'hdpn'
+            kind = "headphones"
+        } else {
+            kind = "speakers"
+        }
+    case kAudioDeviceTransportTypeUSB, kAudioDeviceTransportTypeDisplayPort,
+         kAudioDeviceTransportTypeHDMI, kAudioDeviceTransportTypeAirPlay:
+        kind = headphoneName ? "headphones" : "speakers"
+    default:
+        kind = headphoneName ? "headphones" : "unknown"
+    }
+    return (deviceName, kind)
+}
+
+final class RouteJournal: @unchecked Sendable {
+    private let handle: FileHandle?
+    private let epoch: Double
+    private var lastKey = ""
+
+    init(path: String?, epoch: Double) {
+        self.epoch = epoch
+        if let path {
+            FileManager.default.createFile(atPath: path, contents: nil)
+            handle = FileHandle(forWritingAtPath: path)
+        } else { handle = nil }
+    }
+
+    func record() {
+        guard let handle else { return }
+        let (name, kind) = currentOutputRoute()
+        guard kind + name != lastKey else { return }
+        lastKey = kind + name
+        let t = max(0, hostSeconds() - epoch)
+        let line = "{\"t\": \(String(format: "%.1f", t)), " +
+            "\"kind\": \"\(kind)\", " +
+            "\"name\": \(jsonEscape(name))}\n"
+        handle.write(line.data(using: .utf8)!)
+    }
+
+    func close() { try? handle?.close() }
+}
+
+func jsonEscape(_ s: String) -> String {
+    if let d = try? JSONSerialization.data(withJSONObject: [s]),
+       let arr = String(data: d, encoding: .utf8),
+       arr.count >= 2 {
+        return String(arr.dropFirst().dropLast())
+    }
+    return "\"?\""
+}
+
 /// Linear-interpolation resampler — the fallback when AVAudioConverter
 /// can't be built. No anti-alias filter, so only for edge cases; the
 /// converter path is the quality path.
@@ -1328,6 +1453,27 @@ struct LocalSpeechCapture {
             }
             fputs("Spooling session audio to \(dir) (wall-clock timelines"
                   + (spool48Enabled ? " + 48 kHz archive" : "") + ")\n", stderr)
+        }
+
+        // Output-route journal: the strong prior for the playback mix's
+        // speakers/headphones decision. Initial state + every change.
+        let routeJournal = RouteJournal(
+            path: spoolDir.map { "\($0)/route.jsonl" },
+            epoch: hostSeconds())
+        routeJournal.record()
+        if !simMode {
+            var routeAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            _ = AudioObjectAddPropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &routeAddr,
+                DispatchQueue(label: "meetink.route-journal")) { _, _ in
+                    // Settle delay: the new device's data source reads
+                    // stale immediately after a switch.
+                    Thread.sleep(forTimeInterval: 0.5)
+                    routeJournal.record()
+                }
         }
 
 #if MEETINK_AEC
@@ -1722,6 +1868,7 @@ struct LocalSpeechCapture {
         spoolMic.close()
         spool48Sys.close()
         spool48Mic.close()
+        routeJournal.close()
         let idx = audioBuffer.chunkIndex
         if let sysSamples = remaining.system, hasAudio(sysSamples) {
             let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_final_them.wav")

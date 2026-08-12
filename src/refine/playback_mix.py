@@ -48,7 +48,47 @@ def log(msg: str) -> None:
     print(f"playback-mix: {msg}", file=sys.stderr, flush=True)
 
 
-def detect_modes(mic16: np.ndarray, sys16: np.ndarray) -> list[bool]:
+def load_route(path: str | None) -> list[tuple[float, str]]:
+    """Parse capture's route.jsonl: [(t_seconds, kind)] sorted by t.
+
+    Only "headphones"/"speakers" carry information; "unknown" events
+    (virtual devices — Krisp Speaker, BlackHole, aggregates — hide the
+    physical endpoint) are kept so a switch TO a virtual device ends
+    the previous prior rather than extending it.
+    """
+    if not path:
+        return []
+    events: list[tuple[float, str]] = []
+    try:
+        import json
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                    events.append((float(o["t"]), str(o["kind"])))
+                except (ValueError, KeyError):
+                    continue
+    except OSError:
+        return []
+    events.sort()
+    return events
+
+
+def route_kind_at(events: list[tuple[float, str]], t: float) -> str | None:
+    """OS-reported output kind at time t, or None (no journal/unknown)."""
+    kind = None
+    for et, ek in events:
+        if et > t:
+            break
+        kind = ek
+    return kind if kind in ("headphones", "speakers") else None
+
+
+def detect_modes(mic16: np.ndarray, sys16: np.ndarray,
+                 route: list[tuple[float, str]] | None = None) -> list[bool]:
     """Per-window: True = speakers (mic-only), False = headphones (sum)."""
     B = RATE // 10
     n = min(len(mic16), len(sys16))
@@ -68,6 +108,28 @@ def detect_modes(mic16: np.ndarray, sys16: np.ndarray) -> list[bool]:
             continue
         ratio = float(np.median(m[sl][loud] / s[sl][loud]))
         per_win.append(ratio > RATIO_THRESHOLD)
+
+    # Route journal as prior: acoustic evidence always wins where it
+    # exists, but a window WITHOUT evidence (silence, nobody talking)
+    # takes the OS-reported output device over blind neighbor-inherit —
+    # this is what catches headphones coming on/off during a lull.
+    if route:
+        agree = disagree = filled = 0
+        for i, v in enumerate(per_win):
+            kind = route_kind_at(route, (i + 0.5) * WIN_S)
+            if kind is None:
+                continue
+            route_says = kind == "speakers"
+            if v is None:
+                per_win[i] = route_says
+                filled += 1
+            elif v == route_says:
+                agree += 1
+            else:
+                disagree += 1
+        if agree or disagree or filled:
+            log(f"route prior: {agree} agree, {disagree} disagree, "
+                f"{filled} silent window(s) filled")
 
     # Fill evidence-less windows from the nearest decided neighbor
     # (forward first, then backward for a silent head).
@@ -115,6 +177,8 @@ def main() -> int:
     ap.add_argument("--rate", type=int, default=48000)
     ap.add_argument("--force-mode", choices=["mic", "split"],
                     help="override detection (mix_mode config)")
+    ap.add_argument("--route", help="capture's route.jsonl (OS output-"
+                    "device journal) — prior for the mode decision")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -133,11 +197,16 @@ def main() -> int:
         # In-person recording: no system audio at all → pure mic-only.
         sys16 = np.zeros(len(mic16), dtype=np.float32)
 
+    route = load_route(args.route)
+    if route:
+        log(f"route journal: {len(route)} event(s), "
+            f"initial {route[0][1]} ({args.route})")
+
     if args.force_mode:
         modes = [args.force_mode == "mic"]
         log(f"mode forced: {'speakers/mic-only' if modes[0] else 'headphones/sum'}")
     else:
-        modes = detect_modes(mic16, sys16)
+        modes = detect_modes(mic16, sys16, route)
         switches = sum(1 for i in range(1, len(modes)) if modes[i] != modes[i - 1])
         log(f"modes: {sum(modes)}/{len(modes)} windows speakers, "
             f"{switches} device switch(es)")
@@ -157,10 +226,26 @@ def main() -> int:
                 if loud.sum() > 20:
                     ratio = float(np.median(m[loud] / s_[loud]))
                     if ratio > 0.02:
-                        log(f"weak-speakers: acoustic path at "
-                            f"{delay/16.0:.0f} ms, bleed ratio {ratio:.3f} "
-                            f"— deferring to neural clean-mix")
-                        return EXIT_WEAK_SPEAKERS
+                        # Route tiebreak for the ambiguous band: if the
+                        # OS says headphones throughout, the weak path
+                        # is earcup leak (AirPods spill), which the sum
+                        # handles fine — cleanmix would be needless
+                        # neural surgery. Speakers/unknown/virtual
+                        # (Krisp) → the acoustic default stands.
+                        n_hp = sum(
+                            1 for i in range(len(modes))
+                            if route_kind_at(route, (i + 0.5) * WIN_S)
+                            == "headphones")
+                        if route and n_hp == len(modes):
+                            log(f"weak path (ratio {ratio:.3f}) but "
+                                f"route says headphones throughout — "
+                                f"earcup leak, keeping the sum")
+                        else:
+                            log(f"weak-speakers: acoustic path at "
+                                f"{delay/16.0:.0f} ms, bleed ratio "
+                                f"{ratio:.3f} — deferring to neural "
+                                f"clean-mix")
+                            return EXIT_WEAK_SPEAKERS
 
     # Echo gate for the SUM segments only (twice-guarded, as shipped).
     gains = None

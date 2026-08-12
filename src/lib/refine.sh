@@ -67,7 +67,8 @@ refine_enabled() {
 # stitched onto the wrong meeting. Called from cmd_start.
 refine_clear_spool() {
     rm -f "$MK_SPOOL_DIR"/session-sys.raw "$MK_SPOOL_DIR"/session-mic.raw \
-          "$MK_SPOOL_DIR"/session-sys.48k.raw "$MK_SPOOL_DIR"/session-mic.48k.raw
+          "$MK_SPOOL_DIR"/session-sys.48k.raw "$MK_SPOOL_DIR"/session-mic.48k.raw \
+          "$MK_SPOOL_DIR"/route.jsonl
 }
 
 # Refine the just-stopped session in place. Called from cmd_stop after label
@@ -292,6 +293,13 @@ _mix_enhanced_m4a() {
         local dmic=$(_denoise_mic "$pmic" $par "$pd")
         local -a fm=()
         [[ "$mix_mode" == "mic" || "$mix_mode" == "split" ]] && fm=(--force-mode "$mix_mode")
+        # OS output-route journal (capture writes route.jsonl next to the
+        # spools; archive keeps it as <base>.route.jsonl for reprocess).
+        # A prior for the speakers/headphones decision — acoustic
+        # evidence still wins wherever it exists.
+        local rjson="${mic:h}/route.jsonl"
+        [[ -s "$rjson" ]] || rjson="${out%.m4a}.route.jsonl"
+        [[ -s "$rjson" ]] && fm+=(--route "$rjson")
         "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/playback_mix.py" \
                 --mic16 "$amic" --sys16 "$asys" \
                 --mic "$dmic" --sys "$psys" --rate $par \
@@ -564,11 +572,17 @@ audio_archive_session() {
     if (( ! keep_audio && ! keep_spools )) || ! command -v ffmpeg >/dev/null 2>&1; then
         (( keep_audio || keep_spools )) && \
             print -P "${C[yellow]}⚠${C[reset]} keep audio: ffmpeg not found — skipping"
-        rm -f "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw"
+        rm -f "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw" \
+              "${mic:h}/route.jsonl"
         return 0
     fi
 
     local base="${actual%.txt}"
+    # Keep the output-route journal beside the stems: reprocess re-runs
+    # the playback mix from the wavs and wants the same route prior.
+    # Titling renames <base>.* siblings in lockstep, so it travels.
+    [[ -s "${mic:h}/route.jsonl" ]] && \
+        cp "${mic:h}/route.jsonl" "${base}.route.jsonl" 2>/dev/null || true
     local -a raw=(-f s16le -ar 16000 -ac 1)
     if (( keep_audio )); then
         local rc=0
@@ -619,7 +633,8 @@ audio_archive_session() {
     fi
     # Spools consumed — tidy so stale audio can't bleed into the next
     # session (refine_clear_spool at the next start is the backstop).
-    rm -f "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw"
+    rm -f "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw" \
+          "${mic:h}/route.jsonl"
     return 0
 }
 
