@@ -270,7 +270,11 @@ PYEOF7
         local monly="$mic" mar=16000
         (( have48 )) && { monly="$mic48"; mar=48000; }
         local mrc=0
+        # loudnorm: quiet meetings come up, loud ones come down to a
+        # comfortable ceiling (ear-safety request) — single stream, so a
+        # broadcast normalizer is safe here (no cross-stream pumping).
         ffmpeg -v error -y -f s16le -ar $mar -ac 1 -i "$monly" \
+            -af loudnorm=I=-18:TP=-1.5 \
             -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || mrc=$?
         print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=mic-only" \
             >> "$MK_HOME/perf.log" 2>/dev/null || true

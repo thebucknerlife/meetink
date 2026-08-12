@@ -337,6 +337,27 @@ func isLiveRecording(txtPath: String) -> Bool {
 /// prefix, move the session folder + every same-basename file (or the flat
 /// siblings), and retarget live.txt if it pointed at the old path. Returns
 /// the transcript's new path, or nil when nothing moved.
+/// The stamped-prefix + slug basename renameMeeting would produce for a
+/// title — shared with the deferred-rename reconciler so "already named
+/// right" is a cheap comparison, not a rename attempt.
+func expectedBaseName(txtPath: String, displayName: String) -> String? {
+    let title = displayName.trimmingCharacters(in: .whitespaces)
+    guard !title.isEmpty else { return nil }
+    var slug = String(title.map { c in
+        c.isLetter || c.isNumber ? c : "-"
+    }).replacingOccurrences(of: "--+", with: "-", options: .regularExpression)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    if slug.isEmpty { slug = "meeting" }
+    let base = ((txtPath as NSString).lastPathComponent as NSString).deletingPathExtension
+    var prefix = ""
+    if let r = base.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
+                          options: .regularExpression) {
+        prefix = String(base[r])
+        if !prefix.hasSuffix("_") { prefix += "_" }
+    }
+    return prefix + slug
+}
+
 func renameMeeting(txtPath: String, displayName: String) -> String? {
     let title = displayName.trimmingCharacters(in: .whitespaces)
     guard !title.isEmpty else { return nil }
@@ -348,25 +369,24 @@ func renameMeeting(txtPath: String, displayName: String) -> String? {
         setMeetingMeta(txtPath, "title", title)
         return txtPath
     }
+    // Same rule mid-post-processing: the pipeline holds paths into this
+    // folder. The exact title lands in meta.json now (the UI shows it
+    // everywhere immediately); the meetings list reconciles the physical
+    // rename once processing ends.
+    if let pp = postprocPath(),
+       (pp as NSString).deletingLastPathComponent
+           == (txtPath as NSString).deletingLastPathComponent {
+        setMeetingMeta(txtPath, "title", title)
+        return txtPath
+    }
     // The exact title (dashes, punctuation, anything) goes to metadata
     // FIRST — it travels with the same-basename rename below. The slug is
     // just the folder's readable spelling.
     setMeetingMeta(txtPath, "title", title)
-    var slug = String(title.map { c in
-        c.isLetter || c.isNumber ? c : "-"
-    }).replacingOccurrences(of: "--+", with: "-", options: .regularExpression)
-        .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-    if slug.isEmpty { slug = "meeting" }
     let fm = FileManager.default
     let base = ((txtPath as NSString).lastPathComponent as NSString).deletingPathExtension
-    var prefix = ""
-    if let r = base.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
-                          options: .regularExpression) {
-        prefix = String(base[r])
-        if !prefix.hasSuffix("_") { prefix += "_" }
-    }
-    let newBase = prefix + slug
-    guard newBase != base else { return txtPath }
+    guard let newBase = expectedBaseName(txtPath: txtPath, displayName: title),
+          newBase != base else { return txtPath }
     let dir = (txtPath as NSString).deletingLastPathComponent
     var newTxt: String
     if (dir as NSString).lastPathComponent == base {
@@ -786,6 +806,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     // --- Playback (archived transcripts with a kept .m4a only) ---
     private var player: AVAudioPlayer? = nil
     private var audioPath: String? = nil
+    /// inode+mtime of the loaded audio — detects in-place replacement.
+    private var audioStamp: String = ""
     private let playerBar = NSStackView()
     private let playButton = NSButton(title: "", target: nil, action: nil)
     private let timeLabel = NSTextField(labelWithString: "")
@@ -1336,6 +1358,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         } else if !lastResolvedPath.isEmpty {
             // Event linking moved to the header's calendar dropdown.
             add("Relabel Speakers (fast)…", #selector(relabelSpeakers))
+            if audioPath != nil {
+                add("Download Audio…", #selector(downloadAudio))
+            }
             menu.addItem(.separator())
             add("Delete Meeting…", #selector(deleteMeeting))
         } else {
@@ -1580,6 +1605,26 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             let content = self.exportHeader()
                 + ((try? String(contentsOfFile: self.lastResolvedPath, encoding: .utf8)) ?? "")
             try? content.write(to: dest, atomically: true, encoding: .utf8)
+        }
+    }
+
+    @objc private func downloadAudio() {
+        guard let src = audioPath,
+              FileManager.default.fileExists(atPath: src) else { return }
+        let panel = NSSavePanel()
+        let df = DateFormatter()
+        df.dateFormat = "M-d"
+        let suffix = "_audio_" + df.string(from: meetingRecordingDate(lastResolvedPath))
+        panel.nameFieldStringValue = meetingDisplayName(lastResolvedPath)
+            .replacingOccurrences(of: "/", with: "-") + suffix
+            + "." + (src as NSString).pathExtension
+        panel.directoryURL = FileManager.default.urls(
+            for: .downloadsDirectory, in: .userDomainMask).first
+        panel.begin { response in
+            guard response == .OK, let dest = panel.url else { return }
+            try? FileManager.default.removeItem(at: dest)
+            try? FileManager.default.copyItem(
+                at: URL(fileURLWithPath: src), to: dest)
         }
     }
 
@@ -1895,8 +1940,15 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let liveRecording = fixedPath == nil && recordingPID() != nil
         let available = !liveRecording && !lastResolvedPath.isEmpty
             && FileManager.default.fileExists(atPath: candidate)
-        if available && audioPath != candidate {
+        // Same-path REPLACEMENT counts too: reprocess (and mix upgrades)
+        // rewrite the m4a in place, and a player built from the old file
+        // kept playing stale audio until the meeting was reopened.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: candidate)
+        let stamp = "\((attrs?[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0)"
+            + "-\((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
+        if available && (audioPath != candidate || stamp != audioStamp) {
             audioPath = candidate
+            audioStamp = stamp
             player?.stop()
             player = try? AVAudioPlayer(contentsOf: URL(fileURLWithPath: candidate))
             player?.prepareToPlay()
@@ -2508,10 +2560,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         // Populate here, not only on render: the page polls while detached
         // from the window, and an already-rendered transcript never
         // re-renders on attach — the title stayed "(untitled)" (field bug).
-        // No renaming while a post-process/reprocess is running — the
-        // pipeline holds paths open and a mid-run rename races it (it
-        // recovers by inode now, but there's no reason to invite it).
-        titleField.isEnabled = postprocState() == nil
+        // Renaming during processing is safe now: renameMeeting defers
+        // the physical move to the meetings list's reconciler (the title
+        // itself lands in meta.json immediately).
+        titleField.isEnabled = true
         if !titleField.isHidden, titleField.currentEditor() == nil,
            !lastResolvedPath.isEmpty {
             let name = meetingDisplayName(lastResolvedPath)
@@ -2664,19 +2716,6 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     /// (the invariant titling relies on); flat legacy files rename in place.
     @objc private func renameClicked() {
         guard let f = clickedFile() else { return }
-        // Renaming moves the folder out from under an in-flight job — the
-        // reader's title field locks during processing, but this path
-        // didn't (field case: meeting renamed mid-import, the 20-minute
-        // pyannote run nearly wrote into a vanished directory).
-        if let pp = postprocPath(),
-           (pp as NSString).deletingLastPathComponent
-               == (f.path as NSString).deletingLastPathComponent {
-            let alert = NSAlert()
-            alert.messageText = "This meeting is still processing"
-            alert.informativeText = "Rename it when post-processing finishes."
-            alert.runModal()
-            return
-        }
         let alert = NSAlert()
         alert.messageText = "Rename meeting"
         alert.addButton(withTitle: "Rename")
@@ -2737,11 +2776,6 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     private func beginInlineRename(row: Int) {
         guard row >= 0, row < files.count, inlineEditPath == nil else { return }
         let f = files[row]
-        // Same rule as the context-menu rename: nothing moves under a
-        // running post-process job.
-        if let pp = postprocPath(),
-           (pp as NSString).deletingLastPathComponent
-               == (f.path as NSString).deletingLastPathComponent { return }
         guard let cell = table.view(atColumn: 0, row: row, makeIfNecessary: false)
                 as? NSTableCellView,
               let tf = cell.textField else { return }
@@ -2855,6 +2889,19 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
             }
             return sortAscending ? r : !r
         }
+        // Deferred renames: a title set while the meeting was live or
+        // processing lives only in meta.json until the folder is free.
+        // Apply it once nothing is running (renameMeeting is idempotent
+        // and the comparison keeps this loop free on the 2 s tick).
+        for f in stamped where f.3 == .ended {
+            guard let metaTitle = meetingMeta(f.0)["title"] as? String,
+                  !metaTitle.trimmingCharacters(in: .whitespaces).isEmpty,
+                  let want = expectedBaseName(txtPath: f.0, displayName: metaTitle)
+            else { continue }
+            let base = ((f.0 as NSString).lastPathComponent as NSString).deletingPathExtension
+            if want != base { _ = renameMeeting(txtPath: f.0, displayName: metaTitle) }
+        }
+
         let changed = stamped.map(\.0) != files.map(\.path)
             || stamped.map(\.3) != files.map(\.status)
             || stamped.map { Int(($0.4 ?? 0) / 60) } != files.map { Int(($0.duration ?? 0) / 60) }

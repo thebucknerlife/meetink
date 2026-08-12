@@ -77,6 +77,27 @@ def main() -> int:
     if gains is None:
         log("no (plausible) echo path — plain sum, both streams bit-true")
 
+    # Loudness matching: one static gain per stream (never an AGC — the
+    # pumping lesson) bringing each side's speech level to a common
+    # comfortable target. The user's close mic otherwise dwarfs the
+    # remote side; and a quiet stream is boosted at most 4x so noise
+    # floors don't ride up with it.
+    def stream_gain(x: np.ndarray, target: float = 0.07) -> float:
+        B = RATE // 10
+        nb = len(x) // B
+        if nb < 20:
+            return 1.0
+        r = np.sqrt((x[: nb * B].reshape(nb, B) ** 2).mean(axis=1))
+        act = r[r > 0.01]
+        if len(act) < 10:
+            return 1.0
+        level = float(np.percentile(act, 75))
+        return float(np.clip(target / max(level, 1e-4), 0.25, 4.0))
+
+    mic_gain = stream_gain(mic16)
+    sys_gain = stream_gain(sys16)
+    log(f"level match: mic x{mic_gain:.2f}, sys x{sys_gain:.2f}")
+
     B_hi = args.rate // 20   # the gate's 50 ms blocks at playback rate
     n = max(os.path.getsize(args.mic) // 2, os.path.getsize(args.sys_) // 2)
     CHUNK = args.rate * 10
@@ -95,7 +116,7 @@ def main() -> int:
                 idx = np.minimum((np.arange(take) + pos) // B_hi,
                                  len(gains) - 1)
                 s *= gains[idx]
-            mixed = m + s
+            mixed = m * mic_gain + s * sys_gain
             # Soft headroom instead of a hard clip — summed peaks land
             # in the knee instead of squaring off ("clipping" artifacts).
             over = np.abs(mixed) > 0.85
