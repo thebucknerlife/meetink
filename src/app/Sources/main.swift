@@ -163,6 +163,60 @@ func enrolledProfiles() -> [String] {
         .sorted()
 }
 
+/// Cut [start, start+dur) out of an audio file and return it as a
+/// 16 kHz mono 16-bit WAV — the diarize server's /enroll body format.
+/// Used by the voice-harvest path (segment reassignment = ground truth
+/// about whose voice fills that span).
+func extractWav16k(path: String, start: Double, dur: Double) -> Data? {
+    guard let file = try? AVAudioFile(forReading: URL(fileURLWithPath: path))
+    else { return nil }
+    let sr = file.processingFormat.sampleRate
+    let startFrame = AVAudioFramePosition(start * sr)
+    guard sr > 0, startFrame >= 0, startFrame < file.length else { return nil }
+    let want = AVAudioFrameCount(min(dur * sr,
+                                     Double(file.length - startFrame)))
+    guard want > 0,
+          let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                     frameCapacity: want) else { return nil }
+    file.framePosition = startFrame
+    guard (try? file.read(into: buf, frameCount: want)) != nil,
+          buf.frameLength > 0 else { return nil }
+    guard let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                     sampleRate: 16000, channels: 1,
+                                     interleaved: false),
+          let conv = AVAudioConverter(from: file.processingFormat, to: outFmt),
+          let out = AVAudioPCMBuffer(
+              pcmFormat: outFmt,
+              frameCapacity: AVAudioFrameCount(
+                  Double(buf.frameLength) * 16000 / sr) + 16) else { return nil }
+    var fed = false
+    conv.convert(to: out, error: nil) { _, status in
+        if fed { status.pointee = .noDataNow; return nil }
+        fed = true
+        status.pointee = .haveData
+        return buf
+    }
+    guard out.frameLength > 0, let oc = out.floatChannelData?[0] else { return nil }
+    let n = Int(out.frameLength)
+    var pcm = Data(capacity: n * 2)
+    for i in 0..<n {
+        let v = Int16(max(-1.0, min(1.0, oc[i])) * 32767)
+        withUnsafeBytes(of: v.littleEndian) { pcm.append(contentsOf: $0) }
+    }
+    var d = Data()
+    func u32(_ x: UInt32) { withUnsafeBytes(of: x.littleEndian) { d.append(contentsOf: $0) } }
+    func u16(_ x: UInt16) { withUnsafeBytes(of: x.littleEndian) { d.append(contentsOf: $0) } }
+    d.append("RIFF".data(using: .ascii)!)
+    u32(UInt32(36 + pcm.count))
+    d.append("WAVE".data(using: .ascii)!)
+    d.append("fmt ".data(using: .ascii)!)
+    u32(16); u16(1); u16(1); u32(16000); u32(32000); u16(2); u16(16)
+    d.append("data".data(using: .ascii)!)
+    u32(UInt32(pcm.count))
+    d.append(pcm)
+    return d
+}
+
 // MARK: - Profile ↔ email links
 //
 // Calendar attendees are emails; voice profiles are names. One shared
@@ -2231,6 +2285,69 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             }
         }
         writeTranscriptLines(all)
+        // A manual correction is ground truth about whose voice fills
+        // those spans — feed it back into the voice profile so the next
+        // meeting gets it right without help (field ask: separating the
+        // Judd/Allen collisions should TRAIN both profiles).
+        harvestVoice(lines: valid, to: name)
+    }
+
+    /// Enroll the reassigned segments' audio into `name`'s voice profile:
+    /// spans from timing.json, audio from the kept stems (sys for remote
+    /// voices, mic when the target is the user themself), longest-first,
+    /// capped. Best-effort and silent — the server's outlier gate drops
+    /// anything that doesn't cohere, and the Profiles page's "Samples
+    /// updated" column shows the result.
+    private func harvestVoice(lines: [Int], to name: String) {
+        let base = (lastResolvedPath as NSString).deletingPathExtension
+        let meName = (configValue("me_name") ?? "").uppercased()
+        let isSelf = !meName.isEmpty && name.uppercased() == meName
+        let stem = base + (isSelf ? ".mic.wav" : ".sys.wav")
+        guard FileManager.default.fileExists(atPath: stem),
+              let data = FileManager.default.contents(atPath: base + ".timing.json"),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tl = obj["lines"] as? [[String: Any]] else { return }
+        var spans: [(start: Double, dur: Double)] = []
+        for line in lines where line < tl.count {
+            guard let words = tl[line]["words"] as? [[String: Any]],
+                  let s0 = words.first?["s"] as? Double,
+                  let e1 = words.last?["e"] as? Double,
+                  e1 - s0 >= 3.5 else { continue }
+            spans.append((s0, min(e1 - s0, 12)))
+        }
+        spans.sort { $0.dur > $1.dur }
+        let picks = Array(spans.prefix(8))
+        guard !picks.isEmpty else { return }
+        // Enroll under the canonical profile casing; a brand-new name
+        // gets Title Case rather than the transcript's ALL-CAPS label.
+        let low = name.lowercased()
+        let enrollName = enrolledProfiles().first { $0.lowercased() == low }
+            ?? (name == name.uppercased() ? name.capitalized : name)
+        DispatchQueue.global(qos: .utility).async {
+            var enrolled = 0
+            for p in picks {
+                guard let wav = extractWav16k(path: stem, start: p.start,
+                                              dur: p.dur) else { continue }
+                let enc = enrollName.addingPercentEncoding(
+                    withAllowedCharacters: .urlQueryAllowed) ?? enrollName
+                guard let url = URL(string:
+                    "http://127.0.0.1:8179/enroll?name=\(enc)") else { continue }
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.httpBody = wav
+                req.timeoutInterval = 20
+                let sem = DispatchSemaphore(value: 0)
+                URLSession.shared.dataTask(with: req) { d, _, _ in
+                    if let d,
+                       let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                       (o["ok"] as? Bool) == true { enrolled += 1 }
+                    sem.signal()
+                }.resume()
+                sem.wait()
+            }
+            NSLog("meetink: voice harvest → %@ (%d/%d segments enrolled)",
+                  enrollName, enrolled, picks.count)
+        }
     }
 
     private func deleteLines(_ lines: [Int]) {
