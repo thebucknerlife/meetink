@@ -208,6 +208,30 @@ enhance_enabled() {
     [[ "$v" != "off" && "$v" != "false" ]]
 }
 
+# Conservative denoise on the MIC stream only (AC hum, birds, distant
+# traffic — stationary ambience is DFN's sweet spot). Attenuation is
+# capped so voices stay natural (the "tinny" scars); sys is NEVER
+# touched. denoise=off in config disables. Prints the path to use.
+_denoise_mic() {
+    local in="$1" rate="$2" td="$3"
+    local dfn="$MK_HOME/enhance-venv/bin/deepFilter"
+    local v=$(grep '^denoise=' "$MK_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+    if [[ "$v" == "off" || "$v" == "false" || ! -x "$dfn" || ! -s "$in" ]]; then
+        print -- "$in"; return 0
+    fi
+    print -- "mixing audio — denoising mic (capped DeepFilterNet) (step 3/3)" \
+        > /tmp/meetink-postproc.state 2>/dev/null
+    if ffmpeg -v error -y -f s16le -ar $rate -ac 1 -i "$in" "$td/dn-in.wav" 2>>/tmp/meetink-refine.log \
+        && "$dfn" "$td/dn-in.wav" -o "$td" --atten-lim 12 >>/tmp/meetink-refine.log 2>&1 \
+        && [[ -f "$td/dn-in_DeepFilterNet3.wav" ]] \
+        && ffmpeg -v error -y -i "$td/dn-in_DeepFilterNet3.wav" -f s16le -ar $rate -ac 1 \
+               "$td/dn-mic.raw" 2>>/tmp/meetink-refine.log; then
+        print -- "$td/dn-mic.raw"
+    else
+        print -- "$in"   # denoise is best-effort, never blocks the mix
+    fi
+}
+
 # Mix two raw spools into a listenable m4a: enhance (best-effort), then
 # cross-duck so whoever is speaking is heard from their clean stream.
 #   $1 = mic.raw  $2 = sys.raw  $3 = out.m4a
@@ -235,80 +259,38 @@ _mix_enhanced_m4a() {
     # layered mix doubled somebody (the entire v2-v9 saga); the user's
     # verdict on the raw mic spool: "the best version". mix_mode=auto
     # (default) detects it; =mic / =split force either path.
+    # Unified renderer: per-window speakers/headphones detection with
+    # crossfades — the user takes headphones on and off mid-call, and a
+    # whole-meeting mode choice mistreats one half. Uniform meetings
+    # render identically to the previous single-mode paths (speakers →
+    # mic-only, headphones → level-matched guarded sum). The mic gets a
+    # capped conservative denoise first (AC/birds/traffic; sys never
+    # touched). mix_mode=mic|split forces a single mode; =neural routes
+    # to the DTLN experiment below.
     local mix_mode=$(grep '^mix_mode=' "$MK_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
-    local mic_only=0
-    if [[ "$mix_mode" == "mic" ]]; then
-        mic_only=1
-    elif [[ "$mix_mode" != "split" && -s "$mic" && -s "$sys" \
-            && -x "$MK_PARAKEET_VENV/bin/python" ]]; then
-        mic_only=$("$MK_PARAKEET_VENV/bin/python" - "$mic" "$sys" <<'PYEOF7' 2>/dev/null || print 0
-import sys as _s
-import numpy as np
-mic = np.fromfile(_s.argv[1], dtype=np.int16).astype(np.float32) / 32768.0
-sy = np.fromfile(_s.argv[2], dtype=np.int16).astype(np.float32) / 32768.0
-n = min(len(mic), len(sy))
-B = 1600  # 100 ms at 16 kHz
-nb = n // B
-if nb < 50:
-    print(0); raise SystemExit
-m = np.sqrt((mic[:nb*B].reshape(nb, B)**2).mean(axis=1))
-s = np.sqrt((sy[:nb*B].reshape(nb, B)**2).mean(axis=1))
-# Volume-adaptive loudness floor — a fixed 0.05 missed a quiet-playback
-# speakers meeting, it got MIXED, and the mix re-added echo + pumping
-# to two individually clean streams (field case). Half the 75th
-# percentile of sys's non-silent blocks, never below 0.01.
-act = s[s > 0.001]
-floor = max(0.01, float(np.percentile(act, 75)) * 0.5) if len(act) > 50 else 0.05
-loud = s > floor
-# Speakers: the mic tracks the system audio at a substantial fraction
-# (measured 1.03 quiet-playback, 0.57 normal). Headphone leak: 0.004.
-print(1 if loud.sum() > 20 and float(np.median(m[loud] / s[loud])) > 0.15 else 0)
-PYEOF7
-)
-    fi
-    if (( mic_only )) && [[ -s "$mic" ]]; then
-        local monly="$mic" mar=16000
-        (( have48 )) && { monly="$mic48"; mar=48000; }
-        local mrc=0
-        # loudnorm: quiet meetings come up, loud ones come down to a
-        # comfortable ceiling (ear-safety request) — single stream, so a
-        # broadcast normalizer is safe here (no cross-stream pumping).
-        ffmpeg -v error -y -f s16le -ar $mar -ac 1 -i "$monly" \
-            -af loudnorm=I=-18:TP=-1.5 \
-            -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || mrc=$?
-        print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=mic-only" \
-            >> "$MK_HOME/perf.log" 2>/dev/null || true
-        (( mrc == 0 )) && print -P "${C[dim]}  (speakers-mode meeting — mic stream is the mix)${C[reset]}"
-        return $mrc
-    fi
-
-    # Headphone mix: the streams are already the clean separation (no
-    # bleed in the mic), so the mix is raw mic + sys with ONLY the
-    # targeted residual-echo gate for the user's remote echo. The heavy
-    # neural path ran on an AirPods field test and manufactured every
-    # artifact it existed to prevent (mask-transfer "glass jar" on a
-    # clean voice, span-duck pumping, hard-clip distortion) — with no
-    # bleed there is nothing for it to do. DTLN (neural_mix.py) stays
-    # available behind mix_mode=neural for future bleed-y edge cases.
-    if [[ -x "$MK_PARAKEET_VENV/bin/python" && -s "$mic" && -s "$sys" \
+    if [[ -x "$MK_PARAKEET_VENV/bin/python" && -s "$mic" \
           && "$mix_mode" != "neural" ]]; then
-        local nmic="$mic" nsys="$sys" nar=16000
-        (( have48 )) && { nmic="$mic48"; nsys="$sys48"; nar=48000; }
-        local nd=$(mktemp -d -t meetink-hmix)
-        if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/headphone_mix.py" \
+        local pmic="$mic" psys="$sys" par=16000
+        (( have48 )) && { pmic="$mic48"; psys="$sys48"; par=48000; }
+        local pd=$(mktemp -d -t meetink-pmix)
+        local dmic=$(_denoise_mic "$pmic" $par "$pd")
+        local -a fm=()
+        [[ "$mix_mode" == "mic" || "$mix_mode" == "split" ]] && fm=(--force-mode "$mix_mode")
+        if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/playback_mix.py" \
                 --mic16 "$mic" --sys16 "$sys" \
-                --mic "$nmic" --sys "$nsys" --rate $nar \
-                --out "$nd/mixed.raw" 2>>/tmp/meetink-refine.log; then
-            local nrc=0
-            ffmpeg -v error -y -f s16le -ar $nar -ac 1 -i "$nd/mixed.raw" \
-                -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || nrc=$?
-            rm -rf "$nd"
-            print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=headphone" \
+                --mic "$dmic" --sys "$psys" --rate $par \
+                "${fm[@]}" \
+                --out "$pd/mixed.raw" 2>>/tmp/meetink-refine.log; then
+            local prc=0
+            ffmpeg -v error -y -f s16le -ar $par -ac 1 -i "$pd/mixed.raw" \
+                -c:a aac -b:a 96k "$out" 2>>/tmp/meetink-refine.log || prc=$?
+            rm -rf "$pd"
+            print -- "$(date '+%Y-%m-%d %H:%M:%S')  kind=mix name=${${out:t}:r} total_s=$((SECONDS - _mix_t0)) mode=playback" \
                 >> "$MK_HOME/perf.log" 2>/dev/null || true
-            return $nrc
+            return $prc
         fi
-        rm -rf "$nd"
-        print -P "${C[dim]}  (headphone mix bailed — fallback)${C[reset]}"
+        rm -rf "$pd"
+        print -P "${C[dim]}  (playback mix bailed — fallback)${C[reset]}"
     fi
 
     # DTLN neural mix — opt-in via mix_mode=neural (see headphone mix
