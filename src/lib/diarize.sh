@@ -1557,6 +1557,34 @@ profile_merge() {
 
 # /profile dispatch. Direct $2/$3 indexing to avoid shift-with-no-args
 # crashing under bin/meetink's set -e.
+# Drop pollution from a profile: orphan voice clusters (a minority
+# centroid far from the profile's other centroids = another person
+# folded in) plus stray samples matching no centroid. See the server's
+# /profiles/<name>/prune for the exact rules.
+profile_prune() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        print -P "${C[red]}usage:${C[reset]} /profile prune <name>"
+        return 1
+    fi
+    diarize_running || { print -P "${C[red]}error:${C[reset]} diarize-server not running"; return 1; }
+    local resp=$(curl -s -X POST \
+        "http://127.0.0.1:$MK_DIARIZE_PORT/profiles/$(_mk_urlq "$name")/prune")
+    if ! _resp_ok "$resp"; then
+        print -P "${C[red]}error:${C[reset]} $resp"
+        return 1
+    fi
+    local removed=$(print -- "$resp" | sed -nE 's/.*"removed":[[:space:]]*([0-9]+).*/\1/p')
+    if [[ "$removed" == "0" ]]; then
+        print -P "${C[green]}✓${C[reset]} ${C[bold]}$name${C[reset]} is clean ${C[dim]}(nothing to prune)${C[reset]}"
+    else
+        local left=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
+        local tb=$(print -- "$resp" | sed -nE 's/.*"tightness_before":[[:space:]]*([0-9.]+).*/\1/p')
+        local ta=$(print -- "$resp" | sed -nE 's/.*"tightness_after":[[:space:]]*([0-9.]+).*/\1/p')
+        print -P "${C[green]}✓${C[reset]} Pruned ${C[bold]}$name${C[reset]}: ${C[red]}-${removed}${C[reset]} polluted samples ${C[dim]}(${left} kept, tightness ${tb} → ${ta})${C[reset]}"
+    fi
+}
+
 cmd_profile() {
     local sub="$1"
     case "$sub" in
@@ -1572,6 +1600,7 @@ cmd_profile() {
             ;;
         rm-all|reset-all|nuke)  profile_rm_all                ;;
         diagnose|diag|inspect|why) profile_diagnose "$2"      ;;
+        prune)                 profile_prune   "$2"      ;;
         clusters|cluster)      profile_clusters          ;;
         assign)                profile_assign  "$2" "$3" ;;
         rename)                profile_rename  "$2" "$3" ;;
@@ -1588,6 +1617,7 @@ cmd_profile() {
             print -P "  ${C[dim]}/profile rm <name>${C[reset]}               delete a profile"
             print -P "  ${C[dim]}/profile rm all${C[reset]}                  delete every profile (asks to confirm)"
             print -P "  ${C[dim]}/profile diagnose <name>${C[reset]}         full diagnostic dump (tightness, cross-matches, auto-train)"
+            print -P "  ${C[dim]}/profile prune <name>${C[reset]}            drop polluted samples (orphan voice clusters + strays)"
             print -P "  ${C[dim]}/profile clusters${C[reset]}                show active speaker clusters"
             print -P "  ${C[dim]}/profile assign <number> <name>${C[reset]}  cluster → profile + rewrite transcript"
             print -P "  ${C[dim]}/profile merge <from> <into>${C[reset]}     fold one cluster into another"

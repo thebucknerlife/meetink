@@ -322,6 +322,14 @@ session_whitelist: "list[str] | None" = None
 # threshold). Cleared on /start.
 session_confirmed: "set[str]" = set()
 
+# Borderline-label hysteresis: a match scoring just above threshold gets
+# labeled only when the PREVIOUS window (within the window cadence)
+# matched the same name — one-off grazes of a profile stay Speaker N
+# instead of stamping a wrong name on a single line. Confident scores
+# and user-confirmed (session_confirmed) names label immediately.
+BORDERLINE_BAND = float(os.environ.get("MEETINK_DIARIZE_BORDER_BAND", "0.07"))
+_borderline_pending: dict = {"name": None, "ts": 0.0}
+
 
 # --- Recent embedding ring -------------------------------------------------
 #
@@ -1421,6 +1429,8 @@ def session_clear() -> None:
     _next_cluster_idx = 0
     cluster_aliases.clear()
     session_confirmed.clear()
+    _borderline_pending["name"] = None
+    _borderline_pending["ts"] = 0.0
     _last_cluster_letter = None
     _last_cluster_ts = 0.0
     # Auto-train log is a per-session counter; resetting it on /start
@@ -1626,6 +1636,29 @@ class Handler(BaseHTTPRequestHandler):
                 _push_recent_embedding(emb)
                 result = identify(emb)
                 resp = dict(result)
+                # Borderline hysteresis (see _borderline_pending). Skips
+                # session-confirmed names — the user vouched for them.
+                if resp["speaker"] is not None \
+                        and resp["speaker"] not in session_confirmed \
+                        and (resp.get("confidence") or 0.0) \
+                            < settings["threshold"] + BORDERLINE_BAND:
+                    now_ts = time.time()
+                    same_recent = (
+                        _borderline_pending["name"] == resp["speaker"]
+                        and now_ts - _borderline_pending["ts"] <= 45.0
+                    )
+                    _borderline_pending["name"] = resp["speaker"]
+                    _borderline_pending["ts"] = now_ts
+                    if not same_recent:
+                        print(
+                            f"identify defer: {resp['speaker']}@"
+                            f"{resp.get('confidence')} borderline — needs a "
+                            f"second consecutive window",
+                            file=sys.stderr,
+                        )
+                        resp["deferred"] = resp["speaker"]
+                        resp["speaker"] = None
+                        resp["reason"] = "borderline_pending"
                 if resp["speaker"] is None:
                     # No profile match — assign to a cluster so the live
                     # transcript still distinguishes voices.
@@ -2224,6 +2257,78 @@ class Handler(BaseHTTPRequestHandler):
                     "samples": count,
                     "merged": merged_into_existing,
                     "rejected": rejected,
+                })
+                return
+            if url.path.startswith("/profiles/") and url.path.endswith("/prune"):
+                # Profile hygiene: drop pollution that accumulated via
+                # folds and auto-train. Two passes, then re-cluster:
+                #   1. ORPHAN CENTROIDS — a centroid whose best sim to
+                #      the profile's other centroids is under
+                #      ?cluster_floor (default 0.55) while holding a
+                #      MINORITY of the samples is another person folded
+                #      in (same-voice modes sit closer than that;
+                #      different people sit ~0.4-0.5 in titanet space).
+                #   2. STRAY SAMPLES — anything scoring under
+                #      ?sample_floor (default 0.45) against every
+                #      centroid.
+                name = unquote(
+                    url.path[len("/profiles/"):-len("/prune")]).strip()
+                if name not in profiles:
+                    self._json(404, {"error": f"no profile named {name}"})
+                    return
+                qs = parse_qs(url.query)
+                cluster_floor = float(qs.get("cluster_floor", ["0.55"])[0])
+                sample_floor = float(qs.get("sample_floor", ["0.45"])[0])
+                p = profiles[name]
+                before_n = int(p["samples"].shape[0])
+                before_tight = round(_profile_tightness(p), 3)
+                keep = np.ones(before_n, dtype=bool)
+                cents = p["centroids"]
+                cids = p["cluster_ids"]
+                if cents.shape[0] > 1:
+                    cross = cents @ cents.T
+                    np.fill_diagonal(cross, -1.0)
+                    counts = np.bincount(cids, minlength=cents.shape[0])
+                    for ci in range(cents.shape[0]):
+                        if float(np.max(cross[ci])) < cluster_floor \
+                                and counts[ci] < counts.max():
+                            keep &= cids != ci
+                sims = p["samples"] @ cents.T
+                keep &= np.max(sims, axis=1) >= sample_floor
+                removed = before_n - int(keep.sum())
+                if removed == 0:
+                    self._json(200, {
+                        "ok": True, "name": name, "removed": 0,
+                        "samples": before_n, "tightness": before_tight,
+                    })
+                    return
+                if not keep.any():
+                    self._json(400, {"error": "prune would empty the "
+                                     "profile — delete it instead"})
+                    return
+                new_samples = p["samples"][keep].copy()
+                new_ts = p["timestamps"][keep].copy()
+                centroids, cluster_ids, new_samples = _rebuild_profile(
+                    new_samples, new_ts)
+                profiles[name] = {
+                    "centroids": centroids,
+                    "samples": new_samples,
+                    "cluster_ids": cluster_ids,
+                    "timestamps": new_ts,
+                }
+                _save(name)
+                after_tight = round(_profile_tightness(profiles[name]), 3)
+                print(
+                    f"pruned: {name} -{removed} samples "
+                    f"({before_n} → {int(keep.sum())}), tightness "
+                    f"{before_tight} → {after_tight}",
+                    file=sys.stderr,
+                )
+                self._json(200, {
+                    "ok": True, "name": name, "removed": removed,
+                    "samples": int(keep.sum()),
+                    "tightness_before": before_tight,
+                    "tightness_after": after_tight,
                 })
                 return
             if url.path.startswith("/profiles/") and url.path.endswith("/pop"):
