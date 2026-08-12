@@ -1702,7 +1702,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 add("Download Audio…", #selector(downloadAudio))
             }
             menu.addItem(.separator())
-            add("Relabel Speakers (fast)", #selector(relabelSpeakers))
+            add("Relabel Speakers (fast)…", #selector(relabelSpeakers))
             // Reprocess needs SOURCE audio, which is the m4a or the kept
             // stems — the stems can exist without the m4a when the stop
             // pipeline died before the archive step (field incident:
@@ -1711,7 +1711,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             let hasStems = FileManager.default.fileExists(atPath: stemBase + ".mic.wav")
                 || FileManager.default.fileExists(atPath: stemBase + ".sys.wav")
             if audioPath != nil || hasStems {
-                add(reprocessRunning ? "Reprocessing…" : "Reprocess",
+                add(reprocessRunning ? "Reprocessing…" : "Reprocess…",
                     #selector(reprocess))
                 menu.items.last?.isEnabled = !reprocessRunning
                 menu.items.last?.toolTip = "Re-run transcription, diarization "
@@ -1892,6 +1892,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// reprocess's many. The transcript reloads via the file watcher.
     @objc private func relabelSpeakers() {
         guard let launcher = launcherPath(), !lastResolvedPath.isEmpty else { return }
+        let confirm = NSAlert()
+        confirm.messageText = "Relabel speakers?"
+        confirm.informativeText = "Re-runs speaker identification on this "
+            + "meeting using the current voice profiles. The text stays "
+            + "unchanged; labels may move."
+        confirm.addButton(withTitle: "Continue")
+        confirm.addButton(withTitle: "Cancel")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launcher)
         proc.arguments = ["relabel", lastResolvedPath]
@@ -1908,6 +1916,15 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func reprocess() {
         guard let launcher = launcherPath(), !lastResolvedPath.isEmpty,
               !reprocessRunning else { return }
+        let confirm = NSAlert()
+        confirm.messageText = "Reprocess this meeting?"
+        confirm.informativeText = "Re-runs transcription, speaker "
+            + "identification and the audio mix from the kept audio. "
+            + "Takes a few minutes; manual segment edits are replaced "
+            + "(the previous transcript is kept alongside)."
+        confirm.addButton(withTitle: "Continue")
+        confirm.addButton(withTitle: "Cancel")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
         let path = lastResolvedPath
         // DETACHED, no pipes: the old Process+Pipe setup made the
         // reprocess a dependent of the app — relaunching the app closed
@@ -2114,17 +2131,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func menuReassignSegment(_ sender: NSMenuItem) {
         guard let info = sender.representedObject as? [String: Int],
               let line = info["line"], line < snapshot.lines.count else { return }
-        promptReassign(lines: [line], preview: snapshot.lines[line].text)
+        promptReassign(lines: [line], anchorRange: lineRanges[line])
     }
 
     @objc private func menuReassignSelection(_ sender: NSMenuItem) {
         guard let lines = sender.representedObject as? [Int],
               !lines.isEmpty else { return }
-        let previews = lines.prefix(2).compactMap {
-            $0 < snapshot.lines.count
-                ? String(snapshot.lines[$0].text.prefix(50)) : nil
-        }
-        promptReassign(lines: lines, preview: previews.joined(separator: " … "))
+        promptReassign(lines: lines, anchorRange: textView.selectedRange())
     }
 
     @objc private func menuDeleteSelection(_ sender: NSMenuItem) {
@@ -2143,37 +2156,48 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
     /// One name prompt → relabel every line in `lines`. Shared by the
     /// single-segment menu, the multi-segment selection, and the
-    /// post-split hand-off.
-    private func promptReassign(lines: [Int], preview: String) {
-        let alert = NSAlert()
-        alert.messageText = lines.count == 1
-            ? "Reassign this segment"
-            : "Reassign \(lines.count) segments"
-        alert.informativeText = String(preview.prefix(120))
-        alert.addButton(withTitle: "Reassign")
-        alert.addButton(withTitle: "Cancel")
-        let combo = NSComboBox(frame: NSRect(x: 0, y: 0, width: 220, height: 25))
-        // Suggest enrolled profiles PLUS this meeting's named speakers —
-        // a just-assigned guest ("ALLEN") may have no profile yet but is
-        // exactly who segments get reassigned to (field report).
-        var suggestions = enrolledProfiles()
-        let known = Set(suggestions.map { $0.lowercased() })
-        for sp in speakers.map(\.name)
-        where sp != "THEM" && sp != "ME" && !sp.hasPrefix("Speaker ")
-            && !known.contains(sp.lowercased()) {
-            suggestions.append(sp)
+    /// post-split hand-off. Same popover as the speakers sidebar —
+    /// meeting names first (↓ + Enter), profile-suggesting field below —
+    /// anchored at the segment/selection instead of a modal window.
+    private func promptReassign(lines: [Int], anchorRange: NSRange?) {
+        assignPopover?.close()
+        let named = speakers.map(\.name).filter {
+            $0 != "THEM" && $0 != "ME" && !$0.hasPrefix("Speaker ")
         }
-        combo.addItems(withObjectValues: suggestions)
-        combo.placeholderString = "Name"
-        combo.completes = true
-        combo.numberOfVisibleItems = 16
-        combo.delegate = ComboAutoOpen.shared
-        alert.accessoryView = combo
-        alert.window.initialFirstResponder = combo
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let name = combo.stringValue.trimmingCharacters(in: .whitespaces).uppercased()
-        guard !name.isEmpty, !name.contains("/"), !name.hasPrefix(".") else { return }
-        reassignLines(lines, to: name)
+        let pop = NSPopover()
+        pop.behavior = .transient
+        let vc = AssignPopoverVC(
+            header: lines.count == 1
+                ? "Reassign this segment to…"
+                : "Reassign \(lines.count) segments to…",
+            assignTitle: "Reassign",
+            inMeeting: named,
+            onAssign: { [weak self] name in
+                self?.assignPopover?.close()
+                self?.assignPopover = nil
+                let up = name.trimmingCharacters(in: .whitespaces).uppercased()
+                guard !up.isEmpty, !up.contains("/"),
+                      !up.hasPrefix(".") else { return }
+                self?.reassignLines(lines, to: up)
+            },
+            onClose: { [weak self] in
+                self?.assignPopover?.close()
+                self?.assignPopover = nil
+            })
+        pop.contentViewController = vc
+        assignPopover = pop
+        var rect = NSRect(x: 8, y: 8, width: 1, height: 1)
+        if let r = anchorRange, let lm = textView.layoutManager,
+           let tc = textView.textContainer {
+            let g = lm.glyphRange(forCharacterRange: r,
+                                  actualCharacterRange: nil)
+            var br = lm.boundingRect(forGlyphRange: g, in: tc)
+            br.origin.x += textView.textContainerInset.width
+            br.origin.y += textView.textContainerInset.height
+            if br.width > 0, br.height > 0 { rect = br }
+        }
+        pop.show(relativeTo: rect, of: textView, preferredEdge: .maxY)
+        vc.view.window?.makeFirstResponder(vc.keyView)
     }
 
     /// Bulk timing mutation in ONE read-modify-write — per-line splices
@@ -2241,7 +2265,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         if splitSegment(line, atChar: ch - range.location),
            line + 1 < snapshot.lines.count {
             promptReassign(lines: [line + 1],
-                           preview: snapshot.lines[line + 1].text)
+                           anchorRange: lineRanges[line + 1])
         }
     }
 
