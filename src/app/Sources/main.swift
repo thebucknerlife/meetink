@@ -180,6 +180,15 @@ func profileEmailMap() -> [String: String] {
     return obj
 }
 
+func removeProfileEmail(_ email: String) {
+    var map = profileEmailMap()
+    map.removeValue(forKey: email.lowercased())
+    if let data = try? JSONSerialization.data(withJSONObject: map,
+                                              options: [.sortedKeys]) {
+        try? data.write(to: URL(fileURLWithPath: profileEmailMapPath()))
+    }
+}
+
 func setProfileEmail(_ email: String, profile: String) {
     var map = profileEmailMap()
     // Canonical profile casing — "ed" links as "Ed" (the same
@@ -1147,9 +1156,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let titleSpacer = NSView()
         titleSpacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1),
                                               for: .horizontal)
-        let titleRow = NSStackView(views: [titleField, titleSpacer, eventButton])
+        let titleRow = NSStackView(views: [titleField, titleSpacer,
+                                           eventButton, copyButton, menuButton])
         titleRow.orientation = .horizontal
         titleRow.spacing = 8
+        // Long titles truncate with "…" instead of shoving the buttons:
+        // the title compresses first (the event button's width varies
+        // with the linked meeting's name and keeps its own ≤220 cap).
         titleField.setContentCompressionResistancePriority(
             NSLayoutConstraint.Priority(740), for: .horizontal)
 
@@ -1193,8 +1206,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         strip.addArrangedSubview(statusDot)
         strip.addArrangedSubview(headerField)
         strip.addArrangedSubview(NSView())
-        strip.addArrangedSubview(copyButton)
-        strip.addArrangedSubview(menuButton)
 
         let divider = NSBox()
         divider.boxType = .separator
@@ -4038,7 +4049,16 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
     private let table = NSTableView()
     private let meetingsTable = NSTableView()
     private let detail = NSTextField(wrappingLabelWithString: "")
-    private var profiles: [(name: String, samples: Int)] = []
+    private struct ProfileRow {
+        let name: String
+        let samples: Int
+        let created: Double
+        let updated: Double
+        let samplesUpdated: Double
+    }
+    private var profiles: [ProfileRow] = []
+    private var sortKey = "name"
+    private var sortAscending = true
     private var meetings: [(name: String, path: String)] = []   // for the selected profile
     private let hiddenBox = NSButton(
         checkboxWithTitle: "Hidden (not counted as a participant)", target: nil, action: nil)
@@ -4047,15 +4067,30 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
     /// profile is who you think it is.
     var onListen: ((String, String) -> Void)?
     private var selectedProfile: String? = nil
+    /// Canonical (as-enrolled) name of the selection — email links store
+    /// this casing, selectedProfile stores the UPPERCASED label form.
+    private var selectedCanonical: String? = nil
+    private let emailsLabel = NSTextField(wrappingLabelWithString: "")
+    private let addEmailBtn = NSButton(title: "Add Email…", target: nil, action: nil)
+    private let removeEmailBtn = NSButton(title: "Remove Email…", target: nil, action: nil)
 
     override func loadView() {
         let root = NSView()
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
         scroll.translatesAutoresizingMaskIntoConstraints = false
-        let nameCol = NSTableColumn(identifier: .init("name")); nameCol.title = "Profile"; nameCol.width = 220
-        let sampCol = NSTableColumn(identifier: .init("samples")); sampCol.title = "Voice samples"; sampCol.width = 120
-        table.addTableColumn(nameCol); table.addTableColumn(sampCol)
+        func col(_ id: String, _ title: String, _ width: CGFloat) -> NSTableColumn {
+            let c = NSTableColumn(identifier: .init(id))
+            c.title = title
+            c.width = width
+            c.sortDescriptorPrototype = NSSortDescriptor(key: id, ascending: true)
+            return c
+        }
+        table.addTableColumn(col("name", "Profile", 170))
+        table.addTableColumn(col("samples", "Samples", 70))
+        table.addTableColumn(col("created", "Created", 110))
+        table.addTableColumn(col("updated", "Updated", 110))
+        table.addTableColumn(col("samples_updated", "Samples updated", 120))
         table.dataSource = self; table.delegate = self
         table.usesAlternatingRowBackgroundColors = true
         let menu = NSMenu()
@@ -4091,9 +4126,33 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         hiddenBox.toolTip = "Hidden speakers collapse in the transcript sidebar "
             + "and don't count toward talk share (e.g. the Zoom announcer)"
         hiddenBox.translatesAutoresizingMaskIntoConstraints = false
+        emailsLabel.font = NSFont.systemFont(ofSize: 11)
+        emailsLabel.textColor = .secondaryLabelColor
+        addEmailBtn.bezelStyle = .rounded
+        addEmailBtn.controlSize = .small
+        addEmailBtn.font = NSFont.systemFont(ofSize: 10)
+        addEmailBtn.target = self
+        addEmailBtn.action = #selector(addEmail)
+        removeEmailBtn.bezelStyle = .rounded
+        removeEmailBtn.controlSize = .small
+        removeEmailBtn.font = NSFont.systemFont(ofSize: 10)
+        removeEmailBtn.target = self
+        removeEmailBtn.action = #selector(removeEmail)
+        let emailsRow = NSStackView(views: [emailsLabel, addEmailBtn, removeEmailBtn])
+        emailsRow.orientation = .horizontal
+        emailsRow.spacing = 6
+        emailsRow.alignment = .firstBaseline
+        emailsRow.translatesAutoresizingMaskIntoConstraints = false
+        emailsLabel.setContentHuggingPriority(NSLayoutConstraint.Priority(1),
+                                              for: .horizontal)
+        emailsRow.isHidden = true
         root.addSubview(scroll); root.addSubview(meetScroll)
-        root.addSubview(hiddenBox); root.addSubview(detail)
+        root.addSubview(hiddenBox); root.addSubview(emailsRow)
+        root.addSubview(detail)
         NSLayoutConstraint.activate([
+            emailsRow.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            emailsRow.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -12),
+            emailsRow.bottomAnchor.constraint(equalTo: detail.topAnchor, constant: -6),
             scroll.topAnchor.constraint(equalTo: root.topAnchor),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -4103,7 +4162,7 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
             meetScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             meetScroll.bottomAnchor.constraint(equalTo: hiddenBox.topAnchor, constant: -8),
             hiddenBox.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
-            hiddenBox.bottomAnchor.constraint(equalTo: detail.topAnchor, constant: -6),
+            hiddenBox.bottomAnchor.constraint(equalTo: emailsRow.topAnchor, constant: -6),
             detail.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
             detail.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
             detail.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
@@ -4118,21 +4177,51 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         var req = URLRequest(url: URL(string: "http://127.0.0.1:8179/profiles")!)
         req.timeoutInterval = 3
         URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            var out: [(String, Int)] = []
+            var out: [ProfileRow] = []
             if let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let arr = obj["profiles"] as? [[String: Any]] {
                 out = arr.compactMap { p in
                     guard let n = p["name"] as? String else { return nil }
-                    return (n, (p["samples"] as? Int) ?? 0)
+                    return ProfileRow(
+                        name: n,
+                        samples: (p["samples"] as? Int) ?? 0,
+                        created: (p["created"] as? Double) ?? 0,
+                        updated: (p["updated"] as? Double) ?? 0,
+                        samplesUpdated: (p["samples_updated"] as? Double) ?? 0)
                 }
             }
             DispatchQueue.main.async {
-                self?.profiles = out.map { (name: $0.0, samples: $0.1) }
-                self?.table.reloadData()
+                self?.profiles = out
+                self?.applySort()
                 self?.detail.stringValue = out.isEmpty
                     ? "No profiles (is the diarize server running?)" : "Select a profile to see recent meetings."
             }
         }.resume()
+    }
+
+    private func applySort() {
+        let asc = sortAscending
+        profiles.sort { a, b in
+            let r: Bool
+            switch sortKey {
+            case "samples":         r = a.samples < b.samples
+            case "created":         r = a.created < b.created
+            case "updated":         r = a.updated < b.updated
+            case "samples_updated": r = a.samplesUpdated < b.samplesUpdated
+            default: r = a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            }
+            return asc ? r : !r
+        }
+        table.reloadData()
+    }
+
+    func tableView(_ tableView: NSTableView,
+                   sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        guard tableView == table,
+              let d = tableView.sortDescriptors.first, let key = d.key else { return }
+        sortKey = key
+        sortAscending = d.ascending
+        applySort()
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -4151,7 +4240,22 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         }
         let id = tableColumn?.identifier.rawValue ?? "name"
         let cell = NSTableCellView()
-        let f = NSTextField(labelWithString: id == "name" ? profiles[row].name : "\(profiles[row].samples)")
+        let p = profiles[row]
+        func dateStr(_ t: Double) -> String {
+            guard t > 0 else { return "—" }
+            let df = DateFormatter()
+            df.dateFormat = "M/d h:mm a"
+            return df.string(from: Date(timeIntervalSince1970: t))
+        }
+        let text: String
+        switch id {
+        case "samples":          text = "\(p.samples)"
+        case "created":          text = dateStr(p.created)
+        case "updated":          text = dateStr(p.updated)
+        case "samples_updated":  text = dateStr(p.samplesUpdated)
+        default:                 text = p.name
+        }
+        let f = NSTextField(labelWithString: text)
         f.translatesAutoresizingMaskIntoConstraints = false
         cell.addSubview(f); cell.textField = f
         NSLayoutConstraint.activate([
@@ -4166,8 +4270,10 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         guard row >= 0, row < profiles.count else { return }
         let name = profiles[row].name.uppercased()
         selectedProfile = name
+        selectedCanonical = profiles[row].name
         hiddenBox.isHidden = false
         hiddenBox.state = hiddenSpeakerNames().contains(name) ? .on : .off
+        refreshEmailsRow()
         DispatchQueue.global().async { [weak self] in
             // Which recent meetings does this voice appear in?
             let dir = transcriptsDir()
@@ -4190,6 +4296,72 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
                     : "Double-click a meeting to open it and play \(name)'s first segment."
             }
         }
+    }
+
+    /// Emails linked to the selected profile (profiles/emails.json —
+    /// the same links the transcript sidebar's Attendees section
+    /// writes). One profile ↔ many emails.
+    private func linkedEmails() -> [String] {
+        guard let canon = selectedCanonical?.lowercased() else { return [] }
+        return profileEmailMap()
+            .filter { $0.value.lowercased() == canon }
+            .keys.sorted()
+    }
+
+    private func refreshEmailsRow() {
+        guard selectedCanonical != nil else { emailsRow_setHidden(true); return }
+        let emails = linkedEmails()
+        emailsLabel.stringValue = emails.isEmpty
+            ? "Emails: none linked (calendar attendees with these emails "
+              + "will match this voice once linked)"
+            : "Emails: " + emails.joined(separator: ", ")
+        removeEmailBtn.isEnabled = !emails.isEmpty
+        emailsRow_setHidden(false)
+    }
+
+    private func emailsRow_setHidden(_ hidden: Bool) {
+        emailsLabel.superview?.isHidden = hidden
+    }
+
+    @objc private func addEmail() {
+        guard let canon = selectedCanonical else { return }
+        let alert = NSAlert()
+        alert.messageText = "Link an email to \(canon)"
+        alert.informativeText = "Calendar events with this attendee will "
+            + "expect \(canon)'s voice."
+        alert.addButton(withTitle: "Link")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.placeholderString = "name@example.com"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let email = field.stringValue.trimmingCharacters(in: .whitespaces).lowercased()
+        guard email.contains("@"), !email.contains(" ") else { return }
+        setProfileEmail(email, profile: canon)
+        refreshEmailsRow()
+    }
+
+    @objc private func removeEmail() {
+        let emails = linkedEmails()
+        guard !emails.isEmpty else { return }
+        let menu = NSMenu()
+        for e in emails {
+            let item = NSMenuItem(title: e, action: #selector(removeEmailPicked(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = e
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil,
+                   at: NSPoint(x: 0, y: removeEmailBtn.bounds.maxY),
+                   in: removeEmailBtn)
+    }
+
+    @objc private func removeEmailPicked(_ sender: NSMenuItem) {
+        guard let email = sender.representedObject as? String else { return }
+        removeProfileEmail(email)
+        refreshEmailsRow()
     }
 
     /// Toggle the selected profile's membership in hidden_speakers —

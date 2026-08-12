@@ -1543,17 +1543,36 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         if path == "/profiles":
+            def _file_times(n: str) -> tuple[float, float]:
+                """(created, updated) from the npz — birthtime survives
+                every in-place rewrite, mtime moves with each _save."""
+                for ext in (".npz", ".npy"):
+                    fp = PROFILES_DIR / f"{n}{ext}"
+                    try:
+                        st = fp.stat()
+                        return (float(getattr(st, "st_birthtime", st.st_mtime)),
+                                float(st.st_mtime))
+                    except OSError:
+                        continue
+                return (0.0, 0.0)
+            def _entry(n: str, p: dict) -> dict:
+                created, updated = _file_times(n)
+                ts = p["timestamps"]
+                return {
+                    "name": n,
+                    "samples": int(p["samples"].shape[0]),
+                    "centroids": int(p["centroids"].shape[0]),
+                    "tightness": round(_profile_tightness(p), 3),
+                    "nearest": _profile_nearest(n, p),
+                    "created": created,
+                    "updated": updated,
+                    # Newest sample's own timestamp — differs from file
+                    # mtime when a rename/prune rewrote the file without
+                    # adding voice data.
+                    "samples_updated": float(ts.max()) if ts.size else 0.0,
+                }
             self._json(200, {
-                "profiles": [
-                    {
-                        "name": n,
-                        "samples": int(p["samples"].shape[0]),
-                        "centroids": int(p["centroids"].shape[0]),
-                        "tightness": round(_profile_tightness(p), 3),
-                        "nearest": _profile_nearest(n, p),
-                    }
-                    for n, p in profiles.items()
-                ]
+                "profiles": [_entry(n, p) for n, p in profiles.items()]
             })
             return
         if path == "/session/sensitivity":
