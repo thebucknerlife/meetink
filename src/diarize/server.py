@@ -1007,8 +1007,17 @@ def identify(emb: np.ndarray) -> dict:
     reason: str | None = None
     close_pair = False
     effective_margin = settings["margin"]
+    top_p = candidates[top_name]
+    # LOOSE profiles claim strangers: max-over-centroids scoring means a
+    # diffuse sample cloud (low tightness — pollution, or 500 samples of
+    # very varied capture conditions) has a wide acceptance radius. Ask
+    # more of it: the threshold rises by the tightness deficit, capped.
+    # Field case: a 500-sample tightness-0.73 profile claimed a brand-new
+    # unenrolled voice; tight profiles (0.78+) are unaffected.
+    tightness_bump = min(0.08, max(0.0, 0.78 - _profile_tightness(top_p)))
+    eff_threshold = settings["threshold"] + tightness_bump
     if len(sims) == 1:
-        accepted = top_sim >= settings["single_profile_floor"]
+        accepted = top_sim >= settings["single_profile_floor"] + tightness_bump
         if not accepted:
             reason = "below_single_floor"
     else:
@@ -1017,14 +1026,13 @@ def identify(emb: np.ndarray) -> dict:
         # close in WeSpeaker space and the standard MARGIN cannot be
         # satisfied — drop to a smaller floor that lets the consistent
         # advantage carry the decision.
-        top_p = candidates[top_name]
         runner_p = candidates[second_name]
         cross_sim = float(np.max(top_p["centroids"] @ runner_p["centroids"].T))
         close_pair = cross_sim >= settings["close_pair_threshold"]
         effective_margin = (
             settings["close_pair_margin"] if close_pair else settings["margin"]
         )
-        if top_sim < settings["threshold"]:
+        if top_sim < eff_threshold:
             accepted = False
             reason = "below_threshold"
         elif (top_sim - second_sim) < effective_margin:
@@ -1034,20 +1042,50 @@ def identify(emb: np.ndarray) -> dict:
             )
         else:
             accepted = True
+    # IMPOSTOR test (whitelist only): the whitelist narrows who can be
+    # NAMED, but every enrolled profile still competes as evidence. If a
+    # profile outside the whitelist matches this voice nearly as well as
+    # the winner, the match is "sounds like several people", not
+    # identity — exactly how a guest gets labeled as someone's loose
+    # near-neighbor. Near-duplicates of the winner (centroid cross-sim
+    # >= close_pair_threshold) don't count as impostors.
+    if accepted and session_whitelist is not None:
+        best_imp = -1.0
+        best_imp_name = None
+        for iname, ip in profiles.items():
+            if iname in candidates or ip["samples"].shape[0] < 3:
+                continue
+            cross = float(np.max(top_p["centroids"] @ ip["centroids"].T))
+            if cross >= settings["close_pair_threshold"]:
+                continue
+            s_imp = float(np.max(ip["centroids"] @ emb_l2))
+            if s_imp > best_imp:
+                best_imp, best_imp_name = s_imp, iname
+        if best_imp_name is not None                 and (top_sim - best_imp) < settings["margin"]:
+            accepted = False
+            reason = "impostor"
+            print(
+                f"identify reject: {top_name}@{top_sim:.3f} vs impostor "
+                f"{best_imp_name}@{best_imp:.3f} gap="
+                f"{top_sim - best_imp:.3f} < margin={settings['margin']}",
+                file=sys.stderr,
+            )
     # CONFIRMED-PRESENT rescue: the user assigned this profile during
     # THIS meeting, so the person is definitely in the room — a strong
     # prior the plain gates don't know about. Retry the failed gate with
     # a relaxed threshold (bounded) and half the margin. This is what
     # keeps a mid-call assignment from immediately minting fresh
     # "Speaker N" letters for the same voice.
-    if not accepted and top_name in session_confirmed:
+    if not accepted and reason != "impostor" \
+            and top_name in session_confirmed:
         relax = float(os.environ.get("MEETINK_DIARIZE_CONFIRMED_RELAX", "0.06"))
         if len(sims) == 1:
             rescued = top_sim >= max(
-                settings["single_profile_floor"] - relax, 0.60)
+                settings["single_profile_floor"] + tightness_bump - relax,
+                0.60)
         else:
             rescued = (
-                top_sim >= max(settings["threshold"] - relax, 0.55)
+                top_sim >= max(eff_threshold - relax, 0.55)
                 and (top_sim - second_sim) >= effective_margin * 0.5
             )
         if rescued:
@@ -1072,7 +1110,9 @@ def identify(emb: np.ndarray) -> dict:
         elif reason == "below_threshold":
             print(
                 f"identify reject: {top_name} top_sim={top_sim:.3f} < "
-                f"threshold={settings['threshold']}",
+                f"threshold={eff_threshold:.3f}"
+                + (f" (loose profile: +{tightness_bump:.3f})"
+                   if tightness_bump > 0 else ""),
                 file=sys.stderr,
             )
         elif reason == "below_margin":
