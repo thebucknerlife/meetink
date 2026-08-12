@@ -1058,7 +1058,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// Event link as a dropdown in the header bar: shows the linked
     /// calendar event (or "No Event"); clicking lists the day's events.
     private let eventButton = NSButton(title: "No Event", target: nil, action: nil)
-    private let downloadButton = NSButton(title: "Download Transcript", target: nil, action: nil)
     private let menuButton = NSButton(title: "", target: nil, action: nil)
     /// Reprocess lives in the … menu; the flag disables its item mid-run.
     private var reprocessRunning = false
@@ -1185,11 +1184,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         eventButton.target = self
         eventButton.action = #selector(linkEvent)
         eventButton.toolTip = "Link this meeting to a calendar event"
-        downloadButton.bezelStyle = .rounded
-        downloadButton.controlSize = .small
-        downloadButton.font = NSFont.systemFont(ofSize: 11)
-        downloadButton.target = self
-        downloadButton.action = #selector(downloadTranscript)
         copyButton.bezelStyle = .rounded
         copyButton.controlSize = .small
         copyButton.font = NSFont.systemFont(ofSize: 11)
@@ -1200,7 +1194,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         strip.addArrangedSubview(headerField)
         strip.addArrangedSubview(NSView())
         strip.addArrangedSubview(copyButton)
-        strip.addArrangedSubview(downloadButton)
         strip.addArrangedSubview(menuButton)
 
         let divider = NSBox()
@@ -1663,8 +1656,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         if liveRecording {
             add("Discard Recording…", #selector(discardRecording))
         } else if !lastResolvedPath.isEmpty {
-            // Event linking moved to the header's calendar dropdown.
-            add("Relabel Speakers (fast)…", #selector(relabelSpeakers))
+            // Grouped: exports / pipeline / file / destructive. "…" only
+            // on items with a follow-up step (dialog or panel).
+            add("Download Transcript…", #selector(downloadTranscript))
+            if audioPath != nil {
+                add("Download Audio…", #selector(downloadAudio))
+            }
+            menu.addItem(.separator())
+            add("Relabel Speakers (fast)", #selector(relabelSpeakers))
             // Reprocess needs SOURCE audio, which is the m4a or the kept
             // stems — the stems can exist without the m4a when the stop
             // pipeline died before the archive step (field incident:
@@ -1679,9 +1678,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 menu.items.last?.toolTip = "Re-run transcription, diarization "
                     + "and audio enhancement on this meeting's kept audio"
             }
-            if audioPath != nil {
-                add("Download Audio…", #selector(downloadAudio))
-            }
+            menu.addItem(.separator())
             add("Open Folder", #selector(openFolder))
             add("Rename…", #selector(renameFromMenu))
             menu.addItem(.separator())
