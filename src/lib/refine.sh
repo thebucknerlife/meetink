@@ -253,9 +253,15 @@ if nb < 50:
     print(0); raise SystemExit
 m = np.sqrt((mic[:nb*B].reshape(nb, B)**2).mean(axis=1))
 s = np.sqrt((sy[:nb*B].reshape(nb, B)**2).mean(axis=1))
-loud = s > 0.05
-# Speakers: the mic tracks the system audio at a substantial fraction.
-# Headphone leak sits far below 0.15.
+# Volume-adaptive loudness floor — a fixed 0.05 missed a quiet-playback
+# speakers meeting, it got MIXED, and the mix re-added echo + pumping
+# to two individually clean streams (field case). Half the 75th
+# percentile of sys's non-silent blocks, never below 0.01.
+act = s[s > 0.001]
+floor = max(0.01, float(np.percentile(act, 75)) * 0.5) if len(act) > 50 else 0.05
+loud = s > floor
+# Speakers: the mic tracks the system audio at a substantial fraction
+# (measured 1.03 quiet-playback, 0.57 normal). Headphone leak: 0.004.
 print(1 if loud.sum() > 20 and float(np.median(m[loud] / s[loud])) > 0.15 else 0)
 PYEOF7
 )
