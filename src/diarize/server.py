@@ -944,6 +944,20 @@ def identify(emb: np.ndarray) -> dict:
         if not candidates:
             return {"speaker": None, "confidence": 0.0, "runner_up": None, "runner_up_confidence": 0.0}
 
+    # Thin profiles are landmines: a 1-sample centroid is a single
+    # utterance's fingerprint and matches near-random voices with high
+    # confidence (field case: a 1-sample profile claimed a line in a
+    # meeting its owner wasn't in). They stay enrolled and keep
+    # accumulating samples via explicit assignment, but they don't get
+    # to LABEL anyone until they have enough data to be trustworthy.
+    min_id_samples = int(os.environ.get("MEETINK_IDENTIFY_MIN_SAMPLES", "6"))
+    candidates = {
+        n: p for n, p in candidates.items()
+        if p["samples"].shape[0] >= min_id_samples
+    }
+    if not candidates:
+        return {"speaker": None, "confidence": 0.0, "runner_up": None, "runner_up_confidence": 0.0}
+
     # Per-profile score is the cosine to the BEST-matching centroid (not
     # a mean across centroids). Multimodal voices — same person with
     # different recording conditions or mood — get their best mode used

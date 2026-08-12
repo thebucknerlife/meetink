@@ -653,9 +653,14 @@ def offline_diarize_multi(streams: list[dict], port: int,
     # same voice; otherwise label THEM. Never mint "Speaker 23" for a
     # one-liner (field case: 5 people became 19 labels).
     fold_into: dict[int, int] = {}
+    temporal_fold: set[int] = set()
+    # Substantial = named, or enough sustained speech to be a real
+    # participant. The old bar (3 windows / 6 s) let 1-2 line clusters
+    # survive as "Speaker N" noise (field case: a 3-person meeting
+    # showed 17 labels live and 8 refined).
     substantial = [gi for gi, g in enumerate(groups)
                    if names[gi] is not None or
-                   (len(g) >= 3 and sum(windows[k][3] - windows[k][2] for k in g) >= 6.0)]
+                   (len(g) >= 5 and sum(windows[k][3] - windows[k][2] for k in g) >= 15.0)]
     for gi, g in enumerate(groups):
         if names[gi] is not None or gi in substantial:
             continue
@@ -666,16 +671,20 @@ def offline_diarize_multi(streams: list[dict], port: int,
             sim = float(cents[gi] @ cents[tj])
             if sim > best_sim:
                 best_t, best_sim = tj, sim
-        if best_t is not None and best_sim >= 0.35:
+        if best_t is not None and best_sim >= 0.30:
             fold_into[gi] = best_t
         else:
-            names[gi] = "THEM"
+            # No acoustic home — dissolve per-window into whoever is
+            # speaking around it. Cross-talk shards and hard-to-embed
+            # interjections sit INSIDE someone's speech; pooling them
+            # under a shared THEM label just minted a phantom speaker.
+            temporal_fold.add(gi)
 
     speaker_n = 0
     labels: list[str] = []
     for gi, nm in enumerate(names):
-        if gi in fold_into:
-            labels.append("")  # resolved below, target may not be labeled yet
+        if gi in fold_into or gi in temporal_fold:
+            labels.append("")  # resolved below
         elif nm is not None:
             labels.append(nm)
         else:
@@ -688,8 +697,28 @@ def offline_diarize_multi(streams: list[dict], port: int,
 
     win_label: dict[int, str] = {}
     for g, lab in zip(groups, labels):
+        if not lab:
+            continue
         for k in g:
             win_label[k] = lab
+    # Temporal dissolve: each orphan window takes the label of the
+    # nearest labeled window in time.
+    if temporal_fold:
+        labeled = sorted(
+            (0.5 * (windows[k][2] + windows[k][3]), lab)
+            for k, lab in win_label.items()
+        )
+        dissolved = 0
+        for gi in temporal_fold:
+            for k in groups[gi]:
+                mid = 0.5 * (windows[k][2] + windows[k][3])
+                if labeled:
+                    win_label[k] = min(
+                        labeled, key=lambda t: abs(t[0] - mid))[1]
+                else:
+                    win_label[k] = "THEM"
+                dissolved += 1
+        log(f"dissolved {dissolved} orphan window(s) into surrounding voices")
 
     # Exemplar anchoring: the user's per-segment corrections are FEW-SHOT
     # VOICEPRINTS, not just cluster names. When clustering FUSED several
