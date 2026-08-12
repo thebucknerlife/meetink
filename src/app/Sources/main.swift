@@ -747,6 +747,212 @@ final class DropContainerView: NSView {
 
 // MARK: - Transcript page (live or archived)
 
+/// Speaker-assignment popover. Keyboard model (field feedback):
+/// ↓ walks the in-meeting names top to bottom, one more ↓ focuses the
+/// text field; in the field, typing filters the dropdown to ALL
+/// enrolled profiles minus the in-meeting ones shown above, ↓ opens
+/// that dropdown, Enter assigns, Esc closes. Clicking a name assigns
+/// it directly; Assign/Cancel buttons mirror Enter/Esc.
+final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
+    private let headerTitle: String
+    private let assignTitle: String
+    private let inMeeting: [String]
+    private let onAssign: (String) -> Void
+    private let onClose: () -> Void
+    private var rowContainers: [NSView] = []
+    private var rowLabels: [NSTextField] = []
+    private var selIndex = -1
+    private let combo = NSComboBox()
+    private(set) var keyView: KeyRouterView!
+
+    final class KeyRouterView: NSView {
+        weak var vc: AssignPopoverVC?
+        override var acceptsFirstResponder: Bool { true }
+        override func keyDown(with event: NSEvent) {
+            if vc?.handleKey(event) != true { super.keyDown(with: event) }
+        }
+    }
+
+    init(header: String, assignTitle: String, inMeeting: [String],
+         onAssign: @escaping (String) -> Void, onClose: @escaping () -> Void) {
+        self.headerTitle = header
+        self.assignTitle = assignTitle
+        self.inMeeting = inMeeting
+        self.onAssign = onAssign
+        self.onClose = onClose
+        super.init(nibName: nil, bundle: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    override func loadView() {
+        let root = KeyRouterView()
+        root.vc = self
+        keyView = root
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 3
+        stack.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSTextField(labelWithString: headerTitle)
+        header.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        header.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(header)
+
+        for (i, name) in inMeeting.enumerated() {
+            let lbl = NSTextField(labelWithString: name)
+            lbl.font = NSFont.systemFont(ofSize: 13)
+            let cont = NSView()
+            cont.wantsLayer = true
+            cont.layer?.cornerRadius = 5
+            cont.translatesAutoresizingMaskIntoConstraints = false
+            lbl.translatesAutoresizingMaskIntoConstraints = false
+            cont.addSubview(lbl)
+            NSLayoutConstraint.activate([
+                lbl.leadingAnchor.constraint(equalTo: cont.leadingAnchor, constant: 8),
+                lbl.trailingAnchor.constraint(lessThanOrEqualTo: cont.trailingAnchor, constant: -8),
+                lbl.topAnchor.constraint(equalTo: cont.topAnchor, constant: 3),
+                lbl.bottomAnchor.constraint(equalTo: cont.bottomAnchor, constant: -3),
+                cont.widthAnchor.constraint(equalToConstant: 260),
+            ])
+            cont.identifier = NSUserInterfaceItemIdentifier("\(i)")
+            cont.addGestureRecognizer(NSClickGestureRecognizer(
+                target: self, action: #selector(rowClicked(_:))))
+            rowContainers.append(cont)
+            rowLabels.append(lbl)
+            stack.addArrangedSubview(cont)
+        }
+        if !inMeeting.isEmpty {
+            let sep = NSBox()
+            sep.boxType = .separator
+            stack.addArrangedSubview(sep)
+            sep.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        }
+
+        combo.completes = true
+        combo.numberOfVisibleItems = 12
+        combo.placeholderString = "Type a name…"
+        combo.addItems(withObjectValues: availableProfiles())
+        combo.delegate = self
+        combo.target = self
+        combo.action = #selector(comboEntered)      // Enter in the field
+        combo.translatesAutoresizingMaskIntoConstraints = false
+        combo.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        let assignBtn = NSButton(title: assignTitle, target: self,
+                                 action: #selector(comboEntered))
+        assignBtn.bezelStyle = .rounded
+        assignBtn.controlSize = .small
+        let cancelBtn = NSButton(title: "Cancel", target: self,
+                                 action: #selector(cancelClicked))
+        cancelBtn.bezelStyle = .rounded
+        cancelBtn.controlSize = .small
+        let fieldRow = NSStackView(views: [combo, assignBtn, cancelBtn])
+        fieldRow.orientation = .horizontal
+        fieldRow.spacing = 6
+        stack.addArrangedSubview(fieldRow)
+
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: root.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+        ])
+        view = root
+    }
+
+    /// The dropdown's universe: every enrolled profile EXCEPT the ones
+    /// already listed as rows above (they'd be duplicates).
+    private func availableProfiles() -> [String] {
+        let taken = Set(inMeeting.map { $0.lowercased() })
+        return enrolledProfiles().filter { !taken.contains($0.lowercased()) }
+    }
+
+    private func select(_ i: Int) {
+        selIndex = i
+        for (j, cont) in rowContainers.enumerated() {
+            cont.layer?.backgroundColor =
+                j == i ? NSColor.controlAccentColor.cgColor : nil
+            rowLabels[j].textColor = j == i ? .white : .labelColor
+        }
+    }
+
+    fileprivate func handleKey(_ event: NSEvent) -> Bool {
+        switch event.keyCode {
+        case 125:  // ↓ — next name; past the last one, into the field
+            if selIndex + 1 < rowContainers.count {
+                select(selIndex + 1)
+            } else {
+                select(-1)
+                view.window?.makeFirstResponder(combo)
+            }
+            return true
+        case 126:  // ↑
+            if selIndex > 0 { select(selIndex - 1) }
+            return true
+        case 36, 76:  // Enter on a highlighted name
+            if selIndex >= 0, selIndex < inMeeting.count {
+                onAssign(inMeeting[selIndex])
+                return true
+            }
+            return false
+        case 53:  // Esc
+            onClose()
+            return true
+        default:
+            // Typing while the list has focus jumps into the field.
+            if let chars = event.characters, !chars.isEmpty,
+               chars.rangeOfCharacter(from: .alphanumerics) != nil {
+                view.window?.makeFirstResponder(combo)
+                combo.stringValue = chars
+                combo.currentEditor()?.selectedRange =
+                    NSRange(location: chars.count, length: 0)
+                refilterDropdown()
+                return true
+            }
+            return false
+        }
+    }
+
+    @objc private func rowClicked(_ g: NSClickGestureRecognizer) {
+        guard let id = g.view?.identifier?.rawValue, let i = Int(id),
+              i < inMeeting.count else { return }
+        onAssign(inMeeting[i])
+    }
+
+    @objc private func comboEntered() {
+        let name = combo.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        onAssign(name)
+    }
+
+    @objc private func cancelClicked() { onClose() }
+
+    private func refilterDropdown() {
+        let typed = combo.stringValue.lowercased()
+        let all = availableProfiles()
+        let matches = typed.isEmpty ? all
+            : all.filter { $0.lowercased().contains(typed) }
+        combo.removeAllItems()
+        combo.addItems(withObjectValues: matches.isEmpty ? all : matches)
+        (combo.cell as? NSComboBoxCell)?.perform(Selector(("popUp:")))
+    }
+
+    func controlTextDidChange(_ n: Notification) { refilterDropdown() }
+
+    func control(_ control: NSControl, textView: NSTextView,
+                 doCommandBy selector: Selector) -> Bool {
+        // Esc in the field closes the whole popover. ↓ falls through to
+        // NSComboBox's native handling, which opens the dropdown.
+        if selector == #selector(NSResponder.cancelOperation(_:)) {
+            onClose()
+            return true
+        }
+        return false
+    }
+}
+
 /// Waveform scrubber: the playback bar's slider drawn as the audio's
 /// actual peaks, so silence and speech are visible at a glance. Click
 /// or drag anywhere to seek; the played portion tints with the system
@@ -1888,101 +2094,51 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         return true
     }
 
-    // Inline assignment: a context menu anchored under the speaker's
-    // row instead of a modal window. The meeting's own named speakers
-    // come first — the usual case is "Speaker 4 is one of the people
-    // already here", so it's arrow-down + Enter. Below them, a free
-    // text field with profile autocompletion (Enter assigns), plus
-    // Assign/Cancel buttons. Esc closes the menu natively.
-    private var assignMenuLabel: String? = nil
-    private var assignCombo: NSComboBox? = nil
-    private var assignMenu: NSMenu? = nil
+    // Inline assignment: a popover anchored under the speaker's row.
+    // The meeting's own named speakers come first as arrow-key rows —
+    // the usual case is "Speaker 4 is one of the people already here",
+    // so it's ↓↓ + Enter. Arrowing past the last name focuses the text
+    // field; there, typing filters ALL profiles minus the ones listed
+    // above, ↓ opens that dropdown, Enter assigns, Esc closes.
+    private var assignPopover: NSPopover? = nil
 
     private func promptForName(label: String) {
+        assignPopover?.close()
         let isUnnamed = label.hasPrefix("Speaker ") || label == "THEM"
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        let header = NSMenuItem(title: isUnnamed ? "Who is \(label)?" : "Reassign \(label) to…",
-                                action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-
         let names = speakers.map(\.name).filter {
             $0 != label && $0 != "THEM" && $0 != "ME"
                 && !$0.hasPrefix("Speaker ")
         }
-        for name in names {
-            let item = NSMenuItem(title: name,
-                                  action: #selector(assignMenuPicked(_:)),
-                                  keyEquivalent: "")
-            item.target = self
-            item.representedObject = name
-            menu.addItem(item)
-        }
-        if !names.isEmpty { menu.addItem(.separator()) }
-
-        let combo = NSComboBox(frame: NSRect(x: 0, y: 0, width: 168, height: 25))
-        combo.addItems(withObjectValues: enrolledProfiles())
-        combo.placeholderString = "Name…"
-        combo.completes = true
-        combo.numberOfVisibleItems = 12
-        combo.delegate = ComboAutoOpen.shared
-        combo.target = self
-        combo.action = #selector(assignComboEntered)   // Enter in the field
-        let assignBtn = NSButton(title: isUnnamed ? "Assign" : "Reassign",
-                                 target: self, action: #selector(assignComboEntered))
-        assignBtn.bezelStyle = .rounded
-        assignBtn.controlSize = .small
-        let cancelBtn = NSButton(title: "Cancel", target: self,
-                                 action: #selector(assignMenuCancel))
-        cancelBtn.bezelStyle = .rounded
-        cancelBtn.controlSize = .small
-        let fieldRow = NSStackView(views: [combo, assignBtn, cancelBtn])
-        fieldRow.orientation = .horizontal
-        fieldRow.spacing = 6
-        fieldRow.frame = NSRect(x: 14, y: 3, width: 306, height: 26)
-        let holder = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 32))
-        holder.addSubview(fieldRow)
-        let fieldItem = NSMenuItem()
-        fieldItem.view = holder
-        menu.addItem(fieldItem)
-
-        assignMenuLabel = label
-        assignCombo = combo
-        assignMenu = menu
-
-        // Anchor right under the speaker's row in the panel; fall back
-        // to the panel's origin when the row isn't visible (e.g. the
-        // transcript's assign links for a hidden row).
-        var at = NSPoint(x: 8, y: 8)
+        let pop = NSPopover()
+        pop.behavior = .transient
+        let vc = AssignPopoverVC(
+            header: isUnnamed ? "Who is \(label)?" : "Reassign \(label) to…",
+            assignTitle: isUnnamed ? "Assign" : "Reassign",
+            inMeeting: names,
+            onAssign: { [weak self] name in
+                self?.assignPopover?.close()
+                self?.assignPopover = nil
+                // Same guard as ever: only path-hostile input rejected —
+                // "Greg (AE)", "Jean-Luc" and "J.R." are legitimate.
+                guard !name.isEmpty, !name.contains("/"),
+                      !name.hasPrefix(".") else { return }
+                self?.runAssign(label: label, name: name)
+            },
+            onClose: { [weak self] in
+                self?.assignPopover?.close()
+                self?.assignPopover = nil
+            })
+        pop.contentViewController = vc
+        assignPopover = pop
+        var anchor = NSRect(x: 8, y: 8, width: 1, height: 1)
         if let rowIdx = panelRows.firstIndex(where: {
             if case .speaker(let n, _, _) = $0 { return n == label }
             return false
         }), rowIdx < speakersTable.numberOfRows {
-            let r = speakersTable.rect(ofRow: rowIdx)
-            at = NSPoint(x: r.minX + 8, y: r.maxY + 2)
+            anchor = speakersTable.rect(ofRow: rowIdx)
         }
-        menu.popUp(positioning: nil, at: at, in: speakersTable)
-    }
-
-    @objc private func assignMenuPicked(_ sender: NSMenuItem) {
-        guard let label = assignMenuLabel,
-              let name = sender.representedObject as? String else { return }
-        runAssign(label: label, name: name)
-    }
-
-    @objc private func assignComboEntered() {
-        guard let label = assignMenuLabel, let combo = assignCombo else { return }
-        let name = combo.stringValue.trimmingCharacters(in: .whitespaces)
-        // Only path-hostile input is rejected — "Greg (AE)", "Jean-Luc"
-        // and "J.R." are all legitimate names.
-        guard !name.isEmpty, !name.contains("/"), !name.hasPrefix(".") else { return }
-        assignMenu?.cancelTracking()
-        runAssign(label: label, name: name)
-    }
-
-    @objc private func assignMenuCancel() {
-        assignMenu?.cancelTracking()
+        pop.show(relativeTo: anchor, of: speakersTable, preferredEdge: .maxY)
+        vc.view.window?.makeFirstResponder(vc.keyView)
     }
 
     private func runAssign(label: String, name: String) {
