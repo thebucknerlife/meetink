@@ -672,6 +672,20 @@ def _save(name: str) -> None:
     )
 
 
+def _canonical_profile_name(name: str) -> str:
+    """The existing profile whose name matches case-insensitively, else
+    the name as given. Assigning "ED" while "Ed" is enrolled must train
+    "Ed": macOS's default filesystem is case-INsensitive, so ED.npz and
+    Ed.npz are the same file and two in-memory profiles differing only
+    by case silently overwrite each other on disk (field incident: the
+    DOUG → Doug rename deleted the file it had just saved)."""
+    low = name.lower()
+    for existing in profiles:
+        if existing.lower() == low:
+            return existing
+    return name
+
+
 def _outlier_reject(name: str, new_emb_l2: np.ndarray) -> tuple[bool, float]:
     """Check whether `new_emb_l2` is too dissimilar from profile `name`'s
     existing centroids to be the same speaker. Returns (rejected, best_sim).
@@ -1744,6 +1758,8 @@ class Handler(BaseHTTPRequestHandler):
                                      "no_cluster": True})
                     return
                 letter = cluster["letter"]
+                # "ED" folds into the enrolled "Ed", never a twin profile.
+                name = _canonical_profile_name(name)
                 # Promote the cluster's samples to the profile via
                 # _add_samples_bulk so outlier rejection + k-means kick
                 # in. Re-assigning into an existing profile accumulates
@@ -1972,6 +1988,36 @@ class Handler(BaseHTTPRequestHandler):
                 if src_name not in profiles:
                     self._json(404, {"error": f"no profile named {src_name}"})
                     return
+                # Pure RECASE ("DOUG" → "Doug"): rekey in memory and
+                # rewrite the (case-insensitively identical) file. The
+                # generic path below deleted the file it had just saved,
+                # because src.npz and dst.npz are the same file on a
+                # case-insensitive filesystem.
+                if src_name.lower() == dst_name.lower():
+                    profiles[dst_name] = profiles.pop(src_name)
+                    # Unlink BEFORE saving: overwriting through the old
+                    # name keeps the old on-disk casing, and _load_all
+                    # keys by file stem — the recase would silently
+                    # revert on the next server restart.
+                    for ext in (".npz", ".npy"):
+                        p = PROFILES_DIR / f"{src_name}{ext}"
+                        try:
+                            if p.exists():
+                                p.unlink()
+                        except OSError:
+                            pass
+                    _save(dst_name)
+                    count = int(profiles[dst_name]["samples"].shape[0])
+                    print(f"recased: {src_name} → {dst_name} "
+                          f"({count} samples)", file=sys.stderr)
+                    self._json(200, {
+                        "ok": True, "from": src_name, "to": dst_name,
+                        "samples": count, "merged": False, "rejected": 0,
+                    })
+                    return
+                # Renaming ONTO an enrolled name matches case-insensitively
+                # too — "ed" merges into "Ed", never a twin profile.
+                dst_name = _canonical_profile_name(dst_name)
                 src_samples = profiles[src_name]["samples"]
                 src_timestamps = profiles[src_name]["timestamps"]
                 merged_into_existing = dst_name in profiles
@@ -1994,12 +2040,21 @@ class Handler(BaseHTTPRequestHandler):
                     # outlier check (nothing to compare against).
                     profiles[dst_name] = profiles[src_name]
                     _save(dst_name)
-                # Drop src from memory and disk regardless of which branch.
+                # Drop src from memory and disk regardless of which branch
+                # — but NEVER delete dst's own file: on a case-insensitive
+                # filesystem src.npz can resolve to the very file _save
+                # just wrote for dst.
                 profiles.pop(src_name, None)
+                dst_file = PROFILES_DIR / f"{dst_name}.npz"
                 for ext in (".npz", ".npy"):
                     p = PROFILES_DIR / f"{src_name}{ext}"
-                    if p.exists():
-                        p.unlink()
+                    try:
+                        if p.exists() and not (
+                            dst_file.exists() and p.samefile(dst_file)
+                        ):
+                            p.unlink()
+                    except OSError:
+                        pass
                 count = int(profiles[dst_name]["samples"].shape[0])
                 print(
                     f"renamed: {src_name} → {dst_name} "
@@ -2069,6 +2124,7 @@ class Handler(BaseHTTPRequestHandler):
                 if len(samples) < 16000 * 3:
                     self._json(400, {"error": "need >= 3s of audio"})
                     return
+                name = _canonical_profile_name(name)
                 count, accepted, best_sim = _add_sample(
                     name, embed(samples), source="enroll",
                 )
