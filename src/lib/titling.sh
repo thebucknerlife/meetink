@@ -766,51 +766,38 @@ PYEOF3
     local base="${file:t:r}"
     local trimmed="${base%-*}"
 
-    # Folder-style session (<base>/<base>.txt — see cmd_start)? Then the
-    # FOLDER carries the name: rename it, then every inner file sharing the
-    # old basename (transcript, .live-raw, .summary, .idx, kept audio) in
-    # lockstep. The flat-layout .idx collision dance below doesn't apply —
-    # the sidecar travels with its folder.
+    # Folder-style session (<base>/<base>.txt — see cmd_start)? The stamp
+    # folder is the meeting's PERMANENT IDENTITY — nothing on disk ever
+    # renames. The human title lives in meta.json (shown everywhere by
+    # the app; synthesized into filenames only at export time). Physical
+    # renames raced every concurrent holder of the old path — the stop
+    # pipeline itself lost the L10 meeting's postproc to its own pending
+    # rename — and IDs make the whole class impossible.
     if [[ "${dir:t}" == "$base" ]]; then
-        local parent="${dir:h}"
-        local newdir="$parent/${trimmed}_${slug}"
-        local n=2
-        while [[ -e "$newdir" ]] && (( n <= 99 )); do
-            newdir="$parent/${trimmed}_${slug}_${n}"
-            (( n++ ))
-        done
-        if [[ -e "$newdir" ]]; then
-            print -P "${C[dim]}  (rename skipped — 99 same-slug collisions)${C[reset]}"
-            return 0
-        fi
-        if ! mv "$dir" "$newdir" 2>/dev/null; then
-            print -P "${C[dim]}  (rename failed)${C[reset]}"
-            return 0
-        fi
-        local newbase="${newdir:t}"
-        setopt local_options null_glob
-        local inner suffix
-        for inner in "$newdir/$base".*; do
-            suffix="${${inner:t}#$base}"
-            mv "$inner" "$newdir/${newbase}${suffix}" 2>/dev/null || true
-        done
-        local new="$newdir/${newbase}.txt"
-        [[ -n "$event_title" ]] && _meta_set_title "$new" "$event_title"
-
-        # Update live.txt if it pointed at the old path.
-        local live="$MK_TRANSCRIPTS_DIR/live.txt"
-        if [[ -L "$live" && "$(readlink "$live" 2>/dev/null)" == "$file" ]]; then
-            ln -sfn "$new" "$live"
+        # A title already in meta (user rename, live event link) wins
+        # over anything derived here — never clobber it.
+        local existing_title=""
+        [[ -f "${file%.txt}.meta.json" ]] && existing_title=$(python3 -c "
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get('title') or '')
+except Exception:
+    pass" "${file%.txt}.meta.json" 2>/dev/null)
+        if [[ -z "$existing_title" ]]; then
+            local nice_title="$event_title"
+            [[ -z "$nice_title" ]] && nice_title="${slug//-/ }"
+            _meta_set_title "$file" "$nice_title"
+            print -P "${C[green]}✓${C[reset]} Titled: ${C[bright_cyan]}${nice_title}${C[reset]}"
+        else
+            print -P "${C[dim]}  (title kept: ${existing_title})${C[reset]}"
         fi
 
-        print -P "${C[green]}✓${C[reset]} Renamed: ${C[bright_cyan]}${newbase}${C[reset]}"
-
-        # Summary + rolling meetings.md, same as the flat branch — but the
-        # project dir is the folder's PARENT, not the folder itself.
+        # Summary + rolling meetings.md — the project dir is the folder's
+        # PARENT, not the folder itself.
         if typeset -f summary_save >/dev/null 2>&1; then
-            if summary_save "$new" 2>/dev/null; then
+            if summary_save "$file" 2>/dev/null; then
                 if typeset -f meetings_log_rebuild >/dev/null 2>&1; then
-                    meetings_log_rebuild "$parent" 2>/dev/null
+                    meetings_log_rebuild "${dir:h}" 2>/dev/null
                 fi
             else
                 print -P "${C[dim]}  (summary skipped)${C[reset]}"

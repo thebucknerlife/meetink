@@ -333,89 +333,19 @@ func isLiveRecording(txtPath: String) -> Bool {
         == (txtPath as NSString).standardizingPath
 }
 
-/// Rename a meeting to a new display name: slugify, keep the timestamp
-/// prefix, move the session folder + every same-basename file (or the flat
-/// siblings), and retarget live.txt if it pointed at the old path. Returns
-/// the transcript's new path, or nil when nothing moved.
-/// The stamped-prefix + slug basename renameMeeting would produce for a
-/// title — shared with the deferred-rename reconciler so "already named
-/// right" is a cheap comparison, not a rename attempt.
-func expectedBaseName(txtPath: String, displayName: String) -> String? {
-    let title = displayName.trimmingCharacters(in: .whitespaces)
-    guard !title.isEmpty else { return nil }
-    var slug = String(title.map { c in
-        c.isLetter || c.isNumber ? c : "-"
-    }).replacingOccurrences(of: "--+", with: "-", options: .regularExpression)
-        .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-    if slug.isEmpty { slug = "meeting" }
-    let base = ((txtPath as NSString).lastPathComponent as NSString).deletingPathExtension
-    var prefix = ""
-    if let r = base.range(of: #"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?_?"#,
-                          options: .regularExpression) {
-        prefix = String(base[r])
-        if !prefix.hasSuffix("_") { prefix += "_" }
-    }
-    return prefix + slug
-}
-
+/// "Rename" a meeting: record the exact title in meta.json and nothing
+/// else. The stamp folder is the meeting's PERMANENT IDENTITY — nothing
+/// physically moves on disk, ever. Physical renames raced every
+/// concurrent holder of the old path (the stop pipeline lost the L10
+/// meeting's entire post-processing to its own pending rename). The
+/// display name shows everywhere immediately via meta; exports
+/// synthesize friendly filenames from it at save time. Returns the
+/// (unchanged) transcript path, nil only for an empty title.
 func renameMeeting(txtPath: String, displayName: String) -> String? {
     let title = displayName.trimmingCharacters(in: .whitespaces)
     guard !title.isEmpty else { return nil }
-    // A live meeting must not move on disk (see isLiveRecording). Record
-    // the exact title in meta.json — the display name updates everywhere
-    // immediately — and let stop-time titling perform the physical rename
-    // with its lockstep machinery once capture has exited.
-    if isLiveRecording(txtPath: txtPath) {
-        setMeetingMeta(txtPath, "title", title)
-        return txtPath
-    }
-    // Same rule mid-post-processing: the pipeline holds paths into this
-    // folder. The exact title lands in meta.json now (the UI shows it
-    // everywhere immediately); the meetings list reconciles the physical
-    // rename once processing ends.
-    if let pp = postprocPath(),
-       (pp as NSString).deletingLastPathComponent
-           == (txtPath as NSString).deletingLastPathComponent {
-        setMeetingMeta(txtPath, "title", title)
-        return txtPath
-    }
-    // The exact title (dashes, punctuation, anything) goes to metadata
-    // FIRST — it travels with the same-basename rename below. The slug is
-    // just the folder's readable spelling.
     setMeetingMeta(txtPath, "title", title)
-    let fm = FileManager.default
-    let base = ((txtPath as NSString).lastPathComponent as NSString).deletingPathExtension
-    guard let newBase = expectedBaseName(txtPath: txtPath, displayName: title),
-          newBase != base else { return txtPath }
-    let dir = (txtPath as NSString).deletingLastPathComponent
-    var newTxt: String
-    if (dir as NSString).lastPathComponent == base {
-        let parent = (dir as NSString).deletingLastPathComponent
-        let newDir = parent + "/" + newBase
-        guard !fm.fileExists(atPath: newDir),
-              (try? fm.moveItem(atPath: dir, toPath: newDir)) != nil else { return nil }
-        for item in (try? fm.contentsOfDirectory(atPath: newDir)) ?? []
-        where item.hasPrefix(base + ".") {
-            let suffix = String(item.dropFirst(base.count))
-            try? fm.moveItem(atPath: newDir + "/" + item,
-                             toPath: newDir + "/" + newBase + suffix)
-        }
-        newTxt = newDir + "/" + newBase + ".txt"
-    } else {
-        for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? []
-        where item.hasPrefix(base + ".") {
-            let suffix = String(item.dropFirst(base.count))
-            try? fm.moveItem(atPath: dir + "/" + item,
-                             toPath: dir + "/" + newBase + suffix)
-        }
-        newTxt = dir + "/" + newBase + ".txt"
-    }
-    let live = liveSymlinkPath()
-    if let t = try? fm.destinationOfSymbolicLink(atPath: live), t == txtPath {
-        try? fm.removeItem(atPath: live)
-        try? fm.createSymbolicLink(atPath: live, withDestinationPath: newTxt)
-    }
-    return fm.fileExists(atPath: newTxt) ? newTxt : nil
+    return txtPath
 }
 
 /// Per-meeting metadata (<base>.meta.json, moved by the same-basename
@@ -3297,19 +3227,6 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
             }
             return sortAscending ? r : !r
         }
-        // Deferred renames: a title set while the meeting was live or
-        // processing lives only in meta.json until the folder is free.
-        // Apply it once nothing is running (renameMeeting is idempotent
-        // and the comparison keeps this loop free on the 2 s tick).
-        for f in stamped where f.3 == .ended {
-            guard let metaTitle = meetingMeta(f.0)["title"] as? String,
-                  !metaTitle.trimmingCharacters(in: .whitespaces).isEmpty,
-                  let want = expectedBaseName(txtPath: f.0, displayName: metaTitle)
-            else { continue }
-            let base = ((f.0 as NSString).lastPathComponent as NSString).deletingPathExtension
-            if want != base { _ = renameMeeting(txtPath: f.0, displayName: metaTitle) }
-        }
-
         let changed = stamped.map(\.0) != files.map(\.path)
             || stamped.map(\.3) != files.map(\.status)
             || stamped.map { Int(($0.4 ?? 0) / 60) } != files.map { Int(($0.duration ?? 0) / 60) }
