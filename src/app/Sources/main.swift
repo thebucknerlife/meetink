@@ -984,10 +984,50 @@ final class WaveformScrubberView: NSView {
     }
 }
 
+/// Transcript text view. Body text used to carry play-links, and
+/// NSTextView DRAGS a link (the "segment" ghost) on click-drag instead
+/// of selecting — so body links are gone: drag always selects, and a
+/// plain click (no movement, judged after the tracking loop) plays via
+/// onBodyClick. Name/timestamp keep real links (single words, no drag
+/// ambiguity).
+final class TranscriptTextView: NSTextView {
+    var onBodyClick: ((Int) -> Void)? = nil
+
+    override func mouseDown(with event: NSEvent) {
+        guard event.clickCount == 1,
+              event.modifierFlags.intersection(
+                  [.shift, .command, .option, .control]).isEmpty else {
+            return super.mouseDown(with: event)
+        }
+        let p = convert(event.locationInWindow, from: nil)
+        super.mouseDown(with: event)   // full selection-tracking loop
+        // Zero-length selection after tracking = plain click, not drag.
+        if selectedRange().length == 0, let ci = clickChar(at: p) {
+            onBodyClick?(ci)
+        }
+    }
+
+    /// Character actually under the point — nil for margins/whitespace
+    /// past line ends (insertion-index APIs snap to the nearest char,
+    /// which would make dead space play random segments).
+    private func clickChar(at p: NSPoint) -> Int? {
+        guard let lm = layoutManager, let tc = textContainer else { return nil }
+        let pt = NSPoint(x: p.x - textContainerInset.width,
+                         y: p.y - textContainerInset.height)
+        var frac: CGFloat = 0
+        let g = lm.glyphIndex(for: pt, in: tc,
+                              fractionOfDistanceThroughGlyph: &frac)
+        let rect = lm.boundingRect(forGlyphRange: NSRange(location: g, length: 1),
+                                   in: tc)
+        guard rect.insetBy(dx: -3, dy: -3).contains(pt) else { return nil }
+        return lm.characterIndexForGlyph(at: g)
+    }
+}
+
 final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                                       NSTableViewDataSource, NSTableViewDelegate,
                                       NSTextFieldDelegate {
-    private let textView = NSTextView()
+    private let textView = TranscriptTextView()
     private let headerField = NSTextField(labelWithString: "")
     private let titleField = NSTextField(string: "")
     private let speakersTable = NSTableView()
@@ -1208,6 +1248,18 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         // without firing — NSTextView's default link behavior.
         textView.linkTextAttributes = [:]
         textView.delegate = self
+        textView.onBodyClick = { [weak self] ci in
+            guard let self, self.audioPath != nil else { return }
+            // Name/stamp links handle their own clicks (play / toggle).
+            if let ts = self.textView.textStorage, ci < ts.length,
+               ts.attribute(.link, at: ci, effectiveRange: nil) != nil {
+                return
+            }
+            if let line = self.lineIndex(forChar: ci),
+               line < self.lineOffsets.count {
+                self.seek(to: self.lineOffsets[line], andPlay: true)
+            }
+        }
         scroll.documentView = textView
 
         jumpButton.translatesAutoresizingMaskIntoConstraints = false
@@ -1962,6 +2014,34 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard !liveRecording, !lastResolvedPath.isEmpty,
               let line = lineIndex(forChar: charIndex) else { return menu }
         let edit = NSMenu()
+        // Drag-selection spanning multiple segments → bulk actions on
+        // exactly the highlighted lines (the middle ground between
+        // one-segment reassign and the sidebar's whole-label rewrite).
+        let sel = view.selectedRange()
+        if sel.length > 0 {
+            let selLines = lineRanges.filter {
+                NSIntersectionRange(sel, $0.value).length > 0
+            }.keys.sorted()
+            if selLines.count > 1 {
+                func addBulk(_ title: String, _ selr: Selector) {
+                    let i = NSMenuItem(title: title, action: selr,
+                                       keyEquivalent: "")
+                    i.target = self
+                    i.representedObject = selLines
+                    edit.addItem(i)
+                }
+                addBulk("Reassign \(selLines.count) Segments to…",
+                        #selector(menuReassignSelection(_:)))
+                addBulk("Delete \(selLines.count) Segments…",
+                        #selector(menuDeleteSelection(_:)))
+                edit.addItem(.separator())
+                for item in menu.items
+                where item.action == #selector(NSText.copy(_:)) {
+                    edit.addItem(item.copy() as! NSMenuItem)
+                }
+                return edit
+            }
+        }
         func add(_ title: String, _ sel: Selector) {
             let i = NSMenuItem(title: title, action: sel, keyEquivalent: "")
             i.target = self
@@ -1995,10 +2075,42 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func menuReassignSegment(_ sender: NSMenuItem) {
         guard let info = sender.representedObject as? [String: Int],
               let line = info["line"], line < snapshot.lines.count else { return }
-        let seg = snapshot.lines[line]
+        promptReassign(lines: [line], preview: snapshot.lines[line].text)
+    }
+
+    @objc private func menuReassignSelection(_ sender: NSMenuItem) {
+        guard let lines = sender.representedObject as? [Int],
+              !lines.isEmpty else { return }
+        let previews = lines.prefix(2).compactMap {
+            $0 < snapshot.lines.count
+                ? String(snapshot.lines[$0].text.prefix(50)) : nil
+        }
+        promptReassign(lines: lines, preview: previews.joined(separator: " … "))
+    }
+
+    @objc private func menuDeleteSelection(_ sender: NSMenuItem) {
+        guard let lines = sender.representedObject as? [Int],
+              !lines.isEmpty else { return }
         let alert = NSAlert()
-        alert.messageText = "Reassign this segment"
-        alert.informativeText = String(seg.text.prefix(120))
+        alert.messageText = "Delete \(lines.count) segments?"
+        alert.informativeText = "This removes the highlighted segments "
+            + "from the transcript. It cannot be undone (the pre-edit "
+            + "snapshot keeps the original)."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Delete")
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        deleteLines(lines)
+    }
+
+    /// One name prompt → relabel every line in `lines`. Shared by the
+    /// single-segment menu, the multi-segment selection, and the
+    /// post-split hand-off.
+    private func promptReassign(lines: [Int], preview: String) {
+        let alert = NSAlert()
+        alert.messageText = lines.count == 1
+            ? "Reassign this segment"
+            : "Reassign \(lines.count) segments"
+        alert.informativeText = String(preview.prefix(120))
         alert.addButton(withTitle: "Reassign")
         alert.addButton(withTitle: "Cancel")
         let combo = NSComboBox(frame: NSRect(x: 0, y: 0, width: 220, height: 25))
@@ -2012,19 +2124,53 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let name = combo.stringValue.trimmingCharacters(in: .whitespaces).uppercased()
         guard !name.isEmpty, !name.contains("/"), !name.hasPrefix(".") else { return }
-        guard var (all, idx) = readTranscriptLines(), line < idx.count else { return }
-        snapshotBeforeFirstEdit()
-        all[idx[line]] = "[\(seg.timestamp)] \(name): \(seg.text)"
-        var entry: [String: Any] = ["label": name]
-        entry["t"] = line < lineOffsets.count ? lineOffsets[line] : 0
-        // Keep the words — the text didn't change, only the label.
+        reassignLines(lines, to: name)
+    }
+
+    /// Bulk timing mutation in ONE read-modify-write — per-line splices
+    /// would shift indices under each other.
+    private func rewriteTiming(_ mutate: (inout [[String: Any]]) -> Void) {
         let tPath = (lastResolvedPath as NSString).deletingPathExtension + ".timing.json"
-        if let data = FileManager.default.contents(atPath: tPath),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let tl = obj["lines"] as? [[String: Any]], line < tl.count {
-            entry["words"] = tl[line]["words"] ?? []
+        guard let data = FileManager.default.contents(atPath: tPath),
+              var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var lines = obj["lines"] as? [[String: Any]],
+              lines.count == snapshot.lines.count else { return }
+        mutate(&lines)
+        obj["lines"] = lines
+        if let out = try? JSONSerialization.data(withJSONObject: obj) {
+            try? out.write(to: URL(fileURLWithPath: tPath))
         }
-        spliceTiming(line: line, with: [entry])
+    }
+
+    private func reassignLines(_ lines: [Int], to name: String) {
+        guard var (all, idx) = readTranscriptLines() else { return }
+        snapshotBeforeFirstEdit()
+        let valid = lines.filter { $0 < idx.count && $0 < snapshot.lines.count }
+        guard !valid.isEmpty else { return }
+        for line in valid {
+            let seg = snapshot.lines[line]
+            all[idx[line]] = "[\(seg.timestamp)] \(name): \(seg.text)"
+        }
+        // Labels only — text and word timings are untouched.
+        rewriteTiming { tl in
+            for line in valid where line < tl.count {
+                tl[line]["label"] = name
+            }
+        }
+        writeTranscriptLines(all)
+    }
+
+    private func deleteLines(_ lines: [Int]) {
+        guard var (all, idx) = readTranscriptLines() else { return }
+        snapshotBeforeFirstEdit()
+        let valid = lines.filter { $0 < idx.count }.sorted(by: >)
+        guard !valid.isEmpty else { return }
+        for line in valid { all.remove(at: idx[line]) }
+        rewriteTiming { tl in
+            for line in valid where line < tl.count {
+                tl.remove(at: line)
+            }
+        }
         writeTranscriptLines(all)
     }
 
@@ -2038,7 +2184,16 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard let info = sender.representedObject as? [String: Int],
               let line = info["line"], let ch = info["char"],
               let range = lineRanges[line] else { return }
-        splitSegment(line, atChar: ch - range.location)
+        // Both halves keep the speaker, and same-speaker lines render as
+        // ONE block — a bare split looks like nothing happened (field
+        // report). Splitting is almost always the prelude to reassigning
+        // the second half, so hand straight off to that dialog (Cancel
+        // keeps the split with the original speaker).
+        if splitSegment(line, atChar: ch - range.location),
+           line + 1 < snapshot.lines.count {
+            promptReassign(lines: [line + 1],
+                           preview: snapshot.lines[line + 1].text)
+        }
     }
 
     @objc private func menuDeleteSegment(_ sender: NSMenuItem) {
@@ -2703,12 +2858,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         applySegmentText(line, "")
     }
 
-    private func splitSegment(_ line: Int, atChar offset: Int) {
+    @discardableResult
+    private func splitSegment(_ line: Int, atChar offset: Int) -> Bool {
         guard var (all, idx) = readTranscriptLines(), line < idx.count,
-              line < snapshot.lines.count else { return }
+              line < snapshot.lines.count else { return false }
         let seg = snapshot.lines[line]
         let text = seg.text as NSString
-        guard offset > 0, offset < text.length else { return }
+        guard offset > 0, offset < text.length else { return false }
         // Snap the cut to the nearest word boundary.
         var cut = offset
         while cut < text.length,
@@ -2716,7 +2872,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 Unicode.Scalar(text.character(at: cut)) ?? " ") { cut += 1 }
         let first = text.substring(to: cut).trimmingCharacters(in: .whitespaces)
         let second = text.substring(from: cut).trimmingCharacters(in: .whitespaces)
-        guard !first.isEmpty, !second.isEmpty else { return }
+        guard !first.isEmpty, !second.isEmpty else { return false }
         snapshotBeforeFirstEdit()
 
         // Second half's timestamp: the timing entry's word whose text
@@ -2756,6 +2912,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             ["t": t2, "label": seg.speaker, "words": words2],
         ])
         writeTranscriptLines(all)
+        return true
     }
 
     /// Speaker whose sample should start playing once the player is ready
@@ -2984,14 +3141,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                         .foregroundColor: NSColor.labelColor,
                         .paragraphStyle: bodyPara,
                     ]
-                    // Any word plays its segment. linkTextAttributes is
-                    // overridden to just the hand cursor, so body text
-                    // keeps its normal look.
+                    // Any word plays its segment — via the text view's
+                    // click-vs-drag bookkeeping (onBodyClick), NOT a
+                    // link attribute: links hijack click-drag into a
+                    // URL drag and text selection becomes impossible.
                     bodyAttrs[.cursor] = NSCursor.iBeam
-                    if audioPath != nil,
-                       let purl = URL(string: "meetink-play://\(part.line)") {
-                        bodyAttrs[.link] = purl
-                    }
                     out.append(NSAttributedString(string: part.text + sep,
                                                   attributes: bodyAttrs))
                     lineRanges[part.line] = NSRange(location: runStart,
