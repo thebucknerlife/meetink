@@ -1267,6 +1267,25 @@ profile_assign() {
         print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}${old_label}${C[reset]} → ${C[bold]}${up_name}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
     fi
 
+    # Sibling clusters the server folded alongside the assignment (same
+    # voice, different anonymous letters) — rewrite those labels too so
+    # one assignment collapses the person's whole "Speaker N" tail.
+    local folded=$(print -- "$resp" \
+        | sed -nE 's/.*"also_folded":[[:space:]]*\[([^]]*)\].*/\1/p' \
+        | tr -d '"')
+    if [[ -n "$folded" && -e "$MK_TRANSCRIPT" ]]; then
+        local f flabel
+        for f in ${(s:,:)folded}; do
+            f="${f## }"; f="${f%% }"
+            [[ -z "$f" ]] && continue
+            flabel="$f"
+            [[ "$f" == <-> ]] && flabel="Speaker ${f}"
+            if _rewrite_transcript_label "$MK_TRANSCRIPT" "$flabel" "$up_name"; then
+                print -P "${C[green]}✓${C[reset]} Also folded ${C[dim]}${flabel}${C[reset]} → ${C[bold]}${up_name}${C[reset]}"
+            fi
+        done
+    fi
+
     # If the meeting was auto-recorded by /watch, the whitelist may have
     # been cleared at meeting-start because the just-promoted person
     # wasn't enrolled yet. Now they are — re-derive so the rest of the

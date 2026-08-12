@@ -314,6 +314,14 @@ PROFILE_MAX_SAMPLES = int(os.environ.get("MEETINK_PROFILE_MAX_SAMPLES", "500"))
 # []   = match against nothing, always cluster.
 session_whitelist: "list[str] | None" = None
 
+# Profiles the user has CONFIRMED are in this meeting by assigning a
+# cluster to them mid-call. That's a strong prior — the person is
+# definitely in the room — so identify() relaxes its gates a notch for
+# these names (field case: assigned mid-sentence, the very next window
+# fell back to "Speaker 38" because it scored 0.61 against a 0.65
+# threshold). Cleared on /start.
+session_confirmed: "set[str]" = set()
+
 
 # --- Recent embedding ring -------------------------------------------------
 #
@@ -998,6 +1006,7 @@ def identify(emb: np.ndarray) -> dict:
     # settings dict).
     reason: str | None = None
     close_pair = False
+    effective_margin = settings["margin"]
     if len(sims) == 1:
         accepted = top_sim >= settings["single_profile_floor"]
         if not accepted:
@@ -1025,6 +1034,30 @@ def identify(emb: np.ndarray) -> dict:
             )
         else:
             accepted = True
+    # CONFIRMED-PRESENT rescue: the user assigned this profile during
+    # THIS meeting, so the person is definitely in the room — a strong
+    # prior the plain gates don't know about. Retry the failed gate with
+    # a relaxed threshold (bounded) and half the margin. This is what
+    # keeps a mid-call assignment from immediately minting fresh
+    # "Speaker N" letters for the same voice.
+    if not accepted and top_name in session_confirmed:
+        relax = float(os.environ.get("MEETINK_DIARIZE_CONFIRMED_RELAX", "0.06"))
+        if len(sims) == 1:
+            rescued = top_sim >= max(
+                settings["single_profile_floor"] - relax, 0.60)
+        else:
+            rescued = (
+                top_sim >= max(settings["threshold"] - relax, 0.55)
+                and (top_sim - second_sim) >= effective_margin * 0.5
+            )
+        if rescued:
+            print(
+                f"identify: {top_name}@{top_sim:.3f} accepted via "
+                f"confirmed-present relaxation (was {reason})",
+                file=sys.stderr,
+            )
+            accepted = True
+            reason = "confirmed_relaxed"
     # Stderr-log every rejection with the gate that failed and the gap.
     # This is the missing diagnostic users have been hitting: their
     # enrolled person silently falls to Speaker N with no signal as to why.
@@ -1298,6 +1331,7 @@ def session_clear() -> None:
     clusters.clear()
     _next_cluster_idx = 0
     cluster_aliases.clear()
+    session_confirmed.clear()
     _last_cluster_letter = None
     _last_cluster_ts = 0.0
     # Auto-train log is a per-session counter; resetting it on /start
@@ -1775,6 +1809,34 @@ class Handler(BaseHTTPRequestHandler):
                     skip_outliers=(name in profiles),
                 )
                 clusters.remove(cluster)
+                # The user just confirmed this person is IN the meeting —
+                # identify() relaxes its gates for them from here on.
+                session_confirmed.add(name)
+                # Sibling fold: the same voice often spawned OTHER
+                # anonymous letters before the assignment (each hard
+                # window minted a new one). Any remaining cluster whose
+                # centroid strongly matches the updated profile is the
+                # same person — fold it too and report its letter so the
+                # caller can rewrite those transcript labels as well.
+                also_folded: list[str] = []
+                fold_bar = settings["threshold"] + 0.03
+                prof_centroids = profiles[name]["centroids"]
+                for c in list(clusters):
+                    sim = float(np.max(prof_centroids @ _l2(c["centroid"])))
+                    if sim >= fold_bar:
+                        _add_samples_bulk(
+                            name, c["samples"],
+                            source=f"assign-sibling:{c['letter']}",
+                            skip_outliers=True,
+                        )
+                        clusters.remove(c)
+                        also_folded.append(c["letter"])
+                        print(
+                            f"session: sibling cluster {c['letter']} → "
+                            f"{name} (sim={sim:.3f})",
+                            file=sys.stderr,
+                        )
+                        prof_centroids = profiles[name]["centroids"]
                 total = int(profiles[name]["samples"].shape[0])
                 print(
                     f"session: cluster {letter} → profile {name} "
@@ -1789,6 +1851,7 @@ class Handler(BaseHTTPRequestHandler):
                     "samples": total,
                     "added": added,
                     "rejected": rejected,
+                    "also_folded": also_folded,
                 })
                 return
             if url.path == "/session/merge":
