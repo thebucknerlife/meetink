@@ -1182,6 +1182,12 @@ cmd_stop() {
     local stop_ino=""
     if [[ -n "$stop_target" && -f "$stop_target" ]]; then
         stop_ino=$(stat -f %i "$stop_target" 2>/dev/null)
+        # Rule 3: recordings without a linked event get one inferred from
+        # calendar overlap (manual/instant/adopted starts) — BEFORE
+        # titling so the event name wins over the LLM guess.
+        if typeset -f infer_event_link >/dev/null 2>&1; then
+            infer_event_link "$stop_target"
+        fi
         title_session_file "$stop_target"
         if [[ ! -f "$stop_target" && -n "$stop_ino" ]]; then
             local by_ino=$(find "$MK_TRANSCRIPTS_DIR" -maxdepth 2 -name '*.txt' -inum "$stop_ino" 2>/dev/null | head -1)

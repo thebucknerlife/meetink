@@ -611,6 +611,111 @@ json.dump(d, open(p, "w"), sort_keys=True)
 PYEOF2
 }
 
+# Infer the calendar event for a recording that has none (manual,
+# instant, adopted starts): best time-overlap attendee-event over the
+# recording's window. Writes the meta event record + the '# event:' /
+# '# attendees:' headers so titling (below), exports, and the app's
+# dropdown all inherit it. Runs in cmd_stop BEFORE titling; imports
+# never pass through here.
+infer_event_link() {
+    local file="$1" actual="$1"
+    [[ -L "$file" ]] && actual=$(readlink "$file" 2>/dev/null)
+    [[ -f "$actual" ]] || return 0
+    # Already linked (watch-started header or app-linked meta)? Done.
+    grep -q '^# event: ' "$actual" 2>/dev/null && return 0
+    local metaf="${actual%.txt}.meta.json"
+    if [[ -f "$metaf" ]] && python3 - "$metaf" <<'PYEOF5' 2>/dev/null
+import json, sys
+raise SystemExit(0 if (json.load(open(sys.argv[1])).get("event") or {}).get("title") else 1)
+PYEOF5
+    then return 0; fi
+    local agent="$MK_HOME/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
+    [[ -x "$agent" ]] || return 0
+    local started=$(grep '^Started:' "$actual" 2>/dev/null | head -1 | sed 's/^Started: //')
+    local ended=$(grep '^Ended:' "$actual" 2>/dev/null | tail -1 | sed 's/^Ended: //')
+    [[ -n "$started" && -n "$ended" ]] || return 0
+    local hidden=$(grep '^hidden_calendars=' "$MK_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
+    local -a hargs=()
+    [[ -n "$hidden" ]] && hargs=(--hidden-calendars "$hidden")
+    local events_json
+    events_json=$("$agent" events         --from "$(python3 -c "
+from datetime import datetime, timedelta
+d = datetime.fromisoformat('$started'.replace('Z','+00:00'))
+print((d - timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))" 2>/dev/null)"         --to "$(python3 -c "
+from datetime import datetime, timedelta
+d = datetime.fromisoformat('$ended'.replace('Z','+00:00'))
+print((d + timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))" 2>/dev/null)"         "${hargs[@]}" 2>/dev/null) || return 0
+    [[ -n "$events_json" ]] || return 0
+    local inferred
+    # Events travel via env, NOT stdin — `python3 -` reads its script from
+    # the heredoc on stdin, so a pipe alongside it is silently empty.
+    inferred=$(MEETINK_EVENTS_JSON="$events_json" \
+        python3 - "$actual" "$started" "$ended" <<'PYEOF8' 2>/dev/null
+import json, os, sys
+from datetime import datetime
+
+def iso(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+txt, started, ended = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    events = json.loads(os.environ.get("MEETINK_EVENTS_JSON", "[]"))
+except Exception:
+    raise SystemExit(0)
+r0, r1 = iso(started), iso(ended)
+rec_dur = (r1 - r0).total_seconds()
+if rec_dur < 60:
+    raise SystemExit(0)
+best, best_ov = None, 0.0
+for e in events:
+    atts = e.get("attendees") or []
+    if len(atts) < 2:
+        continue
+    try:
+        e0, e1 = iso(e["start"]), iso(e["end"])
+    except Exception:
+        continue
+    ov = (min(r1, e1) - max(r0, e0)).total_seconds()
+    if ov > best_ov:
+        best, best_ov = e, ov
+# Confidence: the match must cover a real chunk of the recording —
+# ≥30% of it AND ≥2 minutes, or ≥10 minutes outright.
+if not best or not (best_ov >= 600 or (best_ov >= 120 and best_ov >= 0.3 * rec_dur)):
+    raise SystemExit(0)
+names = [a.get("name") or a.get("email") or "" for a in (best.get("attendees") or [])]
+names = [n for n in names if n]
+meta_p = txt[:-4] + ".meta.json"
+meta = {}
+try:
+    meta = json.load(open(meta_p))
+except Exception:
+    pass
+meta["event"] = {"title": best.get("title") or "",
+                 "start": best.get("start") or "",
+                 "attendees": names}
+json.dump(meta, open(meta_p, "w"), sort_keys=True)
+data = open(txt, errors="replace").read()
+lines = []
+if "# event: " not in data:
+    lines.append("# event: " + (best.get("title") or ""))
+if "# attendees: " not in data and names:
+    lines.append("# attendees: " + ", ".join(names))
+if lines:
+    i = data.find("Started:")
+    if i >= 0:
+        open(txt, "w").write(data[:i] + "
+".join(lines) + "
+" + data[i:])
+print(best.get("title") or "")
+PYEOF8
+)
+    if [[ -n "$inferred" ]]; then
+        print -P "${C[green]}✓${C[reset]} Linked to calendar event: ${C[bright_cyan]}${inferred}${C[reset]}"
+        typeset -f mk_activity >/dev/null 2>&1 &&             mk_activity "inferred event — ${inferred}"
+    fi
+    return 0
+}
+
 title_session_file() {
     local file="$1"
     [[ -f "$file" ]] || return 0

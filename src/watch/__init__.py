@@ -103,9 +103,13 @@ MEETING_END_QUIET_TICKS = 2
 #                       re-detection. Catches users wrapping a call where
 #                       the conferencing app re-activates briefly.
 INSTANT_CONFIRM_TICKS = 1
-INSTANT_SCHEDULED_BUFFER_S = 120
 INSTANT_SKIP_COOLDOWN_S = 1800
 INSTANT_END_COOLDOWN_S = 300
+
+# Presence-driven engine knobs.
+JOIN_EARLY_S = 600            # presence this early still matches the event
+FALLBACK_GRACE_S = 180        # event started, no presence → ask after this
+CONFLICT_WINDOW_S = 900       # "switch recording?" window after a new start
 
 
 class EventStatus(Enum):
@@ -137,6 +141,9 @@ class WatchedEvent:
     # calendar-backed events. Populated with the source label
     # (zoom/meet/teams/webex/...) the agent flagged at detection.
     detected_source: Optional[str] = None
+    # One-shot notification guards (presence-driven engine).
+    fallback_asked: bool = False     # "event started, no meeting app seen"
+    conflict_asked: bool = False     # "another meeting is starting — switch?"
 
     def score(self) -> int:
         """Higher = more deserving of being recorded when conflicting
@@ -598,14 +605,17 @@ class WatchManager:
         if now_wall - self._last_active_poll > poll_interval:
             self._poll_meeting_active()
 
-        # Recording start/stop based on event boundaries + meeting-active.
-        # Done outside the lock when possible (subprocess calls).
-        self._maybe_start_recording(now)
+        # Presence-driven engine: presence starts recordings (matched to
+        # the calendar when possible), the fallback asks when an event
+        # started with no presence, and the conflict alert offers a
+        # switch when a new event begins during ANY active recording.
         if self._currently_recording is not None:
             self._maybe_end_recording(now, now_wall)
         else:
             self._maybe_start_instant_recording(now, now_wall)
+            self._maybe_event_fallback(now)
             self._maybe_nudge_adopted_recording()
+        self._maybe_conflict_alert(now)
 
         # Expire events whose window has long passed and never recorded.
         with self._lock:
@@ -738,135 +748,88 @@ class WatchManager:
         threading.Thread(target=worker, daemon=True,
                          name=f"meetink-notify-{e.id[:8]}").start()
 
-    # -- recording start ---------------------------------------------------
+    # -- recording start (presence-driven engine) ---------------------------
+    #
+    # Recordings START when the user actually JOINS a meeting (presence),
+    # never at calendar time — event-time starts recorded silent rooms
+    # whenever the user skipped or joined undetectably (field bugs). The
+    # calendar's roles: identity for presence matches, the no-presence
+    # fallback ask, and the "another meeting is starting" conflict alert.
 
-    def _maybe_start_recording(self, now: datetime) -> None:
-        """At each tick, pick at most one event to start. Defers any
-        others whose start time has arrived but a recording is already
-        in flight."""
-        if self._currently_recording is not None:
-            with self._lock:
-                # Mark anything that should have started but can't, as
-                # deferred (rather than letting it sit notified forever).
-                for e in self._events.values():
-                    if e.status == EventStatus.NOTIFIED and \
-                       e.start <= now <= e.end:
-                        e.status = EventStatus.DEFERRED
-            return
-
-        with self._lock:
-            ready = [
-                e for e in self._events.values()
-                if e.status in (EventStatus.NOTIFIED, EventStatus.DEFERRED)
-                and e.start <= now <= e.end
-                # Synthetic instant-meeting events are owned by the
-                # _maybe_start_instant_recording worker thread — that
-                # path handles its own notification + /start. If this
-                # sweep also picks them up, two parallel /start calls
-                # race and one logs "/start failed: Already recording".
-                and e.detected_source is None
-            ]
-            if not ready:
-                return
-            # Conflict resolution: highest score wins. Ties broken by
-            # earliest start. _agent_notify can prompt the user on
-            # genuine ties (TODO: phase 3 tie-breaker UI).
-            ready.sort(key=lambda e: (-e.score(), e.start))
-            chosen = ready[0]
-
-        # Drop the lock while we shell out — both subprocesses can take
-        # 1-2 s on a cold whisper-server.
-        if chosen.project:
+    def _begin_event_recording(self, ev: WatchedEvent,
+                               armed: bool = False) -> bool:
+        """Shared start path for every identified-event start (presence
+        match, fallback ask, conflict switch). Handles project routing,
+        diarize sensitivity, the attendee whitelist, and state marking.
+        `armed` = presence already seen (end-detection active at birth)."""
+        if ev.project:
             self._project_before_routing = _active_project()
             self._routed_project = True
-            _project_use(chosen.project)
-
-        # Auto-tune diarize sensitivity from the attendee count before
-        # /start fires (so the very first /identify call hits the right
-        # preset). No-ops cleanly if diarize-server is off.
-        preset = _pick_preset_from_attendees(chosen.attendees)
+            _project_use(ev.project)
+        preset = _pick_preset_from_attendees(ev.attendees)
         if _apply_sensitivity_preset(preset):
-            print(
-                f"[watch] sensitivity → {preset} "
-                f"({len(chosen.attendees)} attendees, "
-                f"{chosen.title!r})",
-                file=sys.stderr,
-            )
-
-        # Restrict /identify to enrolled profiles whose names match the
-        # attendee list. Passed via MEETINK_WHITELIST so cmd_start sees
-        # the same source of truth as `/start alex stacey` — empty env
-        # var means cmd_start clears any stale whitelist for a clean
-        # slate. Eliminates the failure mode where Mike's voice scores
-        # 0.89 against ALEX in a meeting Alex isn't even in.
-        matched = _match_attendees_to_profiles(chosen.attendees)
-        env_extras = self._metadata_env(chosen)
+            _wlog(f"sensitivity → {preset} "
+                  f"({len(ev.attendees)} attendees, {ev.title!r})")
+        matched = _match_attendees_to_profiles(ev.attendees)
+        env_extras = self._metadata_env(ev)
         env_extras["MEETINK_WHITELIST"] = ",".join(matched)
-        if matched:
-            print(
-                f"[watch] whitelist → {matched} "
-                f"(matched from {chosen.title!r})",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"[watch] whitelist cleared "
-                f"(no enrolled attendees in {chosen.title!r})",
-                file=sys.stderr,
-            )
-
-        if _watch_mode() == "notify":
-            # Ask instead of auto-starting. The worker blocks on the
-            # notification click; mark RECORDING optimistically only
-            # after the user says yes.
-            with self._lock:
-                chosen.status = EventStatus.EXPIRED  # don't re-fire the sweep
-            ev = chosen
-
-            def confirm_worker():
-                # Both buttons; the TIMEOUT default is Skip — notify mode
-                # is opt-in, so an unanswered notification must NOT record
-                # (it previously auto-started after the 10-min wait).
-                # Persistence note: banner display time is the OS's call —
-                # Alerts style keeps it up; the buttons also remain
-                # clickable from Notification Center for the full window.
-                response = _agent_notify(
-                    title="Record this meeting?",
-                    body=ev.title,
-                    actions=["Start recording", "Skip"],
-                    default="Skip",
-                    timeout=600,
-                    linger=15,
-                )
-                if "start" not in (response or "").lower():
-                    _wlog(f"notify mode: user did not start '{ev.title}'")
-                    return
-                if _start_recording_subprocess(env_extras):
-                    with self._lock:
-                        ev.status = EventStatus.RECORDING
-                        ev.recorded_at = _now()
-                        self._currently_recording = ev.id
-                        self._seen_active_this_recording = False
-                        self._inactive_streak = 0
-                        self._last_active_poll = time.time()
-                    _wlog(f"recording started for event '{ev.title}' (user-confirmed)")
-
-            threading.Thread(target=confirm_worker, daemon=True).start()
-            return
-
+        _wlog(f"whitelist → {matched or 'cleared'} ({ev.title!r})")
         ok = _start_recording_subprocess(env_extras)
         with self._lock:
             if ok:
-                chosen.status = EventStatus.RECORDING
-                chosen.recorded_at = _now()
-                self._currently_recording = chosen.id
-                self._seen_active_this_recording = False
-                _wlog(f"recording started for event '{chosen.title}'")
+                ev.status = EventStatus.RECORDING
+                ev.recorded_at = _now()
+                self._currently_recording = ev.id
+                self._seen_active_this_recording = armed
                 self._inactive_streak = 0
                 self._last_active_poll = time.time()
+                _wlog(f"recording started for event '{ev.title}'")
             else:
-                # Mark expired so we don't keep retrying every tick.
-                chosen.status = EventStatus.EXPIRED
+                ev.status = EventStatus.EXPIRED
+        return ok
+
+    def _maybe_event_fallback(self, now: datetime) -> None:
+        """An attendee-event started FALLBACK_GRACE_S ago, nothing is
+        recording, and no meeting app is visible — the meeting may be on
+        a phone or an app we can't detect. Ask (in BOTH modes; this path
+        never blind-starts) instead of recording a silent room."""
+        with self._lock:
+            if self._last_meeting_active.get("active"):
+                return
+            candidates = [
+                e for e in self._events.values()
+                if e.status in (EventStatus.PENDING, EventStatus.NOTIFIED)
+                and e.detected_source is None
+                and len(e.attendees) >= 2
+                and not e.fallback_asked
+                and e.start + timedelta(seconds=FALLBACK_GRACE_S) <= now <= e.end
+            ]
+            if not candidates or _capture_pid() is not None:
+                return
+            candidates.sort(key=lambda e: (-e.score(), e.start))
+            ev = candidates[0]
+            ev.fallback_asked = True
+
+        def worker():
+            response = _agent_notify(
+                title=f"“{ev.title}” has started",
+                body="No meeting app detected — recording anyway?",
+                actions=["Start recording", "Skip"],
+                default="Skip",
+                timeout=600,
+                linger=20,
+            )
+            if "start" not in (response or "").lower():
+                _wlog(f"fallback declined/ignored for '{ev.title}'")
+                with self._lock:
+                    ev.status = EventStatus.SKIPPED
+                return
+            with self._lock:
+                if self._currently_recording is not None or _capture_pid():
+                    return
+            self._begin_event_recording(ev, armed=False)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _metadata_env(self, e: WatchedEvent) -> dict[str, str]:
         """Build the env dict consumed by main.swift's transcript-header
@@ -952,6 +915,110 @@ class WatchManager:
         if restore_project:
             _project_restore(getattr(self, "_project_before_routing", ""))
 
+    # -- conflict alert -----------------------------------------------------
+
+    def _current_recording_event_key(self) -> tuple[str, str]:
+        """(title, startISO-prefix) of the event linked to whatever is
+        recording right now — read from the live meeting's meta.json so
+        it survives daemon restarts and covers manual/adopted starts."""
+        try:
+            base = os.environ.get(
+                "MEETINK_TRANSCRIPTS_DIR",
+                os.path.expanduser("~/Documents/meetink"))
+            live = os.path.join(base, "live.txt")
+            target = os.path.realpath(live)
+            meta_p = target[:-4] + ".meta.json"
+            with open(meta_p) as f:
+                ev = (json.load(f).get("event") or {})
+            return (str(ev.get("title") or ""), str(ev.get("start") or "")[:16])
+        except Exception:
+            return ("", "")
+
+    def _maybe_conflict_alert(self, now: datetime) -> None:
+        """ANY active recording (auto, manual, adopted) + a different
+        attendee-event reaching its start time → ask whether to switch.
+        Never switches silently, never kills the current recording
+        without a click — meetings running long stay protected."""
+        if _capture_pid() is None:
+            return
+        with self._lock:
+            cur_id = self._currently_recording
+            candidates = [
+                e for e in self._events.values()
+                if e.detected_source is None
+                and len(e.attendees) >= 2
+                and e.status in (EventStatus.PENDING, EventStatus.NOTIFIED)
+                and not e.conflict_asked
+                and e.id != cur_id
+                and e.start <= now <= e.start + timedelta(seconds=CONFLICT_WINDOW_S)
+            ]
+            if not candidates:
+                return
+            candidates.sort(key=lambda e: (-e.score(), e.start))
+            ev = candidates[0]
+            cur_ev = self._events.get(cur_id) if cur_id else None
+        # The new event might BE the current recording (manual start that
+        # got linked, or a restart-orphaned watch recording) — compare
+        # against the live meeting's linked event before alerting.
+        cur_title, cur_start = self._current_recording_event_key()
+        if cur_title and cur_title == ev.title \
+                and ev.start.isoformat()[:16] == cur_start:
+            with self._lock:
+                ev.conflict_asked = True
+            return
+        with self._lock:
+            ev.conflict_asked = True
+        current_desc = (cur_ev.title if cur_ev
+                        else (cur_title or "the current recording"))
+        _wlog(f"conflict: '{ev.title}' starting while recording "
+              f"'{current_desc}' — asking")
+
+        def worker():
+            response = _agent_notify(
+                title=f"“{ev.title}” is starting",
+                body=f"Still recording “{current_desc}”. Switch recordings?",
+                actions=["Switch recording", "Keep current"],
+                default="Keep current",
+                timeout=240,
+                linger=30,
+            )
+            if "switch" not in (response or "").lower():
+                _wlog(f"conflict: keeping current over '{ev.title}'")
+                return
+            self._switch_recording(ev)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _switch_recording(self, ev: WatchedEvent) -> None:
+        """Stop the current recording WITHOUT waiting for its
+        post-processing (the pipeline runs minutes; per-session spools
+        and the refine lock make overlap safe — field-proven), then
+        start the new event as soon as capture has exited."""
+        _wlog(f"switching recordings → '{ev.title}'")
+        with self._lock:
+            old_id = self._currently_recording
+            if old_id and old_id in self._events:
+                self._events[old_id].status = EventStatus.COMPLETED
+            self._currently_recording = None
+            self._inactive_streak = 0
+        try:
+            subprocess.Popen([str(LAUNCHER), "stop"],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             env={**os.environ, "MEETINK_NO_TAIL": "1"})
+        except Exception as exc:
+            _wlog(f"switch: stop spawn failed: {exc}")
+            return
+        for _ in range(30):
+            if _capture_pid() is None:
+                break
+            time.sleep(1)
+        if _capture_pid() is not None:
+            _wlog("switch: capture did not exit — aborting new start")
+            return
+        time.sleep(2)   # let cmd_stop finish consolidating/retargeting
+        self._begin_event_recording(ev, armed=True)
+
     # -- adopted recordings (started manually, not by the watch) -----------
 
     def _maybe_nudge_adopted_recording(self) -> None:
@@ -1007,14 +1074,16 @@ class WatchManager:
     def _maybe_start_instant_recording(
         self, now: datetime, now_wall: float
     ) -> None:
-        """Detect calls that start without a calendar event and offer
-        to record. Suppressed during scheduled-event windows + cooldowns;
-        requires INSTANT_CONFIRM_TICKS active polls before firing.
+        """THE start trigger: the user is presently in a meeting
+        (INSTANT_CONFIRM_TICKS stable active polls). A calendar
+        attendee-event covering now makes it an identified start (named,
+        linked, right sensitivity); otherwise it is an instant start.
 
         Notification is fire-and-forget: a worker thread blocks on the
         agent until the user clicks Skip or the timeout expires (default
         = record). _instant_pending guards against re-entry while the
         user is still deciding."""
+        matched_event: WatchedEvent | None = None
         with self._lock:
             if self._instant_pending:
                 return
@@ -1022,24 +1091,30 @@ class WatchManager:
                 return
             if now_wall < self._end_cooldown_until:
                 return
-            # Don't compete with the scheduled path. Anything notified /
-            # deferred / recording owns the moment; anything pending
-            # within INSTANT_SCHEDULED_BUFFER_S of starting also does
-            # (it's about to claim the next minute anyway).
-            for e in self._events.values():
-                if e.status in (EventStatus.NOTIFIED, EventStatus.DEFERRED,
-                                EventStatus.RECORDING):
-                    return
-                if e.status == EventStatus.PENDING:
-                    until_start = (e.start - now).total_seconds()
-                    if 0 < until_start < INSTANT_SCHEDULED_BUFFER_S:
-                        return
-
             if self._instant_streak < INSTANT_CONFIRM_TICKS:
                 return
             active = self._last_meeting_active
             if not active.get("active"):
                 return
+
+            # Presence is THE start trigger. First: is this a calendar
+            # meeting? Match attendee-events whose window covers now
+            # (joining up to JOIN_EARLY_S early counts). A SKIPPED match
+            # means the user declined this meeting — respect it and don't
+            # fall through to an instant start of the same call.
+            covering = [
+                e for e in self._events.values()
+                if e.detected_source is None
+                and len(e.attendees) >= 2
+                and e.start - timedelta(seconds=JOIN_EARLY_S) <= now <= e.end
+            ]
+            if any(e.status == EventStatus.SKIPPED for e in covering):
+                return
+            startable = [e for e in covering if e.status in
+                         (EventStatus.PENDING, EventStatus.NOTIFIED)]
+            if startable:
+                startable.sort(key=lambda e: (-e.score(), e.start))
+                matched_event = startable[0]
 
             # Reserve the slot. Reset streak so a Skip-then-stay-in-call
             # doesn't immediately re-arm; the cooldown set by the worker
@@ -1048,6 +1123,41 @@ class WatchManager:
             self._instant_streak = 0
             source = active.get("source") or "meeting"
             signals = list(active.get("signals", []))
+
+        if matched_event is not None:
+            ev = matched_event
+            _wlog(f"presence matched calendar event '{ev.title}' ({source})")
+
+            def event_worker() -> None:
+                try:
+                    if _watch_mode() == "notify":
+                        response = _agent_notify(
+                            title="Record this meeting?",
+                            body=ev.title,
+                            actions=["Start recording", "Skip"],
+                            default="Skip",
+                            timeout=600,
+                            linger=15,
+                        )
+                        if "start" not in (response or "").lower():
+                            with self._lock:
+                                ev.status = EventStatus.SKIPPED
+                            _wlog(f"notify mode: user skipped '{ev.title}'")
+                            return
+                    with self._lock:
+                        if self._currently_recording is not None:
+                            return
+                    # Presence seen → end-detection armed at birth.
+                    self._begin_event_recording(ev, armed=True)
+                finally:
+                    with self._lock:
+                        self._instant_pending = False
+
+            threading.Thread(target=event_worker, daemon=True,
+                             name="meetink-event-start").start()
+            return
+
+        with self._lock:
 
             instant_id = f"instant-{int(now_wall)}"
             ev = WatchedEvent(
