@@ -184,8 +184,12 @@ func setProfileEmail(_ email: String, profile: String) {
     var map = profileEmailMap()
     // Canonical profile casing — "ed" links as "Ed" (the same
     // case-insensitive rule the diarize server applies to assignment).
+    // Not-yet-enrolled names (typed or taken from an ALL-CAPS transcript
+    // label) store Title Case so the link reads like every other one;
+    // matching is case-insensitive everywhere, so this is cosmetic-safe.
     let low = profile.lowercased()
-    let canonical = enrolledProfiles().first { $0.lowercased() == low } ?? profile
+    let canonical = enrolledProfiles().first { $0.lowercased() == low }
+        ?? (profile == profile.uppercased() ? profile.capitalized : profile)
     map[email.lowercased()] = canonical
     if let data = try? JSONSerialization.data(withJSONObject: map,
                                               options: [.sortedKeys]) {
@@ -1137,13 +1141,26 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         strip.orientation = .horizontal
         strip.spacing = 8
 
-        let header = NSStackView(views: [titleField, strip])
+        // Title row: editable title on the left, the calendar-event
+        // button right-aligned on the same line (the spacer soaks up
+        // the slack, and keeps the button right even when the title
+        // is hidden on the live view).
+        let titleSpacer = NSView()
+        titleSpacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1),
+                                              for: .horizontal)
+        let titleRow = NSStackView(views: [titleField, titleSpacer, eventButton])
+        titleRow.orientation = .horizontal
+        titleRow.spacing = 8
+        titleField.setContentCompressionResistancePriority(
+            NSLayoutConstraint.Priority(740), for: .horizontal)
+
+        let header = NSStackView(views: [titleRow, strip])
         header.orientation = .vertical
         header.alignment = .leading
         header.spacing = 2
         header.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
         header.translatesAutoresizingMaskIntoConstraints = false
-        titleField.widthAnchor.constraint(equalTo: header.widthAnchor, constant: -24).isActive = true
+        titleRow.widthAnchor.constraint(equalTo: header.widthAnchor, constant: -24).isActive = true
         strip.widthAnchor.constraint(equalTo: header.widthAnchor, constant: -24).isActive = true
 
         statusDot.font = NSFont.systemFont(ofSize: 12)
@@ -1182,7 +1199,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         strip.addArrangedSubview(statusDot)
         strip.addArrangedSubview(headerField)
         strip.addArrangedSubview(NSView())
-        strip.addArrangedSubview(eventButton)
         strip.addArrangedSubview(copyButton)
         strip.addArrangedSubview(downloadButton)
         strip.addArrangedSubview(menuButton)
@@ -2114,7 +2130,17 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         alert.addButton(withTitle: "Reassign")
         alert.addButton(withTitle: "Cancel")
         let combo = NSComboBox(frame: NSRect(x: 0, y: 0, width: 220, height: 25))
-        combo.addItems(withObjectValues: enrolledProfiles())
+        // Suggest enrolled profiles PLUS this meeting's named speakers —
+        // a just-assigned guest ("ALLEN") may have no profile yet but is
+        // exactly who segments get reassigned to (field report).
+        var suggestions = enrolledProfiles()
+        let known = Set(suggestions.map { $0.lowercased() })
+        for sp in speakers.map(\.name)
+        where sp != "THEM" && sp != "ME" && !sp.hasPrefix("Speaker ")
+            && !known.contains(sp.lowercased()) {
+            suggestions.append(sp)
+        }
+        combo.addItems(withObjectValues: suggestions)
         combo.placeholderString = "Name"
         combo.completes = true
         combo.numberOfVisibleItems = 16
@@ -2307,6 +2333,25 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             // change detector can't see it ('sometimes the name updates,
             // sometimes not until I reopen the meeting').
             DispatchQueue.main.async { self?.refreshIfChanged(force: true) }
+            if proc.terminationStatus == 0,
+               out.contains("renaming transcript lines only") {
+                // The transcript was rewritten, but the session had no
+                // voice data for this label (server restarted, or the
+                // meeting is old) — the user must know no profile was
+                // created or trained (field case: "assigned Allen, no
+                // profile exists on the Profiles page").
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Renamed in transcript only"
+                    alert.informativeText = "No voice data for this "
+                        + "speaker was still available, so no voice "
+                        + "profile was created or trained. The name "
+                        + "shows in this transcript; to give them a "
+                        + "profile, use Profiles → Add when they're "
+                        + "next in a meeting."
+                    alert.runModal()
+                }
+            }
             if proc.terminationStatus != 0 || out.lowercased().contains("error") {
                 DispatchQueue.main.async {
                     let alert = NSAlert()
