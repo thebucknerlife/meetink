@@ -400,6 +400,18 @@ def _start_recording_subprocess(env_extras: dict[str, str]) -> bool:
     return True
 
 
+def _transcript_idle_seconds() -> float:
+    """Seconds since the live transcript last grew — a cheap 'is anyone
+    speaking' signal (appends happen within seconds of speech)."""
+    try:
+        base = os.environ.get("MEETINK_TRANSCRIPTS_DIR",
+                              os.path.expanduser("~/Documents/meetink"))
+        target = os.path.realpath(os.path.join(base, "live.txt"))
+        return max(0.0, time.time() - os.path.getmtime(target))
+    except OSError:
+        return 0.0
+
+
 def _capture_pid() -> Optional[int]:
     """PID of a live capture process (whoever started it), else None."""
     try:
@@ -1055,24 +1067,80 @@ class WatchManager:
                 self._adopted_nudged = True
                 should_nudge = True
         if should_nudge:
-            _wlog(f"adopted recording (pid {pid}): meeting app gone — nudging")
-            threading.Thread(target=self._adopted_nudge_worker,
-                             args=(pid,), daemon=True).start()
+            if _watch_mode() == "auto":
+                # Auto mode: Rule 2 is universal — the meeting app was
+                # seen during this recording and is now gone, so stop,
+                # manual start or not. (An in-person recording never
+                # arms this: no meeting app was ever seen.)
+                _wlog(f"adopted recording (pid {pid}): meeting app gone — "
+                      f"auto mode, stopping")
+                threading.Thread(target=self._adopted_auto_stop,
+                                 args=(pid,), daemon=True).start()
+            else:
+                _wlog(f"adopted recording (pid {pid}): meeting app gone — nudging")
+                threading.Thread(target=self._adopted_nudge_worker,
+                                 args=(pid,), daemon=True).start()
+
+    def _adopted_auto_stop(self, pid: int) -> None:
+        if _capture_pid() != pid:
+            return
+        _agent_notify(
+            title="Recording stopped",
+            body="The meeting app closed — auto mode stopped the recording.",
+            actions=["OK"], default="OK", timeout=1, linger=0,
+        )
+        _stop_recording_subprocess()
 
     def _adopted_nudge_worker(self, pid: int) -> None:
+        # default is a sentinel so a TIMEOUT/dismissal is distinguishable
+        # from an explicit "Keep recording" click — an unseen nudge used
+        # to mean infinite recording (field incident: Zoom quit, nudge
+        # missed, recording ran on).
         response = _agent_notify(
             title="Meeting app closed — still recording",
-            body="This recording wasn't started by the watcher, so it won't stop on its own.",
+            body="Stop the recording? (It stops by itself once nothing "
+                 "is being said.)",
             actions=["Stop recording", "Keep recording"],
-            default="Keep recording",
+            default="(timeout)",
             timeout=300,
             linger=25,
         )
-        if "stop" in (response or "").lower():
-            # Only stop if it's still the same capture the nudge was about.
+        low = (response or "").lower()
+        if "stop" in low:
             if _capture_pid() == pid:
                 _wlog(f"adopted recording (pid {pid}): user chose Stop")
                 _stop_recording_subprocess()
+            return
+        if "keep" in low:
+            _wlog(f"adopted recording (pid {pid}): user chose Keep — respecting")
+            return
+        # Unanswered. Escalate: while the meeting app stays gone, stop as
+        # soon as nothing has been said for 5 minutes (transcript idle).
+        # Speech continuing (in-person follow-on) keeps it alive; the app
+        # reappearing cancels; capped at 60 min (the silence/4 h guards
+        # remain behind this).
+        _wlog(f"adopted recording (pid {pid}): nudge unanswered — "
+              f"escalation armed (stop on 5 min of silence)")
+        for _ in range(120):
+            time.sleep(30)
+            if _capture_pid() != pid:
+                return
+            with self._lock:
+                if self._last_meeting_active.get("active"):
+                    _wlog("adopted escalation: meeting app back — standing down")
+                    return
+            if _transcript_idle_seconds() >= 300:
+                _wlog(f"adopted recording (pid {pid}): meeting gone + "
+                      f"5 min silent — stopping")
+                _agent_notify(
+                    title="Recording stopped",
+                    body="The meeting ended and nothing was said for 5 "
+                         "minutes.",
+                    actions=["OK"], default="OK", timeout=1, linger=0,
+                )
+                if _capture_pid() == pid:
+                    _stop_recording_subprocess()
+                return
 
     # -- instant-meeting detection ----------------------------------------
 
