@@ -814,7 +814,7 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
                 lbl.trailingAnchor.constraint(lessThanOrEqualTo: cont.trailingAnchor, constant: -8),
                 lbl.topAnchor.constraint(equalTo: cont.topAnchor, constant: 3),
                 lbl.bottomAnchor.constraint(equalTo: cont.bottomAnchor, constant: -3),
-                cont.widthAnchor.constraint(equalToConstant: 260),
+                cont.widthAnchor.constraint(equalToConstant: 332),
             ])
             cont.identifier = NSUserInterfaceItemIdentifier("\(i)")
             cont.addGestureRecognizer(NSClickGestureRecognizer(
@@ -827,7 +827,7 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
             let sep = NSBox()
             sep.boxType = .separator
             stack.addArrangedSubview(sep)
-            sep.widthAnchor.constraint(equalToConstant: 260).isActive = true
+            sep.widthAnchor.constraint(equalToConstant: 332).isActive = true
         }
 
         combo.completes = true
@@ -858,6 +858,10 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             stack.topAnchor.constraint(equalTo: root.topAnchor),
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            // Fixed content width sized so the field + Assign + Cancel
+            // always fit INSIDE the popover (field report: the buttons
+            // ran off the edge when the popover hugged the name rows).
+            root.widthAnchor.constraint(equalToConstant: 352),
         ])
         view = root
     }
@@ -947,6 +951,13 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
         // NSComboBox's native handling, which opens the dropdown.
         if selector == #selector(NSResponder.cancelOperation(_:)) {
             onClose()
+            return true
+        }
+        // ↑ with the dropdown CLOSED climbs back into the name list
+        // (an open dropdown handles its own arrows and never gets here).
+        if selector == #selector(NSResponder.moveUp(_:)), !inMeeting.isEmpty {
+            view.window?.makeFirstResponder(keyView)
+            select(rowContainers.count - 1)
             return true
         }
         return false
