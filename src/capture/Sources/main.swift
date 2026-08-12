@@ -101,18 +101,84 @@ func int16Data(_ samples: [Float]) -> Data {
     return data
 }
 
+func hostTicksToSeconds(_ ticks: UInt64) -> Double {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    return Double(ticks) * Double(info.numer) / Double(info.denom) / 1_000_000_000.0
+}
+
+/// Seconds on the host clock (mach_absolute_time scaled).
+func hostSeconds() -> Double {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    return Double(mach_absolute_time()) * Double(info.numer)
+        / Double(info.denom) / 1_000_000_000.0
+}
+
 final class SpoolWriter: @unchecked Sendable {
     private let handle: FileHandle?
+    private let rate: Double
+    private let lock = NSLock()
+    // Wall-clock tracking: dropped buffers (SCK under load, mic tap
+    // rebuilds) silently COMPRESS a spool's timeline, and the two spools'
+    // relative alignment then random-walks by seconds over a meeting —
+    // measured 40ms-1.4s of non-monotonic wander, which quietly broke
+    // every offline echo tool (they all assume a near-static delay).
+    // Writers stamped with each buffer's host time insert silence for
+    // the missing stretch, so the spool IS a wall-clock timeline and the
+    // pair stays aligned by construction.
+    private var expectedAt: Double = -1
+    private let epoch: Double
 
-    init(path: String?) {
+    init(path: String?, rate: Double = sampleRate, epoch: Double = -1) {
+        self.rate = rate
+        self.epoch = epoch
         guard let path = path else { handle = nil; return }
         FileManager.default.createFile(atPath: path, contents: nil)
         handle = FileHandle(forWritingAtPath: path)
     }
 
+    /// Legacy append (sim mode / no timing source): straight write.
     func append(_ samples: [Float]) {
         guard let handle = handle else { return }
+        lock.lock()
         handle.write(int16Data(samples))
+        expectedAt = -2   // mixed-mode marker; stamped appends stop gap-filling
+        lock.unlock()
+    }
+
+    /// Wall-clock append: `at` is the host time of samples[0].
+    func append(_ samples: [Float], at: Double) {
+        guard let handle = handle else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        if expectedAt == -1 {
+            // First buffer: pad from the shared session epoch so both
+            // streams' timelines start at the same instant. If the
+            // stamp isn't in the host-clock domain (>5 s from epoch),
+            // fall back to per-stream start rather than writing a
+            // mountain of silence.
+            expectedAt = (epoch > 0 && abs(at - epoch) < 5) ? epoch : at
+        }
+        if expectedAt >= 0 {
+            let gap = at - expectedAt
+            if gap > 0.04 {
+                // Missing audio — hold the timeline with silence.
+                var missing = Int(gap * rate)
+                let zeros = [Float](repeating: 0, count: min(missing, Int(rate)))
+                while missing > 0 {
+                    handle.write(int16Data(Array(zeros.prefix(min(missing, zeros.count)))))
+                    missing -= zeros.count
+                }
+            }
+            // gap < -0.04 (overlap) is left alone: timestamps jittering
+            // backwards are device-report noise, and dropping samples
+            // would lose real audio.
+        }
+        handle.write(int16Data(samples))
+        if expectedAt >= 0 {
+            expectedAt = max(expectedAt, at) + Double(samples.count) / rate
+        }
     }
 
     func close() {
@@ -925,6 +991,10 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
     let targetFormat: AVAudioFormat
     /// 48 kHz sys archive spool; nil when archive spooling is off.
     let archiveSpool: SpoolWriter?
+    /// 16 kHz sys spool — written HERE (with the buffer's host time)
+    /// rather than in the chunk loop, so gaps become silence and the
+    /// spool timeline stays wall-clock true.
+    let spool16: SpoolWriter?
     // Persistent downsampler for the whisper path when SCK runs at the
     // archive rate. One instance across callbacks — AVAudioConverter
     // carries filter state internally, so the stream stays continuous
@@ -932,9 +1002,11 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
     private var downConverter: AVAudioConverter?
     private var downConverterRate: Double = 0
 
-    init(buffer: AudioBuffer, archiveSpool: SpoolWriter? = nil) {
+    init(buffer: AudioBuffer, archiveSpool: SpoolWriter? = nil,
+         spool16: SpoolWriter? = nil) {
         self.buffer = buffer
         self.archiveSpool = archiveSpool
+        self.spool16 = spool16
         self.targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
         super.init()
     }
@@ -979,6 +1051,8 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
             monoSamples = float32Samples
         }
 
+        let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+
         // Full-bandwidth archive copy first, straight from the stream —
         // it is also the 48 kHz canceller's far-end reference.
         if let archiveSpool {
@@ -986,7 +1060,7 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
                 ? monoSamples
                 : resampleLinear(monoSamples, from: inputRate, to: archiveRate)
             aecFeedFar(arch, aecHandle48)
-            archiveSpool.append(arch)
+            archiveSpool.append(arch, at: pts)
         }
 
         // Whisper path: 16 kHz. When SCK delivers 16 kHz directly (archive
@@ -995,6 +1069,7 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
             // The sys stream is the AEC's far-end reference — feed it
             // before it lands in the transcription buffer.
             aecFeedFar(samples, aecHandle)
+            spool16?.append(samples, at: pts)
             buffer.appendSystem(samples)
         }
         if abs(inputRate - sampleRate) <= 1.0 {
@@ -1236,13 +1311,22 @@ struct LocalSpeechCapture {
         if let dir = spoolDir {
             try? FileManager.default.createDirectory(
                 atPath: dir, withIntermediateDirectories: true)
-            spoolSys = SpoolWriter(path: "\(dir)/session-sys.raw")
-            spoolMic = SpoolWriter(path: "\(dir)/session-mic.raw")
+            // One epoch for every stream: all spool timelines start at
+            // the same wall-clock instant and stay aligned through gaps
+            // (real mode stamps every append with the buffer's host
+            // time; sim mode keeps the legacy chunk-loop writes).
+            let epoch = hostSeconds()
+            spoolSys = SpoolWriter(path: "\(dir)/session-sys.raw",
+                                   rate: sampleRate, epoch: epoch)
+            spoolMic = SpoolWriter(path: "\(dir)/session-mic.raw",
+                                   rate: sampleRate, epoch: epoch)
             if spool48Enabled {
-                spool48Sys = SpoolWriter(path: "\(dir)/session-sys.48k.raw")
-                spool48Mic = SpoolWriter(path: "\(dir)/session-mic.48k.raw")
+                spool48Sys = SpoolWriter(path: "\(dir)/session-sys.48k.raw",
+                                         rate: archiveRate, epoch: epoch)
+                spool48Mic = SpoolWriter(path: "\(dir)/session-mic.48k.raw",
+                                         rate: archiveRate, epoch: epoch)
             }
-            fputs("Spooling session audio to \(dir) (for post-meeting refine"
+            fputs("Spooling session audio to \(dir) (wall-clock timelines"
                   + (spool48Enabled ? " + 48 kHz archive" : "") + ")\n", stderr)
         }
 
@@ -1296,7 +1380,8 @@ struct LocalSpeechCapture {
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let delegate = CaptureDelegate(buffer: audioBuffer,
-                                       archiveSpool: spool48Enabled ? spool48Sys : nil)
+                                       archiveSpool: spool48Enabled ? spool48Sys : nil,
+                                       spool16: spoolDir != nil ? spoolSys : nil)
 
         let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
         try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: DispatchQueue(label: "system-audio"))
@@ -1411,9 +1496,11 @@ struct LocalSpeechCapture {
             let archiveFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                               sampleRate: archiveRate,
                                               channels: 1, interleaved: false)!
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { inBuffer, _ in
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { inBuffer, when in
                 let inFormat = inBuffer.format
                 guard inFormat.sampleRate > 0 else { return }
+                let at = when.isHostTimeValid
+                    ? hostTicksToSeconds(when.hostTime) : hostSeconds()
                 if converterInputFormat != inFormat {
                     converter = AVAudioConverter(from: inFormat, to: targetFormat)
                     converterInputFormat = inFormat
@@ -1431,6 +1518,7 @@ struct LocalSpeechCapture {
                     // Subtract the speaker bleed (sys is the reference)
                     // before the gate/whisper/spool ever see it.
                     aecProcessNear(&samples, aecHandle)
+                    spoolMic.append(samples, at: at)
                     audioBuffer.appendMic(samples)
                     updateMicHeartbeat()
                 }
@@ -1452,11 +1540,10 @@ struct LocalSpeechCapture {
                         // suppressor bakes robotic double-talk artifacts
                         // into the playback audio (field verdict — the
                         // user's natural voice beat every cleaned
-                        // variant). The transcript-driven mix gates the
-                        // bleed instead; neural AEC (DTLN) is the
-                        // planned proper fix.
+                        // variant). Neural AEC on wall-clock-aligned
+                        // spools is the proper fix.
                         spool48Mic.append(Array(UnsafeBufferPointer(
-                            start: fd[0], count: Int(out48.frameLength))))
+                            start: fd[0], count: Int(out48.frameLength))), at: at)
                     }
                 }
             }
@@ -1577,8 +1664,13 @@ struct LocalSpeechCapture {
             if let chunks = audioBuffer.tryExtractChunks() {
                 let idx = audioBuffer.chunkIndex
 
-                if let s = chunks.system { spoolSys.append(s) }
-                if let m = chunks.mic { spoolMic.append(m) }
+                // Real mode spools from the capture callbacks (with host
+                // timestamps); the loop only spools for the sim feeder,
+                // which has no hardware timing.
+                if simMode {
+                    if let s = chunks.system { spoolSys.append(s) }
+                    if let m = chunks.mic { spoolMic.append(m) }
+                }
 
                 if let sysSamples = chunks.system {
                     let sent = hasAudio(sysSamples)
@@ -1622,8 +1714,10 @@ struct LocalSpeechCapture {
         transcriptMerger.flushAll()
 
         let remaining = audioBuffer.flush()
-        if let s = remaining.system { spoolSys.append(s) }
-        if let m = remaining.mic { spoolMic.append(m) }
+        if simMode {
+            if let s = remaining.system { spoolSys.append(s) }
+            if let m = remaining.mic { spoolMic.append(m) }
+        }
         spoolSys.close()
         spoolMic.close()
         spool48Sys.close()
