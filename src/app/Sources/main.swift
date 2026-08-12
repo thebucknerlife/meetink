@@ -3776,6 +3776,8 @@ final class SettingsViewController: NSViewController {
     private var calendarBoxes: [(box: NSButton, id: String)] = []
     private let keepAudioBox = NSButton(
         checkboxWithTitle: "Keep audio recording", target: nil, action: nil)
+    private let denoiseBox = NSButton(
+        checkboxWithTitle: "Noise reduction", target: nil, action: nil)
 
     override func loadView() {
         let root = NSView()
@@ -3787,6 +3789,8 @@ final class SettingsViewController: NSViewController {
         keepAudioBox.action = #selector(toggled(_:))
         keepSpoolsBox.target = self
         keepSpoolsBox.action = #selector(toggled(_:))
+        denoiseBox.target = self
+        denoiseBox.action = #selector(toggled(_:))
         watchModePopup.addItems(withTitles: [
             "Disabled", "Notify only (ask before recording)", "Automatic"])
         watchModePopup.target = self
@@ -3805,6 +3809,10 @@ final class SettingsViewController: NSViewController {
         let spoolsCaption = caption(
             "Keep the raw microphone and system-audio streams as two separate "
             + "wav files — replayable end-to-end with `meetink simulate`.")
+        let denoiseCaption = caption(
+            "Reduce steady background noise (AC, traffic, birds) in the "
+            + "playback audio. Conservative by design; only the microphone "
+            + "stream is treated, and the raw files are always kept untouched.")
         let watchRow = NSStackView(views: [
             NSTextField(labelWithString: "Meeting watch:"), watchModePopup])
         watchRow.orientation = .horizontal
@@ -3831,6 +3839,7 @@ final class SettingsViewController: NSViewController {
             watchRow, watchCaption,
             keepAudioBox, audioCaption,
             keepSpoolsBox, spoolsCaption,
+            denoiseBox, denoiseCaption,
             calTitle, calCaption, calendarsStack,
             footnote,
         ])
@@ -3843,7 +3852,9 @@ final class SettingsViewController: NSViewController {
         stack.setCustomSpacing(2, after: keepAudioBox)
         stack.setCustomSpacing(18, after: audioCaption)
         stack.setCustomSpacing(2, after: keepSpoolsBox)
-        stack.setCustomSpacing(20, after: spoolsCaption)
+        stack.setCustomSpacing(18, after: spoolsCaption)
+        stack.setCustomSpacing(2, after: denoiseBox)
+        stack.setCustomSpacing(20, after: denoiseCaption)
         stack.setCustomSpacing(2, after: calTitle)
         stack.setCustomSpacing(8, after: calCaption)
         stack.setCustomSpacing(24, after: calendarsStack)
@@ -3873,6 +3884,9 @@ final class SettingsViewController: NSViewController {
         super.viewWillAppear()
         keepAudioBox.state = configBool("keep_audio") ? .on : .off
         keepSpoolsBox.state = configBool("keep_spools") ? .on : .off
+        // Denoise defaults ON when the key is absent.
+        let dn = configValue("denoise") ?? "true"
+        denoiseBox.state = (dn == "off" || dn == "false") ? .off : .on
         if !configBool("watch_enabled") {
             watchModePopup.selectItem(at: 0)
         } else {
@@ -3932,7 +3946,8 @@ final class SettingsViewController: NSViewController {
     }
 
     @objc private func toggled(_ sender: NSButton) {
-        let key = sender == keepAudioBox ? "keep_audio" : "keep_spools"
+        let key = sender == keepAudioBox ? "keep_audio"
+            : sender == denoiseBox ? "denoise" : "keep_spools"
         configSetValue(key, sender.state == .on ? "true" : "false")
     }
 
