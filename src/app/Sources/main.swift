@@ -2300,16 +2300,53 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// an entry = this line starts a new block even under the same
     /// speaker). Empty during live recording (no sidecar yet).
     private func loadHardBreaks(_ txtPath: String) -> Set<Int> {
-        let tPath = (txtPath as NSString).deletingPathExtension + ".timing.json"
-        guard let data = FileManager.default.contents(atPath: tPath),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tl = obj["lines"] as? [[String: Any]] else { return [] }
         var out: Set<Int> = []
-        for (i, e) in tl.enumerated()
-        where (e["hard"] as? Bool) == true || (e["hard"] as? Int) == 1 {
-            out.insert(i)
+        let tPath = (txtPath as NSString).deletingPathExtension + ".timing.json"
+        if let data = FileManager.default.contents(atPath: tPath),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let tl = obj["lines"] as? [[String: Any]] {
+            for (i, e) in tl.enumerated()
+            where (e["hard"] as? Bool) == true || (e["hard"] as? Int) == 1 {
+                out.insert(i)
+            }
+        }
+        // Meetings WITHOUT a timing sidecar (old recordings, imports)
+        // keep their hard breaks in meta.json instead — the field case:
+        // splitting there wrote the text fine, the flag had nowhere to
+        // live, and the halves silently folded back together.
+        for v in (meetingMeta(txtPath)["hard_breaks"] as? [Int]) ?? [] {
+            out.insert(v)
         }
         return out
+    }
+
+    private func hasAlignedTiming() -> Bool {
+        let tPath = (lastResolvedPath as NSString).deletingPathExtension + ".timing.json"
+        guard let data = FileManager.default.contents(atPath: tPath),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tl = obj["lines"] as? [[String: Any]] else { return false }
+        return tl.count == snapshot.lines.count
+    }
+
+    /// Shift the meta-stored hard breaks in lockstep with a structural
+    /// edit. Only sidecar-less meetings use the meta list, and those
+    /// can't be reprocessed/relabeled (no kept audio), so the app's own
+    /// edit functions are the only index-shifters.
+    private func adjustMetaHardBreaks(insertAfter line: Int? = nil,
+                                      deleted: [Int] = []) {
+        var breaks = (meetingMeta(lastResolvedPath)["hard_breaks"] as? [Int]) ?? []
+        guard !breaks.isEmpty || line != nil else { return }
+        if !deleted.isEmpty {
+            let gone = Set(deleted)
+            breaks = breaks.filter { !gone.contains($0) }
+                .map { b in b - deleted.filter { $0 < b }.count }
+        }
+        if let line {
+            breaks = breaks.map { $0 > line ? $0 + 1 : $0 }
+            breaks.append(line + 1)
+        }
+        setMeetingMeta(lastResolvedPath, "hard_breaks",
+                       Array(Set(breaks)).sorted())
     }
 
     private func lineIndex(forChar charIndex: Int) -> Int? {
@@ -2522,6 +2559,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 tl.remove(at: line)
             }
         }
+        adjustMetaHardBreaks(deleted: valid)
         writeTranscriptLines(all)
     }
 
@@ -3245,6 +3283,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         if newText.isEmpty {
             all.remove(at: idx[line])
             spliceTiming(line: line, with: [])
+            adjustMetaHardBreaks(deleted: [line])
         } else {
             all[idx[line]] = "[\(seg.timestamp)] \(seg.speaker): \(newText)"
             // The line's word timings no longer match its text — keep the
@@ -3267,15 +3306,24 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
               line < snapshot.lines.count else { return false }
         let seg = snapshot.lines[line]
         let text = seg.text as NSString
-        guard offset > 0, offset < text.length else { return false }
-        // Snap the cut to the nearest word boundary.
+        guard offset > 0, offset < text.length else {
+            flashStatus("couldn't split here — right-click a later word "
+                        + "(it starts the second half)")
+            return false
+        }
+        // Snap BACKWARD to the start of the clicked word — "split here"
+        // means the word under the cursor begins the second half.
         var cut = offset
-        while cut < text.length,
+        while cut > 0,
               !CharacterSet.whitespaces.contains(
-                Unicode.Scalar(text.character(at: cut)) ?? " ") { cut += 1 }
+                Unicode.Scalar(text.character(at: cut - 1)) ?? " ") { cut -= 1 }
         let first = text.substring(to: cut).trimmingCharacters(in: .whitespaces)
         let second = text.substring(from: cut).trimmingCharacters(in: .whitespaces)
-        guard !first.isEmpty, !second.isEmpty else { return false }
+        guard !first.isEmpty, !second.isEmpty else {
+            flashStatus("couldn't split here — right-click a later word "
+                        + "(it starts the second half)")
+            return false
+        }
         snapshotBeforeFirstEdit()
 
         // Second half's timestamp: the timing entry's word whose text
@@ -3310,10 +3358,15 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         all[idx[line]] = "[\(seg.timestamp)] \(seg.speaker): \(first)"
         all.insert("[\(stamp2)] \(seg.speaker): \(second)", at: idx[line] + 1)
         let t1 = line < lineOffsets.count ? lineOffsets[line] : 0
-        spliceTiming(line: line, with: [
-            ["t": t1, "label": seg.speaker, "words": words1],
-            ["t": t2, "label": seg.speaker, "words": words2, "hard": true],
-        ])
+        if hasAlignedTiming() {
+            spliceTiming(line: line, with: [
+                ["t": t1, "label": seg.speaker, "words": words1],
+                ["t": t2, "label": seg.speaker, "words": words2, "hard": true],
+            ])
+        } else {
+            // No sidecar to carry the flag — meta.json keeps it.
+            adjustMetaHardBreaks(insertAfter: line)
+        }
         writeTranscriptLines(all)
         return true
     }
