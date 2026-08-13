@@ -867,6 +867,7 @@ class WatchManager:
         env_extras = self._metadata_env(ev)
         env_extras["MEETINK_WHITELIST"] = ",".join(matched)
         _wlog(f"whitelist → {matched or 'cleared'} ({ev.title!r})")
+        self._push_roster(ev, matched)
         ok = _start_recording_subprocess(env_extras)
         with self._lock:
             if ok:
@@ -881,6 +882,52 @@ class WatchManager:
             else:
                 ev.status = EventStatus.EXPIRED
         return ok
+
+    def _push_roster(self, ev: WatchedEvent, matched: list) -> None:
+        """Tell the diarize server who the invite expects: linked
+        (profile-resolvable) attendees and unlinked emails. The server
+        derives the expected-unknown-voices count from it — the prior
+        behind roster-guided re-clustering and the extra-person
+        assessment."""
+        try:
+            import urllib.parse
+            import urllib.request
+            email_map = _profile_email_map()
+            matched_low = {m.lower() for m in matched}
+            unlinked: list[str] = []
+            for a in ev.attendees:
+                em = (a.get("email") or "").lower()
+                if not em or "@" not in em:
+                    continue
+                linked_name = email_map.get(em)
+                if linked_name and linked_name.lower() in {
+                        p.lower() for p in matched}:
+                    continue
+                # Token-matched by name counts as linked even without an
+                # email link (the whitelist already carries them).
+                toks = {t for t in
+                        __import__("re").split(r"[\s.,@+\-_/]+", em)
+                        if t}
+                nm_toks = {t for t in
+                           __import__("re").split(
+                               r"[\s.,@+\-_/]+",
+                               (a.get("name") or "").lower()) if t}
+                if any(m.lower() in toks | nm_toks for m in matched):
+                    continue
+                unlinked.append(em)
+            port = int(os.environ.get("MEETINK_DIARIZE_PORT", "8179"))
+            q = urllib.parse.urlencode({
+                "linked": ",".join(sorted(matched_low)),
+                "unlinked": ",".join(sorted(set(unlinked))),
+            })
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/session/expect?{q}",
+                method="POST")
+            urllib.request.urlopen(req, timeout=2).read()
+            _wlog(f"roster → linked={sorted(matched_low)} "
+                  f"unlinked={sorted(set(unlinked))}")
+        except Exception as exc:
+            _wlog(f"roster push failed (non-fatal): {exc}")
 
     def _maybe_event_fallback(self, now: datetime) -> None:
         """An attendee-event started FALLBACK_GRACE_S ago, nothing is

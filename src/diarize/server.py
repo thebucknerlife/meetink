@@ -322,6 +322,21 @@ session_whitelist: "list[str] | None" = None
 # threshold). Cleared on /start.
 session_confirmed: "set[str]" = set()
 
+# --- Meeting roster expectation (stage 2) -----------------------------------
+#
+# The watch engine pushes the invite roster at meeting start: which
+# attendees resolve to enrolled profiles (linked) and which are emails
+# we've never met (unlinked). The count of expected UNKNOWN VOICES =
+# unlinked emails + linked invitees whose profiles are too thin to
+# identify — that prior drives the periodic re-cluster below and the
+# extra-person assessment the UI surfaces.
+session_expected: dict = {"linked": [], "unlinked": [], "set": False}
+session_assessment: dict = {}
+_last_recluster_ts = 0.0
+_obs_since_recluster = 0
+RECLUSTER_EVERY_S = float(os.environ.get("MEETINK_RECLUSTER_EVERY_S", "45"))
+RECLUSTER_MIN_OBS = 8
+
 # Borderline-label hysteresis: a match scoring just above threshold gets
 # labeled only when the PREVIOUS window (within the window cadence)
 # matched the same name — one-off grazes of a profile stay Speaker N
@@ -760,6 +775,32 @@ def _move_profile_audio(src_name: str, dst_name: str) -> None:
             src.rmdir()
     except Exception:
         pass
+
+
+def _update_email_links(old: str, new: "str | None") -> None:
+    """Keep profiles/emails.json (the app's attendee↔profile links) in
+    lockstep with renames and deletes — an email-named profile renamed
+    to the person's real name must keep pulling their calendar invites."""
+    path = PROFILES_DIR / "emails.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            links = json.load(f)
+    except (OSError, ValueError):
+        return
+    changed = False
+    for email, name in list(links.items()):
+        if str(name).lower() == old.lower():
+            if new is None:
+                del links[email]
+            else:
+                links[email] = new
+            changed = True
+    if changed:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(links, f, sort_keys=True)
+        except OSError:
+            pass
 
 
 def _canonical_profile_name(name: str) -> str:
@@ -1434,6 +1475,8 @@ def _replay_session_journal() -> None:
                 cluster_aliases.clear()
                 session_confirmed.clear()
                 _auto_session_count.clear()
+                session_expected.update(
+                    {"linked": [], "unlinked": [], "set": False})
                 _next_cluster_idx = 0
                 obs = 0
             elif kind == "new":
@@ -1476,6 +1519,12 @@ def _replay_session_journal() -> None:
                 name = ev.get("name")
                 if name:
                     session_confirmed.add(str(name))
+            elif kind == "expect":
+                session_expected.update({
+                    "linked": ev.get("linked") or [],
+                    "unlinked": ev.get("unlinked") or [],
+                    "set": True,
+                })
         if clusters or obs:
             print(f"session journal replayed: {len(clusters)} cluster(s), "
                   f"{obs} observation(s), "
@@ -1550,6 +1599,127 @@ def _maybe_merge_clusters() -> None:
                 break
             if merged:
                 break
+
+
+def _expected_unknown_voices() -> "int | None":
+    """How many UNKNOWN voices the invite roster predicts: unlinked
+    emails plus linked invitees whose profiles are too thin to identify
+    (their voices land in clusters exactly like strangers). None when no
+    roster was pushed (manual/instant meetings with no calendar)."""
+    if not session_expected.get("set"):
+        return None
+    min_id = int(os.environ.get("MEETINK_IDENTIFY_MIN_SAMPLES", "6"))
+    thin = 0
+    for n in session_expected.get("linked") or []:
+        p = profiles.get(_canonical_profile_name(n))
+        if p is not None and p["samples"].shape[0] < min_id:
+            thin += 1
+    return len(session_expected.get("unlinked") or []) + thin
+
+
+def _cluster_link_sim(a: dict, b: dict) -> float:
+    """Cluster-pair similarity by the mean of the TOP HALF of pairwise
+    sample sims — kinder than centroid-vs-centroid to diffuse clusters
+    (one person captured under two conditions) while a few shard samples
+    can't fake a match."""
+    sims = (a["samples"] @ b["samples"].T).ravel()
+    if sims.size == 0:
+        return 0.0
+    k = max(1, sims.size // 2)
+    return float(np.sort(sims)[-k:].mean())
+
+
+def _merge_pair(winner: dict, loser: dict, why: str) -> None:
+    if loser["samples"].shape[0] > winner["samples"].shape[0]:
+        winner, loser = loser, winner
+    combined = np.vstack([winner["samples"], loser["samples"]])
+    if combined.shape[0] > CLUSTER_MAX_SAMPLES:
+        combined = combined[-CLUSTER_MAX_SAMPLES:].copy()
+    winner["samples"] = combined
+    winner["centroid"] = _centroid(combined)
+    clusters.remove(loser)
+    _record_alias(loser["letter"], winner["letter"])
+    print(f"recluster: {loser['letter']} -> {winner['letter']} ({why})",
+          file=sys.stderr)
+
+
+def _maybe_recluster(force: bool = False) -> None:
+    """Periodic global coalescence pass (stage 2 of the identity plan).
+
+    The incremental merge is deliberately timid (wrong merges are worse
+    than fragments), so the same voice fragments across conditions. This
+    pass re-examines ALL cluster pairs with sample-level linkage, and —
+    when the invite roster predicts how many unknown voices should exist
+    — relaxes the merge bar stepwise among unknowns until the counts
+    agree or the floor is hit. Leftover clusters beyond the expectation
+    become the "possible extra person" assessment the UI surfaces;
+    nothing is force-merged past the floor."""
+    global _last_recluster_ts, _obs_since_recluster
+    now = time.time()
+    if not force and (now - _last_recluster_ts < RECLUSTER_EVERY_S
+                      or _obs_since_recluster < RECLUSTER_MIN_OBS):
+        return
+    _last_recluster_ts = now
+    _obs_since_recluster = 0
+
+    expected = _expected_unknown_voices()
+
+    def substantial() -> list:
+        return [c for c in clusters if c["samples"].shape[0] >= 2]
+
+    # Merge bars: the standard one always applies (sample-level linkage
+    # catches pairs the incremental centroid check missed). The relaxed
+    # steps run only under a known roster with at least one expected
+    # unknown, and stop the moment counts agree — the floor stays above
+    # typical cross-person similarity.
+    bars = [CLUSTER_MERGE_THRESHOLD]
+    if expected is not None and expected >= 1:
+        bars += [0.50, 0.46]
+    for bar in bars:
+        while True:
+            subs = substantial()
+            if bar != bars[0] and expected is not None                     and len(subs) <= expected:
+                break
+            best = None
+            for i in range(len(subs)):
+                for j in range(i + 1, len(subs)):
+                    sim = _cluster_link_sim(subs[i], subs[j])
+                    if sim >= bar and (best is None or sim > best[0]):
+                        best = (sim, subs[i], subs[j])
+            if best is None:
+                break
+            _merge_pair(best[1], best[2],
+                        f"link={best[0]:.3f} bar={bar:.2f}"
+                        + ("" if bar == bars[0] else " roster-relaxed"))
+
+    # Assessment: what the UI (and stage 3's questions) read.
+    subs = substantial()
+    entries = []
+    for c in subs:
+        best_name, best_sim = None, 0.0
+        for n, p in profiles.items():
+            if p["centroids"].shape[0] == 0:
+                continue
+            sim = float(np.max(p["centroids"] @ c["centroid"]))
+            if sim > best_sim:
+                best_name, best_sim = n, sim
+        entries.append({
+            "letter": c["letter"],
+            "samples": int(c["samples"].shape[0]),
+            "resembles": ({"name": best_name, "sim": round(best_sim, 3)}
+                          if best_name and best_sim >= 0.35 else None),
+        })
+    entries.sort(key=lambda e: -e["samples"])
+    session_assessment.clear()
+    session_assessment.update({
+        "expected_unknowns": expected,
+        "observed_unknowns": len(subs),
+        "clusters": entries,
+        "ts": round(now, 1),
+    })
+    if expected is not None and len(subs) != expected:
+        print(f"recluster: hearing {len(subs)} unknown voice(s), roster "
+              f"suggests {expected}", file=sys.stderr)
 
 
 def _letter_for(idx: int) -> str:
@@ -1643,6 +1813,8 @@ def session_clear() -> None:
     cluster_aliases.clear()
     session_confirmed.clear()
     _auto_session_count.clear()
+    session_expected.update({"linked": [], "unlinked": [], "set": False})
+    session_assessment.clear()
     _borderline_pending["name"] = None
     _borderline_pending["ts"] = 0.0
     _last_cluster_letter = None
@@ -1805,6 +1977,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/session/auto-train":
             self._json(200, dict(auto_train_settings))
             return
+        if path == "/session/expect":
+            self._json(200, {"expected": session_expected,
+                             "assessment": session_assessment})
+            return
         if path == "/session/whitelist":
             self._json(200, {
                 "whitelist": session_whitelist,
@@ -1914,6 +2090,9 @@ class Handler(BaseHTTPRequestHandler):
                     # No profile match — assign to a cluster so the live
                     # transcript still distinguishes voices.
                     letter, sim = _cluster_or_create(emb)
+                    global _obs_since_recluster
+                    _obs_since_recluster += 1
+                    _maybe_recluster()
                     resp["cluster"] = letter
                     resp["cluster_confidence"] = sim
                     # PENDING BIRTH: one observation is not a durable
@@ -2119,6 +2298,22 @@ class Handler(BaseHTTPRequestHandler):
                     "age_s": round(age, 1),
                     "best_sim": round(best_sim, 3),
                 })
+                return
+            if url.path == "/session/expect":
+                qs = parse_qs(url.query)
+                linked = [x for x in
+                          (qs.get("linked", [""])[0]).split(",") if x]
+                unlinked = [x.lower() for x in
+                            (qs.get("unlinked", [""])[0]).split(",") if x]
+                session_expected.update(
+                    {"linked": linked, "unlinked": unlinked, "set": True})
+                _journal({"ev": "expect", "linked": linked,
+                          "unlinked": unlinked})
+                print(f"session: roster — linked={linked or '[]'} "
+                      f"unlinked={unlinked or '[]'}", file=sys.stderr)
+                _maybe_recluster(force=True)
+                self._json(200, {"ok": True,
+                                 "expected_unknowns": _expected_unknown_voices()})
                 return
             if url.path == "/session/clear":
                 session_clear()
@@ -2449,6 +2644,7 @@ class Handler(BaseHTTPRequestHandler):
                 if src_name.lower() == dst_name.lower():
                     profiles[dst_name] = profiles.pop(src_name)
                     _move_profile_audio(src_name, dst_name)
+                    _update_email_links(src_name, dst_name)
                     # Unlink BEFORE saving: overwriting through the old
                     # name keeps the old on-disk casing, and _load_all
                     # keys by file stem — the recase would silently
@@ -2501,6 +2697,7 @@ class Handler(BaseHTTPRequestHandler):
                 # just wrote for dst.
                 profiles.pop(src_name, None)
                 _move_profile_audio(src_name, dst_name)
+                _update_email_links(src_name, dst_name)
                 dst_file = PROFILES_DIR / f"{dst_name}.npz"
                 for ext in (".npz", ".npy"):
                     p = PROFILES_DIR / f"{src_name}{ext}"
@@ -2735,6 +2932,7 @@ class Handler(BaseHTTPRequestHandler):
                     removed = True
             if removed:
                 profiles.pop(name, None)
+                _update_email_links(name, None)
                 try:
                     import shutil
                     shutil.rmtree(PROFILES_DIR / "audio" / name,

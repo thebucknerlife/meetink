@@ -1211,12 +1211,18 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         // future meetings know exactly whose voices to expect.
         case attendeeHeader(unassigned: Int, total: Int)
         case attendee(email: String, profile: String?)
+        // Roster-vs-reality mismatch from the diarize server's periodic
+        // re-cluster ("hearing 3 unknown voices — invite suggests 2").
+        case suspicion(text: String)
     }
     private var panelRows: [PanelRow] = []
     private var attendeesExpanded =
         UserDefaults.standard.bool(forKey: "attendeesExpanded")
     /// Cache key so the panel only reloads when attendees/links change.
     private var lastAttendeesKey = ""
+    /// Latest /session/expect assessment (live meetings only).
+    private var sessionAssessment: [String: Any] = [:]
+    private var lastAssessmentFetch = Date.distantPast
     private var speakers: [(name: String, fraction: Double)] = []
     private var showHiddenSpeakers = false
     private var speakersWidthConstraint: NSLayoutConstraint? = nil
@@ -3240,11 +3246,43 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
     }
 
+    private func fetchAssessment() {
+        guard Date().timeIntervalSince(lastAssessmentFetch) > 5 else { return }
+        lastAssessmentFetch = Date()
+        let live = fixedPath == nil && recordingPID() != nil
+        guard live else {
+            if !sessionAssessment.isEmpty {
+                sessionAssessment = [:]
+                rebuildPanelRows()
+            }
+            return
+        }
+        guard let url = URL(string: "http://127.0.0.1:8179/session/expect")
+        else { return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let data,
+                  let obj = try? JSONSerialization.jsonObject(with: data)
+                      as? [String: Any],
+                  let assess = obj["assessment"] as? [String: Any]
+            else { return }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if !(self.sessionAssessment as NSDictionary).isEqual(to: assess) {
+                    self.sessionAssessment = assess
+                    self.rebuildPanelRows()
+                }
+            }
+        }.resume()
+    }
+
     private func updateSpeakersPanel() {
         let fresh = snapshot.talkShare.map { (name: $0.speaker, fraction: $0.fraction) }
         // Attendees/links change rarely (event link, a new email link) —
         // fold them into the same only-on-change rule so a reload can't
         // eat a mid-flight click.
+        fetchAssessment()
         let map = profileEmailMap()
         let attKey = meetingAttendees()
             .map { "\($0)=\(map[$0] ?? "")" }.joined(separator: ",")
@@ -3322,9 +3360,28 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     ? "\(unlinked[0])?" : "\(candidates)?"
             }
         }
+        // Acoustic resemblance from the server's re-cluster assessment
+        // beats the positional email pairing ("sounds like Dan May?" is
+        // stronger evidence than "is the biggest unknown").
+        if let cl = sessionAssessment["clusters"] as? [[String: Any]] {
+            for c in cl {
+                if let letter = c["letter"] as? String,
+                   let r = c["resembles"] as? [String: Any],
+                   let n = r["name"] as? String {
+                    hints["Speaker \(letter)"] = "sounds like \(n)?"
+                }
+            }
+        }
         var rows: [PanelRow] = visible.map {
             .speaker(name: $0.name, fraction: $0.fraction / vTotal,
                      hidden: false, hint: hints[$0.name])
+        }
+        if let exp = sessionAssessment["expected_unknowns"] as? Int,
+           let obs = sessionAssessment["observed_unknowns"] as? Int,
+           obs > exp {
+            rows.append(.suspicion(text: exp == 0
+                ? "hearing \(obs) unknown voice\(obs == 1 ? "" : "s") — everyone on the invite is known"
+                : "hearing \(obs) unknown voices — invite suggests \(exp)"))
         }
         if !hidden.isEmpty {
             rows.append(.toggle(count: hidden.count))
@@ -3373,6 +3430,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         case .toggle:
             showHiddenSpeakers.toggle()
             rebuildPanelRows()
+        case .suspicion:
+            break   // informational (stage 3 makes it actionable)
         case .attendeeHeader:
             attendeesExpanded.toggle()
             UserDefaults.standard.set(attendeesExpanded, forKey: "attendeesExpanded")
@@ -3715,6 +3774,15 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 + "announcer) — click to show"
             pctField.stringValue = ""
             cell.subviews.last?.isHidden = true   // no pencil on the toggle
+        case .suspicion(let text):
+            nameField.stringValue = "⚠ \(text)"
+            nameField.font = NSFont.systemFont(ofSize: 10)
+            nameField.textColor = .systemOrange
+            nameField.toolTip = "The invite roster and the voices heard "
+                + "so far disagree — assign the unknown speakers or "
+                + "ignore if someone extra joined"
+            pctField.stringValue = ""
+            cell.subviews.last?.isHidden = true
         case .attendeeHeader(let unassigned, let total):
             nameField.stringValue = (attendeesExpanded ? "▾ Attendees" : "▸ Attendees")
                 + " (\(total))" + (unassigned > 0 ? " · \(unassigned) unlinked" : "")
