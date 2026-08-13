@@ -110,6 +110,16 @@ RECORDING_POLL_S = 10.0
 INSTANT_CONFIRM_TICKS = 1
 INSTANT_SKIP_COOLDOWN_S = 1800
 INSTANT_END_COOLDOWN_S = 300
+# During the end-cooldown a same-source instant start needs this many
+# consecutive active polls (instead of a hard suppression): a lingering
+# camera indicator dies within 1-2 polls, a REAL new meeting on the same
+# app keeps polling active and starts within ~a minute.
+INSTANT_COOLDOWN_CONFIRM_TICKS = 3
+# A different app's meeting seen for this many consecutive polls while
+# recording = meeting boundary → stop the old recording (auto mode) so
+# the new meeting's start trigger takes over. ~30 s at the 10 s
+# recording-poll cadence — brief tab-peeks at another call don't trip it.
+SOURCE_SWITCH_TICKS = 3
 
 # Presence-driven engine knobs.
 JOIN_EARLY_S = 600            # presence this early still matches the event
@@ -542,6 +552,18 @@ class WatchManager:
         # Last time a poll saw the recording's meeting absent — the
         # "presence gap" evidence the conflict auto-switch requires.
         self._last_presence_gap_ts: float = 0.0
+        # Foreign-source boundary: a DIFFERENT app's meeting active while
+        # we record is a meeting boundary (join B while A is still up =
+        # stop A, start B). Streak of consecutive polls that saw an
+        # identifiable non-recording source; the switch fires at
+        # SOURCE_SWITCH_TICKS.
+        self._foreign_streak: int = 0
+        self._foreign_source: "str | None" = None
+        self._switch_pending: bool = False
+        # First identifiable source seen during an adopted recording —
+        # adopted starts carry no source of their own, but the boundary
+        # rule needs one to compare against.
+        self._adopted_source: "str | None" = None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -563,6 +585,10 @@ class WatchManager:
             self._end_cooldown_until = 0.0
             self._recording_source = None
             self._end_cooldown_source = None
+            self._foreign_streak = 0
+            self._foreign_source = None
+            self._switch_pending = False
+            self._adopted_source = None
             self._thread = threading.Thread(
                 target=self._loop, name="meetink-watch", daemon=True,
             )
@@ -699,6 +725,7 @@ class WatchManager:
             self._maybe_start_instant_recording(now, now_wall)
             self._maybe_event_fallback(now)
             self._maybe_nudge_adopted_recording()
+        self._maybe_switch_on_foreign_source()
         self._maybe_conflict_alert(now)
 
         # Expire events whose window has long passed and never recorded.
@@ -726,11 +753,11 @@ class WatchManager:
             # recording alive (field case: joining Zoom while the Meet
             # recording wound down reset the countdown — the Meet
             # recording never stopped, the Zoom meeting never started).
+            labels = {sig.split(":", 1)[-1]
+                      for sig in (result.get("signals") or [])} if active else set()
             present = active
             if active and self._currently_recording is not None \
                     and self._recording_source:
-                labels = {sig.split(":", 1)[-1]
-                          for sig in (result.get("signals") or [])}
                 # A bare camera signal can't be attributed to an app —
                 # benefit of the doubt ONLY when nothing else is
                 # identifiable (protects against a browser-scan hiccup
@@ -738,6 +765,23 @@ class WatchManager:
                 # OLD recording alive).
                 present = (self._recording_source in labels
                            or labels == {"camera"})
+            # Foreign-source boundary tracking: while ANY recording runs
+            # (watch-started or adopted) with a known source, count
+            # consecutive polls where an identifiable DIFFERENT app is in
+            # a meeting. Joining meeting B while A is still up is a
+            # boundary — stop A, let B's start trigger take over.
+            rec_source = (self._recording_source
+                          if self._currently_recording is not None
+                          else self._adopted_source
+                          if self._adopted_pid is not None else None)
+            identifiable = labels - {"camera"}
+            if (active and rec_source and identifiable
+                    and rec_source not in labels):
+                self._foreign_streak += 1
+                self._foreign_source = sorted(identifiable)[0]
+            else:
+                self._foreign_streak = 0
+                self._foreign_source = None
             if present:
                 self._inactive_streak = 0
                 if self._currently_recording is not None:
@@ -1019,6 +1063,78 @@ class WatchManager:
             "MEETINK_EVENT_PROJECT":   e.project or "",
         }
 
+    # -- foreign-source boundary --------------------------------------------
+
+    def _maybe_switch_on_foreign_source(self) -> None:
+        """A DIFFERENT app's meeting confirmed active while we record =
+        the user moved to a new meeting. Stop the old recording; the new
+        meeting's normal start trigger (calendar-matched or instant)
+        takes over on the next tick — its activity streak is already
+        built, and the end-cooldown is scoped to the OLD source, so the
+        follow-on start is immediate. Auto mode switches; notify mode
+        asks (default Keep)."""
+        with self._lock:
+            if self._switch_pending:
+                return
+            if self._foreign_streak < SOURCE_SWITCH_TICKS:
+                return
+            if _capture_pid() is None:
+                return
+            new_src = self._foreign_source or "meeting"
+            old_src = (self._recording_source
+                       if self._currently_recording is not None
+                       else self._adopted_source) or "?"
+            recording_id = self._currently_recording
+            self._switch_pending = True
+
+        def worker() -> None:
+            try:
+                if _watch_mode() != "auto":
+                    response = _agent_notify(
+                        title="New meeting detected",
+                        body=f"A meeting on {new_src} started while "
+                             f"recording {old_src}. Switch recording?",
+                        actions=["Switch", "Keep recording"],
+                        default="Keep recording",
+                        timeout=120, linger=15,
+                    )
+                    if "switch" not in (response or "").lower():
+                        _wlog(f"foreign source '{new_src}' during '{old_src}' "
+                              f"— user kept the current recording")
+                        with self._lock:
+                            # Adopt the new source as this recording's:
+                            # the user said B belongs to this recording,
+                            # so stop asking and track presence against B.
+                            if self._currently_recording is not None:
+                                self._recording_source = new_src
+                            else:
+                                self._adopted_source = new_src
+                        return
+                _wlog(f"meeting on '{new_src}' while recording '{old_src}' "
+                      f"— boundary, stopping the old recording")
+                _stop_recording_subprocess()
+                with self._lock:
+                    if recording_id and recording_id in self._events:
+                        self._events[recording_id].status = EventStatus.COMPLETED
+                    self._currently_recording = None
+                    self._recording_source = None
+                    self._adopted_pid = None
+                    self._adopted_source = None
+                    self._inactive_streak = 0
+                    # Cooldown guards the OLD app's wrap-up blips; the
+                    # new source is different, so its start clears the
+                    # source-scoped check immediately.
+                    self._end_cooldown_until = (
+                        time.time() + INSTANT_END_COOLDOWN_S)
+                    self._end_cooldown_source = old_src if old_src != "?" else None
+            finally:
+                with self._lock:
+                    self._switch_pending = False
+                    self._foreign_streak = 0
+                    self._foreign_source = None
+
+        threading.Thread(target=worker, daemon=True).start()
+
     # -- recording end ----------------------------------------------------
 
     def _maybe_end_recording(self, now: datetime, now_wall: float) -> None:
@@ -1249,10 +1365,20 @@ class WatchManager:
                 self._adopted_pid = pid
                 self._adopted_seen_active = False
                 self._adopted_nudged = False
+                self._adopted_source = None
             last = getattr(self, "_last_meeting_active", None) or {}
             if isinstance(last, dict) and last.get("active"):
                 self._adopted_seen_active = True
                 self._adopted_nudged = False
+                # First identifiable app seen during this adopted
+                # recording becomes its source — the reference point the
+                # foreign-source boundary rule compares against.
+                if self._adopted_source is None:
+                    labels = {sig.split(":", 1)[-1]
+                              for sig in (last.get("signals") or [])}
+                    named = sorted(labels - {"camera"})
+                    if named:
+                        self._adopted_source = named[0]
                 return
             if (self._adopted_seen_active
                     and not self._adopted_nudged
@@ -1367,10 +1493,14 @@ class WatchManager:
             # below): a calendar event covering now is a strong enough
             # signal to override it, so back-to-back scheduled meetings
             # still switch within a poll.
+            active_src = self._last_meeting_active.get("source") or ""
             in_end_cooldown = now_wall < self._end_cooldown_until and (
                 self._end_cooldown_source is None
-                or (self._last_meeting_active.get("source") or "")
-                    == self._end_cooldown_source
+                # Unattributable activity (camera-only — the agent emits
+                # a null source) can't prove a DIFFERENT app: treat it
+                # as the old call's wrap-up blip.
+                or not active_src
+                or active_src == self._end_cooldown_source
             )
             if self._instant_streak < INSTANT_CONFIRM_TICKS:
                 return
@@ -1396,9 +1526,15 @@ class WatchManager:
             if startable:
                 startable.sort(key=lambda e: (-e.score(), e.start))
                 matched_event = startable[0]
-            elif in_end_cooldown:
+            elif in_end_cooldown and (
+                self._instant_streak < INSTANT_COOLDOWN_CONFIRM_TICKS
+            ):
                 # No calendar backing and we just auto-stopped this
-                # app's recording — a wrap-up blip, not a new meeting.
+                # app's recording: demand a longer active streak instead
+                # of suppressing outright. A lingering camera indicator
+                # dies within 1-2 polls (the ghost-recording flap); a
+                # REAL new meeting on the same app keeps polling active
+                # and starts within about a minute.
                 return
 
             # Reserve the slot. Reset streak so a Skip-then-stay-in-call
