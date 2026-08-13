@@ -847,6 +847,12 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
     private let headerTitle: String
     private let assignTitle: String
     private let inMeeting: [String]
+    /// Invite entries below the in-meeting names: linked attendees show
+    /// their profile name, unlinked ones show the raw email — assigning
+    /// to an email creates a profile NAMED BY the email (rename later)
+    /// and links it, so connecting a new voice to a calendar invitee is
+    /// one keystroke.
+    private let invite: [String]
     private let onAssign: (String) -> Void
     private let onClose: () -> Void
     private var rowContainers: [NSView] = []
@@ -864,14 +870,19 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
     }
 
     init(header: String, assignTitle: String, inMeeting: [String],
+         invite: [String] = [],
          onAssign: @escaping (String) -> Void, onClose: @escaping () -> Void) {
         self.headerTitle = header
         self.assignTitle = assignTitle
         self.inMeeting = inMeeting
+        self.invite = invite
         self.onAssign = onAssign
         self.onClose = onClose
         super.init(nibName: nil, bundle: nil)
     }
+
+    /// The keyboard-navigable rows: in-meeting names first, invite after.
+    private var navValues: [String] { inMeeting + invite }
     required init?(coder: NSCoder) { fatalError("unused") }
 
     override func loadView() {
@@ -913,7 +924,37 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
             rowLabels.append(lbl)
             stack.addArrangedSubview(cont)
         }
-        if !inMeeting.isEmpty {
+        if !invite.isEmpty {
+            let inviteHdr = NSTextField(labelWithString: "On the invite")
+            inviteHdr.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+            inviteHdr.textColor = .tertiaryLabelColor
+            stack.addArrangedSubview(inviteHdr)
+            for (j, entry) in invite.enumerated() {
+                let i = inMeeting.count + j
+                let lbl = NSTextField(labelWithString: entry)
+                lbl.font = NSFont.systemFont(ofSize: entry.contains("@") ? 11 : 13)
+                let cont = NSView()
+                cont.wantsLayer = true
+                cont.layer?.cornerRadius = 5
+                cont.translatesAutoresizingMaskIntoConstraints = false
+                lbl.translatesAutoresizingMaskIntoConstraints = false
+                cont.addSubview(lbl)
+                NSLayoutConstraint.activate([
+                    lbl.leadingAnchor.constraint(equalTo: cont.leadingAnchor, constant: 8),
+                    lbl.trailingAnchor.constraint(lessThanOrEqualTo: cont.trailingAnchor, constant: -8),
+                    lbl.topAnchor.constraint(equalTo: cont.topAnchor, constant: 3),
+                    lbl.bottomAnchor.constraint(equalTo: cont.bottomAnchor, constant: -3),
+                    cont.widthAnchor.constraint(equalToConstant: 332),
+                ])
+                cont.identifier = NSUserInterfaceItemIdentifier("\(i)")
+                cont.addGestureRecognizer(NSClickGestureRecognizer(
+                    target: self, action: #selector(rowClicked(_:))))
+                rowContainers.append(cont)
+                rowLabels.append(lbl)
+                stack.addArrangedSubview(cont)
+            }
+        }
+        if !inMeeting.isEmpty || !invite.isEmpty {
             let sep = NSBox()
             sep.boxType = .separator
             stack.addArrangedSubview(sep)
@@ -986,8 +1027,8 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
             if selIndex > 0 { select(selIndex - 1) }
             return true
         case 36, 76:  // Enter on a highlighted name
-            if selIndex >= 0, selIndex < inMeeting.count {
-                onAssign(inMeeting[selIndex])
+            if selIndex >= 0, selIndex < navValues.count {
+                onAssign(navValues[selIndex])
                 return true
             }
             return false
@@ -1011,8 +1052,8 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
 
     @objc private func rowClicked(_ g: NSClickGestureRecognizer) {
         guard let id = g.view?.identifier?.rawValue, let i = Int(id),
-              i < inMeeting.count else { return }
-        onAssign(inMeeting[i])
+              i < navValues.count else { return }
+        onAssign(navValues[i])
     }
 
     @objc private func comboEntered() {
@@ -1162,7 +1203,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let titleField = NSTextField(string: "")
     private let speakersTable = NSTableView()
     private enum PanelRow {
-        case speaker(name: String, fraction: Double, hidden: Bool)
+        case speaker(name: String, fraction: Double, hidden: Bool,
+                     hint: String? = nil)
         case toggle(count: Int)
         // Attendee section: the event's invitees (emails), each linked
         // to a voice profile or awaiting a link — the join that lets
@@ -2515,12 +2557,16 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 : "Reassign \(lines.count) segments to…",
             assignTitle: "Reassign",
             inMeeting: named,
+            invite: inviteAssignEntries(excluding: named),
             onAssign: { [weak self] name in
                 self?.assignPopover?.close()
                 self?.assignPopover = nil
                 let up = name.trimmingCharacters(in: .whitespaces).uppercased()
                 guard !up.isEmpty, !up.contains("/"),
                       !up.hasPrefix(".") else { return }
+                if name.contains("@") {
+                    setProfileEmail(name, profile: name)
+                }
                 self?.reassignLines(lines, to: up)
             },
             onClose: { [weak self] in
@@ -2805,6 +2851,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             header: isUnnamed ? "Who is \(label)?" : "Reassign \(label) to…",
             assignTitle: isUnnamed ? "Assign" : "Reassign",
             inMeeting: names,
+            invite: inviteAssignEntries(excluding: names + [label]),
             onAssign: { [weak self] name in
                 self?.assignPopover?.close()
                 self?.assignPopover = nil
@@ -2812,6 +2859,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 // "Greg (AE)", "Jean-Luc" and "J.R." are legitimate.
                 guard !name.isEmpty, !name.contains("/"),
                       !name.hasPrefix(".") else { return }
+                // Assigning to an unlinked invite EMAIL: the profile is
+                // named by the email (rename later) and the link is
+                // recorded now — one keystroke turns a calendar invitee
+                // into a known voice.
+                if name.contains("@") {
+                    setProfileEmail(name, profile: name)
+                }
                 self?.runAssign(label: label, name: name)
             },
             onClose: { [weak self] in
@@ -2822,7 +2876,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         assignPopover = pop
         var anchor = NSRect(x: 8, y: 8, width: 1, height: 1)
         if let rowIdx = panelRows.firstIndex(where: {
-            if case .speaker(let n, _, _) = $0 { return n == label }
+            if case .speaker(let n, _, _, _) = $0 { return n == label }
             return false
         }), rowIdx < speakersTable.numberOfRows {
             anchor = speakersTable.rect(ofRow: rowIdx)
@@ -3227,19 +3281,57 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         return []
     }
 
+    /// Invite entries for assign popovers: each attendee as their linked
+    /// profile name (skipping ones already speaking) or the raw email.
+    private func inviteAssignEntries(excluding present: [String]) -> [String] {
+        let map = profileEmailMap()
+        let low = Set(present.map { $0.lowercased() })
+        var out: [String] = []
+        for email in meetingAttendees() {
+            if let name = map[email] {
+                if !low.contains(name.lowercased())
+                    && !low.contains(name.uppercased().lowercased()) {
+                    out.append(name)
+                }
+            } else {
+                out.append(email)
+            }
+        }
+        return out
+    }
+
     private func rebuildPanelRows() {
         let hiddenNames = hiddenSpeakerNames()
         let visible = speakers.filter { !hiddenNames.contains($0.name.uppercased()) }
         let hidden = speakers.filter { hiddenNames.contains($0.name.uppercased()) }
         let vTotal = max(visible.reduce(0) { $0 + $1.fraction }, 0.0001)
+        // Suggestion hints: pair the biggest unassigned Speaker-N voices
+        // with the invite's UNLINKED emails — "this unknown is probably
+        // the person you invited whose voice we've never met". One
+        // unlinked email annotates the single largest unknown; several
+        // annotate the top few with the candidate set.
+        let unlinked = meetingAttendees().filter { profileEmailMap()[$0] == nil }
+        var hints: [String: String] = [:]
+        if !unlinked.isEmpty {
+            let unknowns = visible.filter { $0.name.hasPrefix("Speaker ") }
+                .sorted { $0.fraction > $1.fraction }
+                .prefix(unlinked.count)
+            let candidates = unlinked.joined(separator: " / ")
+            for u in unknowns {
+                hints[u.name] = unlinked.count == 1
+                    ? "\(unlinked[0])?" : "\(candidates)?"
+            }
+        }
         var rows: [PanelRow] = visible.map {
-            .speaker(name: $0.name, fraction: $0.fraction / vTotal, hidden: false)
+            .speaker(name: $0.name, fraction: $0.fraction / vTotal,
+                     hidden: false, hint: hints[$0.name])
         }
         if !hidden.isEmpty {
             rows.append(.toggle(count: hidden.count))
             if showHiddenSpeakers {
                 rows += hidden.map {
-                    .speaker(name: $0.name, fraction: $0.fraction, hidden: true)
+                    .speaker(name: $0.name, fraction: $0.fraction,
+                             hidden: true, hint: nil)
                 }
             }
         }
@@ -3287,7 +3379,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             rebuildPanelRows()
         case .attendee(let email, _):
             promptForAttendeeLink(email: email, anchorRow: row)
-        case .speaker(let name, _, _):
+        case .speaker(let name, _, _, _):
             // With audio: clicking a name hops to their next segment after
             // the playhead. Renaming is the pencil button. Without audio
             // the click falls back to renaming (nothing to play).
@@ -3349,7 +3441,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func pencilClicked(_ sender: NSButton) {
         let row = speakersTable.row(for: sender)
         guard row >= 0, row < panelRows.count,
-              case .speaker(let name, _, _) = panelRows[row] else { return }
+              case .speaker(let name, _, _, _) = panelRows[row] else { return }
         promptForName(label: name)
     }
 
@@ -3646,8 +3738,22 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             }
             pctField.stringValue = ""
             cell.subviews.last?.isHidden = true
-        case .speaker(let name, let fraction, let hidden):
-            nameField.stringValue = name
+        case .speaker(let name, let fraction, let hidden, let hint):
+            if let hint {
+                let attr = NSMutableAttributedString(
+                    string: name,
+                    attributes: [.font: NSFont.boldSystemFont(ofSize: 12),
+                                 .foregroundColor: hidden
+                                     ? NSColor.tertiaryLabelColor
+                                     : color(for: name)])
+                attr.append(NSAttributedString(
+                    string: "  \(hint)",
+                    attributes: [.font: NSFont.systemFont(ofSize: 10),
+                                 .foregroundColor: NSColor.tertiaryLabelColor]))
+                nameField.attributedStringValue = attr
+            } else {
+                nameField.stringValue = name
+            }
             nameField.textColor = hidden ? .tertiaryLabelColor : color(for: name)
             cell.wantsLayer = true
             cell.layer?.cornerRadius = 5
@@ -3727,11 +3833,21 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     .paragraphStyle: headerPara,
                 ]
                 // With audio available, the NAME means "play from here" —
-                // renaming lives in the speakers panel.
+                // renaming lives in the speakers panel. WITHOUT audio
+                // (live call), the name opens the assign popover instead:
+                // click a Speaker N mid-call and name them (field ask).
                 if audioPath != nil, let first = block.parts.first,
                    let purl = URL(string: "meetink-play://\(first.line)") {
                     speakerAttrs[.link] = purl
                     speakerAttrs[.toolTip] = "Play from here"
+                    speakerAttrs[.underlineStyle] = 0
+                    speakerAttrs[.cursor] = NSCursor.pointingHand
+                } else if audioPath == nil,
+                          let esc = block.speaker.addingPercentEncoding(
+                              withAllowedCharacters: .urlQueryAllowed),
+                          let aurl = URL(string: "meetink-assign://x?label=\(esc)") {
+                    speakerAttrs[.link] = aurl
+                    speakerAttrs[.toolTip] = "Assign this speaker to a person"
                     speakerAttrs[.underlineStyle] = 0
                     speakerAttrs[.cursor] = NSCursor.pointingHand
                 }
