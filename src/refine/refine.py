@@ -1073,22 +1073,65 @@ def main() -> int:
         # that echoes nearby system audio is the room speakers, and the sys
         # copy is authoritative. Never drop the user's own mic lines here —
         # their sys echoes were already removed in pass 1.
-        sys_entries = [(t, norm(x)) for t, _, x, o, _tk in entries if o == "sys"]
+        #
+        # Matching is TOKEN COVERAGE against every sys line overlapping
+        # the mic line's SPAN (token end times), not per-line similarity
+        # near its start: ASR mangles the bleed copy ("segue"/"Segway",
+        # "Rafael"/"Jafael"), sys lines arrive as fragments of one long
+        # mic line, and a single mic paragraph can span MINUTES of sys
+        # speech (field case: a 2-minute THEM paragraph duplicating three
+        # speakers' scorecard updates survived the old per-line check).
+        def span_end(t0: float, tk) -> float:
+            if tk:
+                try:
+                    return float(tk[-1].get("end", t0))
+                except (TypeError, ValueError):
+                    pass
+            return t0
+        sys_spans = [(t, span_end(t, tk), norm(x))
+                     for t, _, x, o, tk in entries if o == "sys"]
         deduped = []
         dropped = 0
         for t, lab, text, origin, toks in entries:
             if origin == "mic" and lab != me_lab:
                 nt = norm(text)
+                end = span_end(t, toks)
+                near = [(st, se, sx) for st, se, sx in sys_spans
+                        if st <= end + 6.0 and se >= t - 6.0]
                 echo = False
-                for st, sx in sys_entries:
-                    if abs(st - t) > 6.0:
-                        continue
-                    if len(nt) < 10:
-                        echo = nt == sx and abs(st - t) <= 3.0
-                    else:
-                        echo = echo_match(nt, sx)
-                    if echo:
-                        break
+                if len(nt) < 10:
+                    # Short lines: fuzzy instead of exact — the bleed copy
+                    # of "Rafael?" arrives as "Jafael?".
+                    echo = any(
+                        st - 3.0 <= t <= se + 3.0
+                        and len(sx) >= 3
+                        and difflib.SequenceMatcher(None, nt, sx).ratio() >= 0.75
+                        for st, se, sx in near)
+                elif near:
+                    # Old per-line check still catches clean duplicates.
+                    echo = any(echo_match(nt, sx) for _, _, sx in near)
+                    if not echo:
+                        # Coverage: what fraction of this mic line's words
+                        # appear in the overlapping sys speech? Prefix
+                        # matching absorbs plural/tense ASR drift.
+                        bag: set[str] = set()
+                        prefixes: set[str] = set()
+                        for _, _, sx in near:
+                            for w in sx.split():
+                                bag.add(w)
+                                if len(w) >= 5:
+                                    prefixes.add(w[:5])
+                        words = nt.split()
+                        if words:
+                            hit = sum(
+                                1 for w in words
+                                if w in bag
+                                or (len(w) >= 5 and w[:5] in prefixes))
+                            cov = hit / len(words)
+                            best = max((difflib.SequenceMatcher(
+                                None, nt, sx).ratio()
+                                for _, _, sx in near), default=0.0)
+                            echo = cov >= 0.6 or (cov >= 0.4 and best >= 0.6)
                 if echo:
                     dropped += 1
                     continue
