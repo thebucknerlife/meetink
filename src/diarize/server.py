@@ -917,8 +917,10 @@ def _profile_nearest(name: str, p: dict) -> dict | None:
     """
     best_name: str | None = None
     best_sim = -1.0
+    if p["centroids"].shape[0] == 0:
+        return None
     for other_name, other in profiles.items():
-        if other_name == name:
+        if other_name == name or other["centroids"].shape[0] == 0:
             continue
         cross = p["centroids"] @ other["centroids"].T
         sim = float(np.max(cross))
@@ -2277,6 +2279,33 @@ class Handler(BaseHTTPRequestHandler):
                     "merged": merged_into_existing,
                     "rejected": rejected,
                 })
+                return
+            if url.path.startswith("/profiles/") and url.path.endswith("/create"):
+                # PLACEHOLDER profile: just the name, zero samples — so a
+                # person can be named (and email-linked) before any voice
+                # data exists. Invisible to /identify (the min-samples
+                # gate already skips thin profiles); the first assign or
+                # segment-harvest fills it in.
+                name = unquote(
+                    url.path[len("/profiles/"):-len("/create")]).strip()
+                if not name or any(c in name for c in "/\\"):
+                    self._json(400, {"error": "invalid name"})
+                    return
+                canonical = _canonical_profile_name(name)
+                if canonical in profiles:
+                    self._json(200, {"ok": True, "name": canonical,
+                                     "existed": True})
+                    return
+                dim = _extractor_dim or 192
+                profiles[name] = {
+                    "centroids": np.zeros((0, dim), dtype=np.float32),
+                    "samples": np.zeros((0, dim), dtype=np.float32),
+                    "cluster_ids": np.zeros(0, dtype=np.int32),
+                    "timestamps": np.zeros(0, dtype=np.float64),
+                }
+                _save(name)
+                print(f"created placeholder profile: {name}", file=sys.stderr)
+                self._json(200, {"ok": True, "name": name, "existed": False})
                 return
             if url.path.startswith("/profiles/") and url.path.endswith("/prune"):
                 # Profile hygiene: drop pollution that accumulated via

@@ -234,6 +234,19 @@ func profileEmailMap() -> [String: String] {
     return obj
 }
 
+/// Reserve a name-only voice profile (zero samples) so a person can be
+/// named and email-linked before any voice data exists. Invisible to
+/// identification until enough samples accumulate.
+func createPlaceholderProfile(_ name: String) {
+    let enc = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+    guard let url = URL(string: "http://127.0.0.1:8179/profiles/\(enc)/create")
+    else { return }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 5
+    URLSession.shared.dataTask(with: req).resume()
+}
+
 func removeProfileEmail(_ email: String) {
     var map = profileEmailMap()
     map.removeValue(forKey: email.lowercased())
@@ -3012,6 +3025,16 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 guard !trimmed.isEmpty, !trimmed.contains("/"),
                       !trimmed.hasPrefix(".") else { return }
                 setProfileEmail(email, profile: trimmed)
+                // Linking an email to a not-yet-enrolled name reserves a
+                // placeholder profile so the link points at something
+                // real (the Sat Pugnet ghost-link case).
+                if !enrolledProfiles().contains(where: {
+                    $0.lowercased() == trimmed.lowercased()
+                }) {
+                    createPlaceholderProfile(
+                        trimmed == trimmed.uppercased()
+                            ? trimmed.capitalized : trimmed)
+                }
                 self?.rebuildPanelRows()
             },
             onClose: { [weak self] in
@@ -4322,6 +4345,8 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         table.dataSource = self; table.delegate = self
         table.usesAlternatingRowBackgroundColors = true
         let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "New Profile…", action: #selector(newProfile), keyEquivalent: ""))
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Rename…", action: #selector(renameProfile), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Delete", action: #selector(deleteProfile), keyEquivalent: ""))
         for i in menu.items { i.target = self }
@@ -4614,6 +4639,27 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
     private func clickedName() -> String? {
         let r = table.clickedRow
         return r >= 0 && r < profiles.count ? profiles[r].name : nil
+    }
+
+    @objc private func newProfile() {
+        let alert = NSAlert()
+        alert.messageText = "New profile"
+        alert.informativeText = "Reserves the name (zero voice samples) so "
+            + "you can link emails now and assign segments later — the "
+            + "first assignment fills in the voice."
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.placeholderString = "Name"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, !name.contains("/"), !name.hasPrefix(".") else { return }
+        createPlaceholderProfile(name)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.refresh()
+        }
     }
 
     @objc private func renameProfile() {
