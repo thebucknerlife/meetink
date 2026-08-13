@@ -702,23 +702,41 @@ def offline_diarize_multi(streams: list[dict], port: int,
         for k in g:
             win_label[k] = lab
     # Temporal dissolve: each orphan window takes the label of the
-    # nearest labeled window in time.
+    # nearest labeled window in time — IF the audio at least resembles
+    # that voice. Temporal adjacency alone must not attribute speech
+    # (Sol review): a conference-system voice, a genuinely brief real
+    # participant, or a noise shard would be silently renamed to whoever
+    # spoke around it. Below the floor the window stays THEM — "there
+    # was speech here, identity unresolved" is an acceptable conclusion.
     if temporal_fold:
         labeled = sorted(
             (0.5 * (windows[k][2] + windows[k][3]), lab)
             for k, lab in win_label.items()
         )
+        label_cents: dict[str, list] = {}
+        for gi2, lab2 in enumerate(labels):
+            if lab2:
+                label_cents.setdefault(lab2, []).append(cents[gi2])
         dissolved = 0
+        kept_unknown = 0
         for gi in temporal_fold:
             for k in groups[gi]:
                 mid = 0.5 * (windows[k][2] + windows[k][3])
-                if labeled:
-                    win_label[k] = min(
-                        labeled, key=lambda t: abs(t[0] - mid))[1]
-                else:
+                lab = (min(labeled, key=lambda t: abs(t[0] - mid))[1]
+                       if labeled else None)
+                if lab is not None:
+                    sims = [float(E[k] @ c)
+                            for c in label_cents.get(lab, [])]
+                    if not sims or max(sims) < 0.35:
+                        lab = None
+                if lab is None:
                     win_label[k] = "THEM"
-                dissolved += 1
-        log(f"dissolved {dissolved} orphan window(s) into surrounding voices")
+                    kept_unknown += 1
+                else:
+                    win_label[k] = lab
+                    dissolved += 1
+        log(f"dissolved {dissolved} orphan window(s) into surrounding "
+            f"voices; {kept_unknown} kept as THEM (no acoustic support)")
 
     # Exemplar anchoring: the user's per-segment corrections are FEW-SHOT
     # VOICEPRINTS, not just cluster names. When clustering FUSED several

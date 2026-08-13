@@ -400,7 +400,11 @@ def _maybe_auto_train(
     # but it does protect against the edge case where the auto-train
     # centroid is held together by old samples and the new one is
     # actually from a similar-sounding stranger.
+    if _auto_session_count.get(name, 0) >= AUTO_TRAIN_SESSION_CAP:
+        return False
     _, accepted, _ = _add_sample(name, emb, source="auto")
+    if accepted:
+        _auto_session_count[name] = _auto_session_count.get(name, 0) + 1
     if accepted:
         _auto_train_log.append({
             "ts": time.time(), "name": name,
@@ -637,6 +641,11 @@ def _load_all() -> None:
                     "samples": samples,
                     "cluster_ids": data["cluster_ids"].astype(np.int32),
                     "timestamps": data["timestamps"].astype(np.float64),
+                    # Legacy files have no provenance — everything counts
+                    # as AUTO until trusted samples arrive.
+                    "sources": (data["sources"].astype(np.int8)
+                                if "sources" in keys
+                                else np.zeros(n, dtype=np.int8)),
                 }
             else:
                 # Legacy: single "centroid" key. Synthesise the new fields
@@ -685,6 +694,7 @@ def _save(name: str) -> None:
         samples=p["samples"],
         cluster_ids=p["cluster_ids"],
         timestamps=p["timestamps"],
+        sources=_profile_sources(p),
     )
 
 
@@ -765,18 +775,61 @@ def _outlier_reject(name: str, new_emb_l2: np.ndarray) -> tuple[bool, float]:
     return best_sim < PROFILE_OUTLIER_FLOOR, best_sim
 
 
+# --- Provenance (Sol review, tier 1) ---------------------------------------
+#
+# Every sample carries a source class: TRUSTED (manual enrollment, user
+# assignment, segment harvest, rename merges of trusted data) vs AUTO
+# (auto-train, sibling folds). Rules:
+#   - eviction under the size cap removes AUTO samples first (oldest
+#     first); the trusted core is never auto-removed,
+#   - /prune never drops trusted samples,
+#   - auto-train may add at most AUTO_TRAIN_SESSION_CAP samples per
+#     profile per SESSION — the Judd poisoning (one mislabeled meeting's
+#     auto-train made Allen the MAJORITY of Judd's profile) becomes
+#     structurally impossible: a bad meeting tops out at a small
+#     minority against any trusted core.
+AUTO_TRAIN_SESSION_CAP = int(os.environ.get(
+    "MEETINK_AUTO_TRAIN_SESSION_CAP", "8"))
+_auto_session_count: dict[str, int] = {}
+
+
+def _trusted_source(source: str) -> bool:
+    return not source.startswith(("auto", "assign-sibling"))
+
+
+def _profile_sources(p: dict) -> np.ndarray:
+    """Per-sample provenance, defaulting legacy profiles to AUTO (0)."""
+    src = p.get("sources")
+    n = p["samples"].shape[0]
+    if src is None or src.shape[0] != n:
+        return np.zeros(n, dtype=np.int8)
+    return src
+
+
 def _cap_recent(
-    samples: np.ndarray, timestamps: np.ndarray, n: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Keep the most-recent `n` (sample, timestamp) rows.
+    samples: np.ndarray, timestamps: np.ndarray, sources: np.ndarray, n: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cap to `n` rows, evicting AUTO samples oldest-first; the trusted
+    core is only touched when it alone exceeds the cap.
 
     Returns contiguous copies (NOT slice views) so the oversized pre-cap array
     is released — a numpy view would keep its base alive and defeat the bound.
     Capping keeps every subsequent allocation the same size class, so the
     libmalloc MEDIUM magazine stops fragmenting (root cause of the RSS leak)."""
-    if samples.shape[0] > n:
-        return samples[-n:].copy(), timestamps[-n:].copy()
-    return samples, timestamps
+    total = samples.shape[0]
+    if total <= n:
+        return samples, timestamps, sources
+    keep = np.ones(total, dtype=bool)
+    over = total - n
+    auto_idx = np.where(sources == 0)[0]
+    evict = auto_idx[np.argsort(timestamps[auto_idx])][:over]
+    keep[evict] = False
+    over = int(keep.sum()) - n
+    if over > 0:
+        tr_idx = np.where(keep & (sources == 1))[0]
+        evict = tr_idx[np.argsort(timestamps[tr_idx])][:over]
+        keep[evict] = False
+    return samples[keep].copy(), timestamps[keep].copy(), sources[keep].copy()
 
 
 def _add_sample(
@@ -804,17 +857,21 @@ def _add_sample(
         return existing_n, False, best_sim
 
     now = time.time()
+    trusted = np.int8(1 if _trusted_source(source) else 0)
     if name in profiles:
         all_samples = np.vstack([profiles[name]["samples"], new[None, :]])
         all_timestamps = np.concatenate(
             [profiles[name]["timestamps"], [now]]
         )
-        all_samples, all_timestamps = _cap_recent(
-            all_samples, all_timestamps, PROFILE_MAX_SAMPLES,
+        all_sources = np.concatenate(
+            [_profile_sources(profiles[name]), [trusted]]).astype(np.int8)
+        all_samples, all_timestamps, all_sources = _cap_recent(
+            all_samples, all_timestamps, all_sources, PROFILE_MAX_SAMPLES,
         )
     else:
         all_samples = new[None, :]
         all_timestamps = np.array([now], dtype=np.float64)
+        all_sources = np.array([trusted], dtype=np.int8)
 
     centroids, cluster_ids, all_samples = _rebuild_profile(
         all_samples, all_timestamps,
@@ -824,6 +881,7 @@ def _add_sample(
         "samples": all_samples,
         "cluster_ids": cluster_ids,
         "timestamps": all_timestamps,
+        "sources": all_sources,
     }
     _save(name)
     return all_samples.shape[0], True, best_sim
@@ -834,6 +892,7 @@ def _add_samples_bulk(
     embeddings: np.ndarray,
     source: str = "manual",
     skip_outliers: bool = True,
+    sources_in: "np.ndarray | None" = None,
 ) -> tuple[int, int]:
     """Append M samples to a profile in one shot. Used by /session/assign
     (folding a cluster into a profile) and /session/rename (merging two
@@ -870,17 +929,25 @@ def _add_samples_bulk(
 
     now = time.time()
     timestamps_new = np.full(added, now, dtype=np.float64)
+    if sources_in is not None and sources_in.shape[0] == embeddings.shape[0]:
+        sources_new = sources_in[accepted_mask].astype(np.int8)
+    else:
+        sources_new = np.full(
+            added, 1 if _trusted_source(source) else 0, dtype=np.int8)
     if name in profiles:
         all_samples = np.vstack([profiles[name]["samples"], accepted])
         all_timestamps = np.concatenate(
             [profiles[name]["timestamps"], timestamps_new]
         )
-        all_samples, all_timestamps = _cap_recent(
-            all_samples, all_timestamps, PROFILE_MAX_SAMPLES,
+        all_sources = np.concatenate(
+            [_profile_sources(profiles[name]), sources_new]).astype(np.int8)
+        all_samples, all_timestamps, all_sources = _cap_recent(
+            all_samples, all_timestamps, all_sources, PROFILE_MAX_SAMPLES,
         )
     else:
         all_samples = accepted
         all_timestamps = timestamps_new
+        all_sources = sources_new
 
     centroids, cluster_ids, all_samples = _rebuild_profile(
         all_samples, all_timestamps,
@@ -890,6 +957,7 @@ def _add_samples_bulk(
         "samples": all_samples,
         "cluster_ids": cluster_ids,
         "timestamps": all_timestamps,
+        "sources": all_sources,
     }
     _save(name)
     return added, rejected_count
@@ -1280,6 +1348,112 @@ def _resolve_alias(letter: str) -> str:
     return cluster_aliases.get(letter, letter)
 
 
+# --- Session journal (Sol review, tier 1) -----------------------------------
+#
+# Every session-cluster mutation appends one JSON line; on boot the
+# server replays the journal since the last "start" event, so a restart
+# mid-day no longer loses the session's voice data (the operational rule
+# "only restart between meetings" existed purely because this state was
+# memory-only — it cost two enrollment opportunities in one day).
+SESSION_JOURNAL = MK_HOME / "session-journal.jsonl"
+_journal_replaying = False
+
+
+def _journal(ev: dict) -> None:
+    if _journal_replaying:
+        return
+    try:
+        with open(SESSION_JOURNAL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ev) + "\n")
+    except OSError:
+        pass
+
+
+def _journal_reset() -> None:
+    if _journal_replaying:
+        return
+    try:
+        with open(SESSION_JOURNAL, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"ev": "start", "ts": time.time()}) + "\n")
+    except OSError:
+        pass
+
+
+def _replay_session_journal() -> None:
+    """Rebuild clusters / aliases / confirmed set from the journal. Runs
+    once at boot, before the HTTP server starts. Profile mutations are
+    NOT replayed — those already persisted to their npz files; an
+    "assign" event only replays the cluster removal + confirmation."""
+    global _journal_replaying, _next_cluster_idx
+    try:
+        lines = SESSION_JOURNAL.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    _journal_replaying = True
+    try:
+        obs = 0
+        for line in lines:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            kind = ev.get("ev")
+            if kind == "start":
+                clusters.clear()
+                cluster_aliases.clear()
+                session_confirmed.clear()
+                _auto_session_count.clear()
+                _next_cluster_idx = 0
+                obs = 0
+            elif kind == "new":
+                emb = np.asarray(ev.get("emb") or [], dtype=np.float32)
+                if emb.size == 0:
+                    continue
+                clusters.append({
+                    "letter": str(ev.get("letter")),
+                    "centroid": _l2(emb),
+                    "samples": _l2(emb)[np.newaxis, :],
+                })
+                try:
+                    _next_cluster_idx = max(_next_cluster_idx,
+                                            int(ev.get("letter")))
+                except (TypeError, ValueError):
+                    pass
+                obs += 1
+            elif kind == "add":
+                emb = np.asarray(ev.get("emb") or [], dtype=np.float32)
+                c = _find_cluster(str(ev.get("letter")))
+                if c is not None and emb.size:
+                    _add_to_cluster(c, emb)
+                    obs += 1
+            elif kind == "merge":
+                loser = _find_cluster(str(ev.get("loser")))
+                winner = _find_cluster(str(ev.get("winner")))
+                if loser is not None and winner is not None:
+                    combined = np.vstack([winner["samples"],
+                                          loser["samples"]])
+                    if combined.shape[0] > CLUSTER_MAX_SAMPLES:
+                        combined = combined[-CLUSTER_MAX_SAMPLES:].copy()
+                    winner["samples"] = combined
+                    winner["centroid"] = _centroid(combined)
+                    clusters.remove(loser)
+                _record_alias(str(ev.get("loser")), str(ev.get("winner")))
+            elif kind == "assign":
+                c = _find_cluster(str(ev.get("letter")))
+                if c is not None:
+                    clusters.remove(c)
+                name = ev.get("name")
+                if name:
+                    session_confirmed.add(str(name))
+        if clusters or obs:
+            print(f"session journal replayed: {len(clusters)} cluster(s), "
+                  f"{obs} observation(s), "
+                  f"{len(session_confirmed)} confirmed",
+                  file=sys.stderr)
+    finally:
+        _journal_replaying = False
+
+
 def _record_alias(loser: str, winner: str) -> None:
     global _last_cluster_letter
     # Keep the map transitively flat: anything that resolved to the loser
@@ -1290,9 +1464,12 @@ def _record_alias(loser: str, winner: str) -> None:
     cluster_aliases[loser] = winner
     if _last_cluster_letter == loser:
         _last_cluster_letter = winner
+    _journal({"ev": "merge", "loser": loser, "winner": winner})
 
 
 def _add_to_cluster(cluster: dict, emb: np.ndarray) -> None:
+    _journal({"ev": "add", "letter": cluster["letter"],
+              "emb": [round(float(x), 4) for x in _l2(emb)]})
     new_samples = np.vstack([cluster["samples"], _l2(emb)[np.newaxis, :]])
     # Cap to the most-recent CLUSTER_MAX_SAMPLES rows. .copy() so the
     # pre-cap array is released — see CLUSTER_MAX_SAMPLES (leak history).
@@ -1356,6 +1533,8 @@ def _new_cluster(emb: np.ndarray) -> dict:
     global _next_cluster_idx
     letter = _letter_for(_next_cluster_idx)
     _next_cluster_idx += 1
+    _journal({"ev": "new", "letter": letter,
+              "emb": [round(float(x), 4) for x in _l2(emb)]})
     cluster = {
         "letter": letter,
         "centroid": _l2(emb),
@@ -1427,10 +1606,12 @@ def _find_cluster_by_ref(ref: str) -> dict | None:
 def session_clear() -> None:
     """Reset clusters and the lettering counter. Called on /start."""
     global _next_cluster_idx, _last_cluster_letter, _last_cluster_ts
+    _journal_reset()
     clusters.clear()
     _next_cluster_idx = 0
     cluster_aliases.clear()
     session_confirmed.clear()
+    _auto_session_count.clear()
     _borderline_pending["name"] = None
     _borderline_pending["ts"] = 0.0
     _last_cluster_letter = None
@@ -1563,6 +1744,7 @@ class Handler(BaseHTTPRequestHandler):
                 return {
                     "name": n,
                     "samples": int(p["samples"].shape[0]),
+                    "trusted": int((_profile_sources(p) == 1).sum()),
                     "centroids": int(p["centroids"].shape[0]),
                     "tightness": round(_profile_tightness(p), 3),
                     "nearest": _profile_nearest(n, p),
@@ -1684,9 +1866,22 @@ class Handler(BaseHTTPRequestHandler):
                     # No profile match — assign to a cluster so the live
                     # transcript still distinguishes voices.
                     letter, sim = _cluster_or_create(emb)
-                    resp["speaker"] = f"Speaker {letter}"
                     resp["cluster"] = letter
                     resp["cluster_confidence"] = sim
+                    # PENDING BIRTH: one observation is not a durable
+                    # identity — a laugh, an interjection, or a blended
+                    # window must not mint a visible "Speaker N" (the
+                    # 37-speakers tail was born here). The first window
+                    # of a brand-new cluster displays as THEM; the letter
+                    # goes public only when a SECOND observation lands in
+                    # the same cluster. Singletons stay THEM and the
+                    # offline pass owns them.
+                    c = _find_cluster(letter)
+                    if c is not None and c["samples"].shape[0] < 2:
+                        resp["speaker"] = "THEM"
+                        resp["pending_cluster"] = letter
+                    else:
+                        resp["speaker"] = f"Speaker {letter}"
                 else:
                     # High-confidence profile match → fold the embedding
                     # back into the profile if the auto-train guardrails
@@ -1956,6 +2151,7 @@ class Handler(BaseHTTPRequestHandler):
                 # The user just confirmed this person is IN the meeting —
                 # identify() relaxes its gates for them from here on.
                 session_confirmed.add(name)
+                _journal({"ev": "assign", "letter": letter, "name": name})
                 # Sibling fold: the same voice often spawned OTHER
                 # anonymous letters before the assignment (each hard
                 # window minted a new one). Any remaining cluster whose
@@ -1975,6 +2171,8 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         clusters.remove(c)
                         also_folded.append(c["letter"])
+                        _journal({"ev": "assign", "letter": c["letter"],
+                                  "name": name})
                         print(
                             f"session: sibling cluster {c['letter']} → "
                             f"{name} (sim={sim:.3f})",
@@ -2242,6 +2440,7 @@ class Handler(BaseHTTPRequestHandler):
                         dst_name, src_samples,
                         source=f"rename:{src_name}",
                         skip_outliers=True,
+                        sources_in=_profile_sources(profiles[src_name]),
                     )
                 else:
                     # Pure rename: rekey, preserving all metadata. No
@@ -2331,6 +2530,7 @@ class Handler(BaseHTTPRequestHandler):
                 before_n = int(p["samples"].shape[0])
                 before_tight = round(_profile_tightness(p), 3)
                 keep = np.ones(before_n, dtype=bool)
+                srcs = _profile_sources(p)
                 cents = p["centroids"]
                 cids = p["cluster_ids"]
                 if cents.shape[0] > 1:
@@ -2343,6 +2543,9 @@ class Handler(BaseHTTPRequestHandler):
                             keep &= cids != ci
                 sims = p["samples"] @ cents.T
                 keep &= np.max(sims, axis=1) >= sample_floor
+                # The trusted core (manual/harvest provenance) is never
+                # auto-removed — prune only clears machine-added samples.
+                keep |= srcs == 1
                 removed = before_n - int(keep.sum())
                 if removed == 0:
                     self._json(200, {
@@ -2356,6 +2559,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 new_samples = p["samples"][keep].copy()
                 new_ts = p["timestamps"][keep].copy()
+                new_src = srcs[keep].copy()
                 centroids, cluster_ids, new_samples = _rebuild_profile(
                     new_samples, new_ts)
                 profiles[name] = {
@@ -2363,6 +2567,7 @@ class Handler(BaseHTTPRequestHandler):
                     "samples": new_samples,
                     "cluster_ids": cluster_ids,
                     "timestamps": new_ts,
+                    "sources": new_src,
                 }
                 _save(name)
                 after_tight = round(_profile_tightness(profiles[name]), 3)
@@ -2592,6 +2797,7 @@ if _extractor_dim == 192:   # TitaNet family
 
 
 if __name__ == "__main__":
+    _replay_session_journal()
     print(
         f"diarize-server ready on 127.0.0.1:{PORT} "
         f"(preset={settings_preset}, threshold={settings['threshold']}, "
