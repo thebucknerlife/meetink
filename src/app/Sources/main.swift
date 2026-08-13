@@ -3053,8 +3053,16 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let attendees = meetingAttendees()
         if !attendees.isEmpty {
             let map = profileEmailMap()
+            // Attendees whose linked profile is HIDDEN (the Zoom
+            // announcer class) stay out of the list too — same rule as
+            // the speaker rows above.
             let entries = attendees.map { (email: $0, profile: map[$0]) }
+                .filter { e in
+                    e.profile.map { !hiddenNames.contains($0.uppercased()) } ?? true
+                }
             let unassigned = entries.filter { $0.profile == nil }
+            guard !entries.isEmpty else { panelRows = rows
+                speakersTable.reloadData(); return }
             rows.append(.attendeeHeader(unassigned: unassigned.count,
                                         total: entries.count))
             if attendeesExpanded {
