@@ -4106,7 +4106,27 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
 final class VocabViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     private let table = NSTableView()
     private let addField = NSTextField()
-    private var entries: [String] = []
+    private var entries: [(term: String, created: Double)] = []
+    private var sortKey = ""          // "" = file (insertion) order
+    private var sortAscending = true
+
+    /// Per-term created-at lives in a sidecar (the vocab file itself is
+    /// a flat comma-separated list whisper reads verbatim). Legacy terms
+    /// have no stamp and show "—".
+    private func metaPath() -> String {
+        (vocabPath() as NSString).deletingLastPathComponent + "/vocab-meta.json"
+    }
+    private func loadMeta() -> [String: Double] {
+        guard let data = FileManager.default.contents(atPath: metaPath()),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Double]
+        else { return [:] }
+        return obj
+    }
+    private func saveMeta(_ m: [String: Double]) {
+        if let data = try? JSONSerialization.data(withJSONObject: m, options: [.sortedKeys]) {
+            try? data.write(to: URL(fileURLWithPath: metaPath()))
+        }
+    }
 
     override func loadView() {
         let content = NSView()
@@ -4123,8 +4143,14 @@ final class VocabViewController: NSViewController, NSTableViewDataSource, NSTabl
         scroll.hasVerticalScroller = true
         let col = NSTableColumn(identifier: .init("entry"))
         col.title = "Entry"
-        col.width = 420
+        col.width = 340
+        col.sortDescriptorPrototype = NSSortDescriptor(key: "entry", ascending: true)
         table.addTableColumn(col)
+        let createdCol = NSTableColumn(identifier: .init("created"))
+        createdCol.title = "Created"
+        createdCol.width = 120
+        createdCol.sortDescriptorPrototype = NSSortDescriptor(key: "created", ascending: true)
+        table.addTableColumn(createdCol)
         table.dataSource = self
         table.delegate = self
         table.usesAlternatingRowBackgroundColors = true
@@ -4154,10 +4180,7 @@ final class VocabViewController: NSViewController, NSTableViewDataSource, NSTabl
             hint.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
             hint.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
             hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            scroll.topAnchor.constraint(equalTo: hint.bottomAnchor, constant: 8),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            addField.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
+            addField.topAnchor.constraint(equalTo: hint.bottomAnchor, constant: 10),
             addField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
             addField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
             addButton.leadingAnchor.constraint(equalTo: addField.trailingAnchor, constant: 8),
@@ -4165,7 +4188,10 @@ final class VocabViewController: NSViewController, NSTableViewDataSource, NSTabl
             removeButton.leadingAnchor.constraint(equalTo: addButton.trailingAnchor, constant: 16),
             removeButton.centerYAnchor.constraint(equalTo: addField.centerYAnchor),
             removeButton.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -12),
-            addField.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+            scroll.topAnchor.constraint(equalTo: addField.bottomAnchor, constant: 10),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
         ])
         self.view = content
     }
@@ -4177,27 +4203,55 @@ final class VocabViewController: NSViewController, NSTableViewDataSource, NSTabl
 
     private func load() {
         let text = (try? String(contentsOfFile: vocabPath(), encoding: .utf8)) ?? ""
+        let meta = loadMeta()
         entries = text.split(whereSeparator: { $0 == "," || $0 == "\n" })
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
+            .map { (term: $0, created: meta[$0.lowercased()] ?? 0) }
+        applySort()
+    }
+
+    private func applySort() {
+        if sortKey == "entry" {
+            entries.sort {
+                let r = $0.term.localizedCaseInsensitiveCompare($1.term) == .orderedAscending
+                return sortAscending ? r : !r
+            }
+        } else if sortKey == "created" {
+            entries.sort {
+                sortAscending ? $0.created < $1.created : $0.created > $1.created
+            }
+        }
         table.reloadData()
+    }
+
+    func tableView(_ tableView: NSTableView,
+                   sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        guard let d = tableView.sortDescriptors.first, let key = d.key else { return }
+        sortKey = key
+        sortAscending = d.ascending
+        applySort()
     }
 
     private func save() {
         // Same shape the file already uses: comma-separated, one line.
         let dir = (vocabPath() as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        try? (entries.joined(separator: ", ") + "\n")
+        try? (entries.map(\.term).joined(separator: ", ") + "\n")
             .write(toFile: vocabPath(), atomically: true, encoding: .utf8)
     }
 
     @objc private func addEntry() {
         let value = addField.stringValue.trimmingCharacters(in: .whitespaces)
         guard !value.isEmpty else { return }
-        if !entries.contains(where: { $0.caseInsensitiveCompare(value) == .orderedSame }) {
-            entries.append(value)
+        if !entries.contains(where: { $0.term.caseInsensitiveCompare(value) == .orderedSame }) {
+            let now = Date().timeIntervalSince1970
+            entries.append((term: value, created: now))
+            var meta = loadMeta()
+            meta[value.lowercased()] = now
+            saveMeta(meta)
             save()
-            table.reloadData()
+            applySort()
         }
         addField.stringValue = ""
     }
@@ -4205,6 +4259,11 @@ final class VocabViewController: NSViewController, NSTableViewDataSource, NSTabl
     @objc private func removeSelected() {
         let rows = table.selectedRowIndexes
         guard !rows.isEmpty else { return }
+        var meta = loadMeta()
+        for r in rows where r < entries.count {
+            meta.removeValue(forKey: entries[r].term.lowercased())
+        }
+        saveMeta(meta)
         entries = entries.enumerated().filter { !rows.contains($0.offset) }.map(\.element)
         save()
         table.reloadData()
@@ -4231,7 +4290,21 @@ final class VocabViewController: NSViewController, NSTableViewDataSource, NSTabl
                 field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
             ])
         }
-        cell.textField?.stringValue = entries[row]
+        if tableColumn?.identifier.rawValue == "created" {
+            let t = entries[row].created
+            if t > 0 {
+                let df = DateFormatter()
+                df.dateFormat = "M/d h:mm a"
+                cell.textField?.stringValue = df.string(
+                    from: Date(timeIntervalSince1970: t))
+            } else {
+                cell.textField?.stringValue = "—"   // predates the sidecar
+            }
+            cell.textField?.textColor = .secondaryLabelColor
+        } else {
+            cell.textField?.stringValue = entries[row].term
+            cell.textField?.textColor = .labelColor
+        }
         return cell
     }
 }
