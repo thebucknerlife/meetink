@@ -1805,6 +1805,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             }
             menu.addItem(.separator())
             add("Open Folder", #selector(openFolder))
+            add("Duplicate Meeting", #selector(duplicateMeeting))
             add("Rename…", #selector(renameFromMenu))
             menu.addItem(.separator())
             add("Delete Meeting…", #selector(deleteMeeting))
@@ -2032,6 +2033,55 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard !lastResolvedPath.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting(
             [URL(fileURLWithPath: lastResolvedPath)])
+    }
+
+    /// Full copy of the meeting under a fresh ID — the safe way to test
+    /// destructive operations (relabel, reprocess) without risking hand
+    /// edits. On APFS copyItem clones, so even gigabyte stems duplicate
+    /// instantly. The copy keeps the event link; its .idx is dropped so
+    /// search re-indexes the new identity.
+    @objc private func duplicateMeeting() {
+        let path = lastResolvedPath
+        guard !path.isEmpty else { return }
+        let fm = FileManager.default
+        let base = ((path as NSString).lastPathComponent as NSString)
+            .deletingPathExtension
+        let dir = (path as NSString).deletingLastPathComponent
+        let title = meetingDisplayName(path) + " (copy)"
+        let folderStyle = (dir as NSString).lastPathComponent == base
+        let parent = folderStyle ? (dir as NSString).deletingLastPathComponent : dir
+        var newBase = base + "_copy"
+        var n = 2
+        while fm.fileExists(atPath: parent + "/" + newBase)
+            || fm.fileExists(atPath: dir + "/" + newBase + ".txt") {
+            newBase = base + "_copy\(n)"
+            n += 1
+        }
+        if folderStyle {
+            let newDir = parent + "/" + newBase
+            guard (try? fm.copyItem(atPath: dir, toPath: newDir)) != nil else {
+                flashStatus("duplicate failed — see Console")
+                return
+            }
+            for item in (try? fm.contentsOfDirectory(atPath: newDir)) ?? []
+            where item.hasPrefix(base + ".") {
+                let suffix = String(item.dropFirst(base.count))
+                try? fm.moveItem(atPath: newDir + "/" + item,
+                                 toPath: newDir + "/" + newBase + suffix)
+            }
+            try? fm.removeItem(atPath: newDir + "/" + newBase + ".idx")
+            setMeetingMeta(newDir + "/" + newBase + ".txt", "title", title)
+        } else {
+            // Flat legacy layout: clone every same-basename sibling.
+            for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+            where item.hasPrefix(base + ".") && !item.hasSuffix(".idx") {
+                let suffix = String(item.dropFirst(base.count))
+                try? fm.copyItem(atPath: dir + "/" + item,
+                                 toPath: dir + "/" + newBase + suffix)
+            }
+            setMeetingMeta(dir + "/" + newBase + ".txt", "title", title)
+        }
+        flashStatus("duplicated → \(title) (in Meetings)")
     }
 
     /// Menu "Rename…": the editable title field IS the rename UI —
