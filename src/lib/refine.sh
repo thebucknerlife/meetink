@@ -827,6 +827,34 @@ cmd_reprocess() {
         mk_notify "Reprocess done" "${${actual:t}:r}"
 }
 
+# Split a recorded meeting into two at a time offset (seconds from the
+# session start — the app passes the playhead). Everything after the cut
+# becomes a new meeting; the event link stays with the original.
+#   $1 = transcript path, $2 = seconds
+cmd_split() {
+    local file="$1" secs="$2" actual
+    actual="$file"
+    [[ -L "$file" ]] && actual=$(readlink "$file" 2>/dev/null)
+    if [[ ! -f "$actual" || -z "$secs" ]]; then
+        print -P "${C[red]}usage:${C[reset]} meetink split <transcript.txt> <seconds>"
+        return 1
+    fi
+    local py="$MK_PY_VENV/bin/python"
+    [[ -x "$py" ]] || py=python3
+    local out
+    out=$("$py" "$MK_ROOT/src/refine/split_meeting.py" "$actual" "$secs") || {
+        print -P "${C[red]}error:${C[reset]} split failed"
+        return 1
+    }
+    local new_txt="${out##*$'\n'}"
+    print -P "${C[green]}✓${C[reset]} Split at ${secs}s → ${C[bright_cyan]}${new_txt:h:t}${C[reset]}"
+    typeset -f mk_activity >/dev/null 2>&1 && {
+        mk_activity "split — ${${actual:t}:r} at ${secs%%.*}s"
+        mk_activity "created by split — ${${new_txt:t}:r}"
+    }
+    print -- "$new_txt"
+}
+
 # Fast recluster of an existing meeting: no transcription, no
 # enhancement — embeddings + clustering + the user's label corrections
 # as exemplars. The 'I fixed two segments, propagate that' loop in about
