@@ -423,13 +423,25 @@ def _start_recording_subprocess(env_extras: dict[str, str]) -> bool:
     # not at the REPL. Suppress the auto-tail window that manual /start
     # opens; the live transcript is one /watch tail away if they want it.
     env = {**os.environ, "MEETINK_NO_TAIL": "1", **env_extras}
-    proc = subprocess.run(
-        [str(LAUNCHER), "start"],
-        check=False, capture_output=True, env=env, text=True,
-    )
+    # Own session + file-backed output, same reason as the stop path:
+    # this daemon can die mid-call (app relaunch) and a pipe to a dead
+    # parent SIGPIPEs the child. The log doubles as the diagnostics
+    # source on failure.
+    with open("/tmp/meetink-watch-stop.log", "ab") as log:
+        log.write(f"--- watch start @ {datetime.now()}\n".encode())
+        log.flush()
+        proc = subprocess.run([str(LAUNCHER), "start"], check=False,
+                              stdout=log, stderr=log, env=env,
+                              start_new_session=True)
     if proc.returncode != 0:
-        _wlog("/start failed: "
-              + (proc.stdout.strip() or proc.stderr.strip() or "(no output)"))
+        tail = ""
+        try:
+            with open("/tmp/meetink-watch-stop.log", "rb") as f:
+                f.seek(max(0, f.seek(0, 2) - 2000))
+                tail = f.read().decode("utf-8", "replace").strip().splitlines()[-1]
+        except OSError:
+            pass
+        _wlog("/start failed: " + (tail or "(see /tmp/meetink-watch-stop.log)"))
         return False
     return True
 
@@ -457,8 +469,18 @@ def _capture_pid() -> Optional[int]:
 
 
 def _stop_recording_subprocess() -> None:
-    subprocess.run([str(LAUNCHER), "stop"],
-                   check=False, capture_output=True)
+    # The stop pipeline (refine, audio archive, titling) runs for MINUTES
+    # after this call starts. It must survive this daemon dying mid-way:
+    # the watch daemon is app-owned, so an app relaunch/quit kills us —
+    # and with capture_output=True the child's next print SIGPIPEd the
+    # whole pipeline (field incident: the Eddie meeting lost its refine,
+    # audio and summary to an app relaunch). Own session + log file, and
+    # the pipeline no longer cares whether we're alive.
+    with open("/tmp/meetink-watch-stop.log", "ab") as log:
+        log.write(f"--- watch stop @ {datetime.now()}\n".encode())
+        log.flush()
+        subprocess.run([str(LAUNCHER), "stop"], check=False,
+                       stdout=log, stderr=log, start_new_session=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1035,11 +1057,8 @@ class WatchManager:
         _stop_recording_subprocess()
         restore_project = False
         with self._lock:
-            was_instant = False
             if recording_id and recording_id in self._events:
-                ev = self._events[recording_id]
-                ev.status = EventStatus.COMPLETED
-                was_instant = ev.detected_source is not None
+                self._events[recording_id].status = EventStatus.COMPLETED
             ended_source = self._recording_source
             self._recording_source = None
             self._currently_recording = None
@@ -1049,13 +1068,17 @@ class WatchManager:
                 self._routed_project = False
                 restore_project = True
             # Brief blips after wrap-up (e.g. user switches Zoom windows
-            # while saying goodbye) shouldn't immediately re-arm instant
-            # detection on the same call.
-            if was_instant:
-                self._end_cooldown_until = (
-                    time.time() + INSTANT_END_COOLDOWN_S
-                )
-                self._end_cooldown_source = ended_source
+            # while saying goodbye, the camera indicator lingering after
+            # leaving a Meet) shouldn't immediately re-arm instant
+            # detection on the same call. EVERY auto-stop arms this, not
+            # just instant ones — the field pattern was scheduled/adopted
+            # stop → ghost instant start ~45 s later → dead in 10 s.
+            # Calendar-matched starts bypass the cooldown, so
+            # back-to-back scheduled meetings still switch promptly.
+            self._end_cooldown_until = (
+                time.time() + INSTANT_END_COOLDOWN_S
+            )
+            self._end_cooldown_source = ended_source
         if restore_project:
             _project_restore(getattr(self, "_project_before_routing", ""))
 
@@ -1191,6 +1214,7 @@ class WatchManager:
             subprocess.Popen([str(LAUNCHER), "stop"],
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL,
+                             start_new_session=True,
                              env={**os.environ, "MEETINK_NO_TAIL": "1"})
         except Exception as exc:
             _wlog(f"switch: stop spawn failed: {exc}")
@@ -1253,6 +1277,12 @@ class WatchManager:
     def _adopted_auto_stop(self, pid: int) -> None:
         if _capture_pid() != pid:
             return
+        # Same wrap-up-blip protection as watch-started stops (the Eddie
+        # ghost: adopted stop, camera lingered, instant start 45 s later).
+        with self._lock:
+            self._end_cooldown_until = time.time() + INSTANT_END_COOLDOWN_S
+            self._end_cooldown_source = self._recording_source
+            self._instant_streak = 0
         _agent_notify(
             title="Recording stopped",
             body="The meeting app closed — auto mode stopped the recording.",
@@ -1331,15 +1361,17 @@ class WatchManager:
                 return
             if now_wall < self._skip_cooldown_until:
                 return
-            if now_wall < self._end_cooldown_until and (
+            # End-cooldown guards re-detection of the SAME app's wrap-up
+            # blips — a different app right after a stop is a genuinely
+            # new meeting. It suppresses only INSTANT starts (decided
+            # below): a calendar event covering now is a strong enough
+            # signal to override it, so back-to-back scheduled meetings
+            # still switch within a poll.
+            in_end_cooldown = now_wall < self._end_cooldown_until and (
                 self._end_cooldown_source is None
                 or (self._last_meeting_active.get("source") or "")
                     == self._end_cooldown_source
-            ):
-                # Cooldown only guards re-detection of the SAME app's
-                # wrap-up blips — a different app right after a stop is
-                # a genuinely new meeting.
-                return
+            )
             if self._instant_streak < INSTANT_CONFIRM_TICKS:
                 return
             active = self._last_meeting_active
@@ -1364,6 +1396,10 @@ class WatchManager:
             if startable:
                 startable.sort(key=lambda e: (-e.score(), e.start))
                 matched_event = startable[0]
+            elif in_end_cooldown:
+                # No calendar backing and we just auto-stopped this
+                # app's recording — a wrap-up blip, not a new meeting.
+                return
 
             # Reserve the slot. Reset streak so a Skip-then-stay-in-call
             # doesn't immediately re-arm; the cooldown set by the worker
