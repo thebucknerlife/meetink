@@ -59,13 +59,14 @@ cmd_ask() {
     # passes the open meeting). --plain: suppress the human decoration so
     # stdout is exactly the answer (machine consumers).
     local tx_override=""
-    typeset -g _ASK_PLAIN=0 _ASK_STREAM=0 _ASK_RESUME=""
+    typeset -g _ASK_PLAIN=0 _ASK_STREAM=0 _ASK_RESUME="" _ASK_HIST=""
     while [[ "$1" == --* ]]; do
         case "$1" in
             --file)   tx_override="$2"; shift 2 ;;
             --plain)  _ASK_PLAIN=1; shift ;;
             --stream) _ASK_STREAM=1; shift ;;   # stream-json to stdout (app)
             --resume) _ASK_RESUME="$2"; shift 2 ;;  # continue a claude session
+            --hist)   _ASK_HIST="$2"; shift 2 ;;    # chat history JSON [{"q","a"}]
             --)       shift; break ;;
             *)        shift ;;
         esac
@@ -160,15 +161,40 @@ ${meetings_text}"
 Current meeting transcript (file: ${tx_path:t}):
 ${transcript_text}"
     fi
-    prompt+="
+    # The question stays OFF the base: the local path reconstructs the
+    # first user message byte-identically across follow-ups so the
+    # resident server's prompt cache extends instead of re-evaluating
+    # the whole context per question.
+    local base_prompt="${prompt}
+
+Question from the user: "
+    prompt="${base_prompt}${question}"
+    # Claude without a resumable session: fold the app's chat history
+    # into the prompt text (the session mechanism replaces this once a
+    # session exists; the local path passes history as real turns).
+    if [[ -n "$_ASK_HIST" && -s "$_ASK_HIST" && "$backend" == "claude" ]]; then
+        local hist_text=$("$MK_PY_VENV/bin/python" - "$_ASK_HIST" 2>/dev/null <<'HPY'
+import json, sys
+try:
+    turns = json.load(open(sys.argv[1]))
+except Exception:
+    turns = []
+for t in (turns or [])[-3:]:
+    print(f"Q: {t.get('q','')}\nA: {t.get('a','')}")
+HPY
+)
+        [[ -n "$hist_text" ]] && prompt="${base_prompt%Question from the user: }
+Earlier in this chat:
+${hist_text}
 
 Question from the user: ${question}"
+    fi
 
     # Dispatch by the same backend setting that titling uses, so /llm backend
     # <name> makes /ask follow suit. ($backend was resolved at the top of
     # cmd_ask, honouring the MEETINK_TITLE_BACKEND env override.)
     if [[ "$backend" == "local" ]]; then
-        _ask_local "$prompt"
+        _ask_local "$prompt" "$base_prompt" "$question"
     elif [[ "$backend" == "lmstudio" ]]; then
         _ask_lmstudio "$prompt"
     else
@@ -204,8 +230,44 @@ _ask_claude() {
     (( ${_ASK_PLAIN:-0} )) || print -P ""
 }
 
+# Resident local model server: the model loads into Metal ONCE and
+# stays warm — the per-question multi-GB reload was the "does the LLM
+# have to warm up?" minute. Lazy-started on the first /ask; restarted
+# automatically when the active model changes.
+MK_LLM_SERVER_PORT="${MEETINK_LLM_SERVER_PORT:-8181}"
+MK_LLM_SERVER_PID="$MK_HOME/llm-server.pid"
+MK_LLM_SERVER_MODEL_FILE="$MK_HOME/llm-server.model"
+
+_llm_server_ready() {
+    curl -s -m 1 "http://127.0.0.1:$MK_LLM_SERVER_PORT/v1/models" >/dev/null 2>&1
+}
+
+_llm_server_ensure() {
+    # Model switched since the server loaded? Restart with the new one.
+    if _llm_server_ready; then
+        local loaded=$(cat "$MK_LLM_SERVER_MODEL_FILE" 2>/dev/null)
+        if [[ "$loaded" == "$MK_LLM_MODEL" ]]; then
+            return 0
+        fi
+        local pid=$(cat "$MK_LLM_SERVER_PID" 2>/dev/null)
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+        sleep 1
+    fi
+    "$MK_PY_VENV/bin/python" -m mlx_lm.server         --model "$MK_LLM_MODEL"         --host 127.0.0.1 --port "$MK_LLM_SERVER_PORT"         > /tmp/meetink-llm-server.log 2>&1 &
+    echo $! > "$MK_LLM_SERVER_PID"
+    print -- "$MK_LLM_MODEL" > "$MK_LLM_SERVER_MODEL_FILE"
+    disown 2>/dev/null || true
+    # Model load is the slow part (~10-30s for the 9B) — but only once.
+    local i
+    for i in {1..90}; do
+        _llm_server_ready && return 0
+        sleep 1
+    done
+    return 1
+}
+
 _ask_local() {
-    local user_prompt="$1"
+    local user_prompt="$1" base_prompt="$2" question="$3"
     if [[ ! -x "$MK_PY_VENV/bin/python" ]]; then
         print -P "${C[red]}error:${C[reset]} REPL Python venv missing"
         print -P "  Run ${C[bright_cyan]}meetink setup${C[reset]} to install it."
@@ -230,6 +292,27 @@ _ask_local() {
     local system_prompt="You answer questions about a meeting transcript. Be concise and grounded only in the transcript and provided context. If the transcript doesn't contain enough information, say so plainly rather than guessing."
     local active=$(local_llm_active_get 2>/dev/null)
     (( ${_ASK_PLAIN:-0} )) || { print -P "${C[dim]}Asking ${active}...${C[reset]}"; print -P ""; }
+    # Preferred path: the resident server (model already warm) with true
+    # streaming — tokens print as they generate. Falls back to the old
+    # one-shot loader if the server can't come up.
+    if _llm_server_ensure; then
+        # Multi-turn via --base-file/--hist-file: follow-up questions
+        # extend the server's cached conversation instead of re-paying
+        # the full context evaluation (~45s → seconds on the 9B).
+        local basef=$(mktemp -t meetink-ask-base)
+        print -rn -- "${base_prompt:-$user_prompt}" > "$basef"
+        local -a hargs=()
+        [[ -n "$_ASK_HIST" && -s "$_ASK_HIST" ]] && hargs=(--hist-file "$_ASK_HIST")
+        "$MK_PY_VENV/bin/python" "$MK_ROOT/src/llm/mlx_client.py" --port "$MK_LLM_SERVER_PORT" --system "$system_prompt" --base-file "$basef" --question "${question:-$user_prompt}" "${hargs[@]}" --max-tokens 700 --temp 0.4           | awk '
+                /^<think>$/  { think = 1; next }
+                /^<\/think>$/ { think = 0; next }
+                { if (!think) print; fflush() }
+            '
+        local rc=${pipestatus[1]}
+        rm -f "$basef"
+        return $rc
+    fi
+    print -P "${C[yellow]}⚠${C[reset]} local model server unavailable — one-shot fallback (slow)" >&2
     # Why mlx-lm vs llama.cpp: 30-60% faster on Apple Silicon (native Metal +
     # ANE integration). max-tokens 512 leaves room for a multi-paragraph
     # answer; temp 0.4 a touch higher than titles for natural prose while

@@ -1694,13 +1694,20 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         if resumed, let sid = chatSessionID {
             args += ["--resume", sid]
         }
-        var question = q
-        if !resumed && !chatHistory.isEmpty {
-            let hist = chatHistory.suffix(3)
-                .map { "Q: \($0.q)\nA: \($0.a)" }.joined(separator: "\n")
-            question = "Earlier in this chat:\n\(hist)\n\nNew question: \(q)"
+        // History travels as structured JSON: the local backend replays
+        // it as real conversation turns (which is what lets the resident
+        // model's prompt cache extend — follow-ups skip the full context
+        // re-evaluation), and claude folds it into the prompt only until
+        // a resumable session exists.
+        if !chatHistory.isEmpty, !resumed {
+            let turns = chatHistory.suffix(6).map { ["q": $0.q, "a": $0.a] }
+            if let data = try? JSONSerialization.data(withJSONObject: Array(turns)) {
+                let histPath = NSTemporaryDirectory() + "meetink-chat-hist.json"
+                try? data.write(to: URL(fileURLWithPath: histPath))
+                args += ["--hist", histPath]
+            }
         }
-        args.append(question)
+        args.append(q)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launcher)
         proc.arguments = args
