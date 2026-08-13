@@ -59,7 +59,7 @@ cmd_ask() {
     # passes the open meeting). --plain: suppress the human decoration so
     # stdout is exactly the answer (machine consumers).
     local tx_override=""
-    typeset -g _ASK_PLAIN=0 _ASK_STREAM=0 _ASK_RESUME="" _ASK_HIST=""
+    typeset -g _ASK_PLAIN=0 _ASK_STREAM=0 _ASK_RESUME="" _ASK_HIST="" _ASK_WARM=0
     while [[ "$1" == --* ]]; do
         case "$1" in
             --file)   tx_override="$2"; shift 2 ;;
@@ -67,11 +67,13 @@ cmd_ask() {
             --stream) _ASK_STREAM=1; shift ;;   # stream-json to stdout (app)
             --resume) _ASK_RESUME="$2"; shift 2 ;;  # continue a claude session
             --hist)   _ASK_HIST="$2"; shift 2 ;;    # chat history JSON [{"q","a"}]
+            --warm)   _ASK_WARM=1; shift ;;         # pre-load model + prime the cache
             --)       shift; break ;;
             *)        shift ;;
         esac
     done
     local question="$*"
+    (( _ASK_WARM )) && question="${question:-warm}"
     if [[ -z "$question" ]]; then
         print -P "${C[red]}usage:${C[reset]} /ask <question>"
         print -P "  ${C[dim]}Examples:${C[reset]}"
@@ -113,6 +115,14 @@ cmd_ask() {
     local meetings_md="$MK_TRANSCRIPTS_DIR/meetings.md"
     if [[ -f "$meetings_md" ]]; then
         meetings_text=$(<"$meetings_md")
+        # Local backend: cap the digest to the newest entries (the file
+        # is newest-first). Claude keeps the full file (200K context and
+        # server-side caching); the local model pays real seconds per
+        # thousand prompt tokens, and a 53KB digest tripled the eval.
+        if [[ "$backend" == "local" && ${#meetings_text} -gt 14000 ]]; then
+            meetings_text="${meetings_text[1,14000]}
+[…older meetings truncated]"
+        fi
     fi
 
     # /ask is also useful when there's no transcript yet, as long as the
@@ -193,6 +203,18 @@ Question from the user: ${question}"
     # Dispatch by the same backend setting that titling uses, so /llm backend
     # <name> makes /ask follow suit. ($backend was resolved at the top of
     # cmd_ask, honouring the MEETINK_TITLE_BACKEND env override.)
+    if (( _ASK_WARM )); then
+        # Pre-warm (local backend only) = load the model into Metal so
+        # the first real question skips the ~20s cold start. Context
+        # pre-evaluation is deliberately NOT done: Qwen3.5's hybrid-
+        # attention cache cannot be trimmed, so the server reuses a
+        # cached prompt only when the new one strictly EXTENDS it — a
+        # different question never does (measured: a primed 13K-token
+        # base was fully re-evaluated anyway).
+        [[ "$backend" == "local" ]] || return 0
+        _llm_server_ensure >/dev/null 2>&1
+        return 0
+    fi
     if [[ "$backend" == "local" ]]; then
         _ask_local "$prompt" "$base_prompt" "$question"
     elif [[ "$backend" == "lmstudio" ]]; then

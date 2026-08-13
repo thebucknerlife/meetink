@@ -1669,6 +1669,19 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         chatBody.isHidden.toggle()
         if !chatBody.isHidden {
             view.window?.makeFirstResponder(chatField)
+            // Pre-warm while the user types: evaluate the transcript
+            // delta into the local model server's prompt cache now, so
+            // the question they're composing answers in seconds. Cheap
+            // no-op on the claude backend or when already primed.
+            if !lastResolvedPath.isEmpty, let launcher = launcherPath() {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: launcher)
+                proc.arguments = ["ask", "--plain", "--warm",
+                                  "--file", lastResolvedPath]
+                proc.standardOutput = FileHandle.nullDevice
+                proc.standardError = FileHandle.nullDevice
+                try? proc.run()
+            }
         }
     }
 

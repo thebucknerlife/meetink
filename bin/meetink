@@ -1059,6 +1059,12 @@ cmd_start() {
     disown 2>/dev/null || true
 
     mk_notify "Recording started" "${session_stamp} — live transcript is filling in"
+    # Pre-warm the local /ask model in the background: load it into
+    # Metal and prime the prompt cache with the stable context (docs +
+    # meetings.md) so a mid-call question answers in seconds instead of
+    # paying the model load + context evaluation. No-op on the claude
+    # backend or when the local model isn't installed.
+    ( "${0:A}" ask --plain --warm >/dev/null 2>&1 & )
     mk_activity "recording started — ${session_stamp}"
 
     print -P ""
