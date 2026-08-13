@@ -779,12 +779,21 @@ def _canonical_profile_name(name: str) -> str:
 def _outlier_reject(name: str, new_emb_l2: np.ndarray) -> tuple[bool, float]:
     """Check whether `new_emb_l2` is too dissimilar from profile `name`'s
     existing centroids to be the same speaker. Returns (rejected, best_sim).
-    No-op if the profile is new or empty."""
+    No-op if the profile is new, empty, or too THIN to judge: a profile
+    under the min-identify sample count can't label anyone, so it also
+    doesn't get to veto a user's ground-truth assignment (field case: a
+    stale 4-sample "Dan May" rejected every sample of the real Dan's
+    live assignment — the cold-start trap blocks the profile from ever
+    growing past its own staleness)."""
     if name not in profiles:
         return False, 1.0
     centroids = profiles[name]["centroids"]
     if centroids.shape[0] == 0:
         return False, 1.0
+    if profiles[name]["samples"].shape[0] < int(
+            os.environ.get("MEETINK_IDENTIFY_MIN_SAMPLES", "6")):
+        sims = centroids @ new_emb_l2
+        return False, float(np.max(sims))
     sims = centroids @ new_emb_l2
     best_sim = float(np.max(sims))
     return best_sim < PROFILE_OUTLIER_FLOOR, best_sim
@@ -922,6 +931,13 @@ def _add_samples_bulk(
     new = _l2_rows(embeddings).astype(np.float32)
 
     accepted_mask = np.ones(new.shape[0], dtype=bool)
+    thin = (name in profiles
+            and profiles[name]["samples"].shape[0] < int(
+                os.environ.get("MEETINK_IDENTIFY_MIN_SAMPLES", "6")))
+    if thin:
+        # Same thin-profile rule as _outlier_reject: a profile too small
+        # to identify anyone doesn't get to veto a user assignment.
+        skip_outliers = False
     if skip_outliers and name in profiles:
         sims = new @ profiles[name]["centroids"].T  # M×K
         max_sims = np.max(sims, axis=1)

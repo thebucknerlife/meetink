@@ -4831,7 +4831,25 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         self.view = root
     }
 
-    override func viewWillAppear() { super.viewWillAppear(); refresh() }
+    private var profilesTimer: Timer?
+
+    override func viewWillAppear() {
+        super.viewWillAppear()
+        refresh()
+        // Live updates: mid-call assignments change sample counts and
+        // "Samples updated" while the user watches this page (field
+        // report: assigned during a call, page looked frozen).
+        profilesTimer?.invalidate()
+        profilesTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) {
+            [weak self] _ in self?.refresh()
+        }
+    }
+
+    override func viewWillDisappear() {
+        super.viewWillDisappear()
+        profilesTimer?.invalidate()
+        profilesTimer = nil
+    }
 
     private func refresh() {
         var req = URLRequest(url: URL(string: "http://127.0.0.1:8179/profiles")!)
@@ -4851,10 +4869,17 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
                 }
             }
             DispatchQueue.main.async {
-                self?.profiles = out
-                self?.applySort()
-                self?.detail.stringValue = out.isEmpty
-                    ? "No profiles (is the diarize server running?)" : "Select a profile to see recent meetings."
+                guard let self else { return }
+                let changed = out.map { "\($0.name)|\($0.samples)|\($0.samplesUpdated)" }
+                    != self.profiles.map { "\($0.name)|\($0.samples)|\($0.samplesUpdated)" }
+                guard changed else { return }
+                self.profiles = out
+                self.applySort()
+                if self.detail.stringValue.isEmpty || out.isEmpty {
+                    self.detail.stringValue = out.isEmpty
+                        ? "No profiles (is the diarize server running?)"
+                        : "Select a profile to see recent meetings."
+                }
             }
         }.resume()
     }
