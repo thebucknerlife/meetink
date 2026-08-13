@@ -1198,8 +1198,17 @@ profile_rename() {
         local resp=$(curl -s -X POST \
             "http://127.0.0.1:$MK_DIARIZE_PORT/session/rename?from=$(_mk_urlq "$old")&to=$(_mk_urlq "$new")")
         if _resp_ok "$resp"; then
-            local merged=$(print -- "$resp" | grep -o '"merged": *true')
-            print -P "${C[green]}✓${C[reset]} Profile ${C[bold]}$old${C[reset]} → ${C[bold]}$new${C[reset]}${merged:+ ${C[dim]}(merged into existing)${C[reset]}}"
+            local samples=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
+            local merged=$(print -- "$resp" | sed -nE 's/.*"merged":[[:space:]]*(true|false).*/\1/p')
+            local rejected=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*([0-9]+).*/\1/p')
+            if [[ "$merged" == "true" ]]; then
+                print -P "${C[green]}✓${C[reset]} Folded ${C[bold]}$old${C[reset]} into ${C[bold]}$new${C[reset]} ${C[dim]}($samples samples total)${C[reset]}"
+                if [[ -n "$rejected" && "$rejected" != "0" ]]; then
+                    print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}${rejected} sample(s) from ${old} dropped as outliers (likely a different speaker — protected ${new} from pollution)${C[reset]}"
+                fi
+            else
+                print -P "${C[green]}✓${C[reset]} Renamed ${C[bold]}$old${C[reset]} → ${C[bold]}$new${C[reset]} ${C[dim]}($samples samples)${C[reset]}"
+            fi
         else
             print -P "${C[yellow]}⚠${C[reset]} No profile ${C[bold]}$old${C[reset]} on the server ${C[dim]}— rewriting transcript labels only${C[reset]}"
         fi
@@ -1220,6 +1229,8 @@ profile_rename() {
     if (( rewritten > 0 )); then
         print -P "${C[green]}✓${C[reset]} Relabeled ${C[bold]}${up_old}${C[reset]} → ${C[bold]}${up_new}${C[reset]} in $rewritten transcript(s)"
     fi
+
+    _maybe_refresh_whitelist_from_attendees
 }
 
 profile_assign() {
@@ -1482,50 +1493,9 @@ profile_undo() {
 # same speaker got enrolled under two names — e.g. earlier session called
 # them BOB, this one calls them FLAVIO). Server is the source of truth;
 # we mirror the change to the live transcript.
-profile_rename() {
-    local from="$1" to="$2"
-    if [[ -z "$from" || -z "$to" ]]; then
-        print -P "${C[red]}usage:${C[reset]} /profile rename <old> <new>"
-        return 1
-    fi
-    if [[ "$to" == */* || "$to" == .* ]]; then
-        print -P "${C[red]}error:${C[reset]} no slashes or leading dots in names"
-        return 1
-    fi
-    if ! diarize_running; then
-        print -P "${C[red]}error:${C[reset]} diarize-server not running"
-        return 1
-    fi
-
-    local resp=$(curl -s -X POST \
-        "http://127.0.0.1:$MK_DIARIZE_PORT/session/rename?from=$(_mk_urlq "$from")&to=$(_mk_urlq "$to")")
-    if ! _resp_ok "$resp"; then
-        print -P "${C[red]}error:${C[reset]} $resp"
-        return 1
-    fi
-    local samples=$(print -- "$resp" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
-    local merged=$(print -- "$resp" | sed -nE 's/.*"merged":[[:space:]]*(true|false).*/\1/p')
-    local rejected=$(print -- "$resp" | sed -nE 's/.*"rejected":[[:space:]]*([0-9]+).*/\1/p')
-    if [[ "$merged" == "true" ]]; then
-        print -P "${C[green]}✓${C[reset]} Folded ${C[bold]}$from${C[reset]} into ${C[bold]}$to${C[reset]} ${C[dim]}($samples samples total)${C[reset]}"
-        if [[ -n "$rejected" && "$rejected" != "0" ]]; then
-            print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}${rejected} sample(s) from ${from} dropped as outliers (likely a different speaker — protected ${to} from pollution)${C[reset]}"
-        fi
-    else
-        print -P "${C[green]}✓${C[reset]} Renamed ${C[bold]}$from${C[reset]} → ${C[bold]}$to${C[reset]} ${C[dim]}($samples samples)${C[reset]}"
-    fi
-
-    # Live transcript labels are uppercase (main.swift uppercases names),
-    # so we rewrite BOB → FLAVIO not bob → flavio.
-    local up_from=$(print -n -- "$from" | tr '[:lower:]' '[:upper:]')
-    local up_to=$(print -n -- "$to" | tr '[:lower:]' '[:upper:]')
-    if [[ -L "$MK_TRANSCRIPT" ]] && _rewrite_transcript_label "$MK_TRANSCRIPT" "$up_from" "$up_to"; then
-        local actual=$(readlink "$MK_TRANSCRIPT" 2>/dev/null)
-        print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}${up_from}${C[reset]} → ${C[bold]}${up_to}${C[reset]} in ${C[bright_cyan]}${actual:t}${C[reset]}"
-    fi
-
-    _maybe_refresh_whitelist_from_attendees
-}
+# NOTE: profile_rename lives earlier in this file (the transcript-sweeping
+# version). A second definition here used to shadow it — zsh keeps the
+# LAST definition — which silently disabled the all-transcripts rewrite.
 
 # Fold one cluster into another (e.g. when one speaker got split across two).
 profile_merge() {
