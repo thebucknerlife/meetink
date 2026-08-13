@@ -3891,7 +3891,13 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
             }
             return sortAscending ? r : !r
         }
+        // Names must be part of the change check: a title that lands
+        // moments after the row first renders (duplicate writes meta
+        // AFTER the folder copy; titling writes it at stop) otherwise
+        // shows the filename fallback forever (field case: the copy
+        // stuck on "copy" instead of its meta title).
         let changed = stamped.map(\.0) != files.map(\.path)
+            || stamped.map(\.1) != files.map(\.name)
             || stamped.map(\.3) != files.map(\.status)
             || stamped.map { Int(($0.4 ?? 0) / 60) } != files.map { Int(($0.duration ?? 0) / 60) }
         files = stamped.map { (path: $0.0, name: $0.1, date: $0.2, status: $0.3, duration: $0.4) }
