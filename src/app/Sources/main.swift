@@ -395,6 +395,26 @@ func fetchAgentEvents(from: Date, to: Date,
     }
 }
 
+/// First video-conference URL in an event's location or notes — the same
+/// host set the watch daemon uses to tell real meetings from time blocks.
+/// Google puts the Meet link in `notes` when `location` holds a room
+/// name, so both are scanned (location first, it's the cleaner field).
+func eventVideoLink(_ e: [String: Any]) -> URL? {
+    let blob = ((e["location"] as? String) ?? "") + "\n"
+        + ((e["notes"] as? String) ?? "")
+    let hosts = #"(?:[\w.-]+\.)?(?:zoom\.us|meet\.google\.com|teams\.microsoft\.com|teams\.live\.com|webex\.com|whereby\.com|meet\.jit\.si|gather\.town)"#
+    let pattern = #"https?://"# + hosts + #"[^\s<>"'’”)\]]*"#
+    guard let re = try? NSRegularExpression(pattern: pattern,
+                                            options: [.caseInsensitive]),
+          let m = re.firstMatch(in: blob,
+                                range: NSRange(blob.startIndex..., in: blob)),
+          let r = Range(m.range, in: blob) else { return nil }
+    // Prose punctuation glued to the URL ("…join here: <url>.") breaks it.
+    var s = Substring(blob[r])
+    while let last = s.last, ".,;:!".contains(last) { s = s.dropLast() }
+    return URL(string: String(s))
+}
+
 /// `meetink start`, then stamp a calendar event on the fresh session —
 /// but only once the live symlink MOVES (stamping earlier would link
 /// the previous meeting). Used by the Today page and the menu bar.
@@ -3504,6 +3524,178 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         promptForName(label: name)
     }
 
+    // MARK: Speaker info popover (the ⓘ button)
+
+    private var infoPopover: NSPopover?
+    private var infoNameField: NSTextField?
+    private var infoSaveButton: NSButton?
+    private var infoOldName = ""
+
+    @objc private func speakerInfoClicked(_ sender: NSButton) {
+        let row = speakersTable.row(for: sender)
+        guard row >= 0, row < panelRows.count,
+              case .speaker(let name, let fraction, _, _) = panelRows[row]
+        else { return }
+        showSpeakerInfo(name: name, fraction: fraction, anchorRow: row)
+    }
+
+    private func showSpeakerInfo(name: String, fraction: Double, anchorRow: Int) {
+        infoPopover?.close()
+        assignPopover?.close()
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        func line(_ text: String, size: CGFloat = 11,
+                  color: NSColor = .secondaryLabelColor) -> NSTextField {
+            let f = NSTextField(wrappingLabelWithString: text)
+            f.font = NSFont.systemFont(ofSize: size)
+            f.textColor = color
+            f.preferredMaxLayoutWidth = 280
+            return f
+        }
+
+        let nameField = NSTextField(string: name)
+        nameField.font = NSFont.boldSystemFont(ofSize: 13)
+        nameField.translatesAutoresizingMaskIntoConstraints = false
+        nameField.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        nameField.target = self
+        nameField.action = #selector(saveSpeakerInfoName)
+        let save = NSButton(title: "Save", target: self,
+                            action: #selector(saveSpeakerInfoName))
+        save.bezelStyle = .rounded
+        save.controlSize = .small
+        save.keyEquivalent = "\r"
+        let nameRow = NSStackView(views: [nameField, save])
+        nameRow.orientation = .horizontal
+        nameRow.spacing = 6
+        stack.addArrangedSubview(nameRow)
+        stack.addArrangedSubview(line(
+            "Renaming updates the transcript, sidebar and attendee links.",
+            color: .tertiaryLabelColor))
+        stack.setCustomSpacing(10, after: stack.arrangedSubviews.last!)
+
+        stack.addArrangedSubview(line(String(format:
+            "Talk share this meeting: %d%%", Int((fraction * 100).rounded()))))
+
+        let emails = profileEmailMap()
+            .filter { $0.value.lowercased() == name.lowercased() }
+            .keys.sorted()
+        if !emails.isEmpty {
+            stack.addArrangedSubview(line("Linked: " + emails.joined(separator: ", ")))
+        }
+
+        let detail = line("Loading profile…", color: .tertiaryLabelColor)
+        stack.addArrangedSubview(detail)
+
+        infoOldName = name
+        infoNameField = nameField
+        infoSaveButton = save
+
+        let vc = NSViewController()
+        let container = NSView()
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            container.widthAnchor.constraint(equalToConstant: 310),
+        ])
+        vc.view = container
+
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.contentViewController = vc
+        infoPopover = pop
+        pop.show(relativeTo: speakersTable.rect(ofRow: anchorRow),
+                 of: speakersTable, preferredEdge: .maxY)
+
+        // Profile stats arrive async from the diarize server; the popover
+        // is useful (name edit, emails, talk share) even when it's down.
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:8179/profiles")!)
+        req.timeoutInterval = 3
+        URLSession.shared.dataTask(with: req) { [weak detail] data, _, _ in
+            var text = "No voice profile yet — use ✎ to assign this speaker."
+            if let data,
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let arr = obj["profiles"] as? [[String: Any]] {
+                if let p = arr.first(where: {
+                    ($0["name"] as? String)?.lowercased() == name.lowercased()
+                }) {
+                    let samples = (p["samples"] as? Int) ?? 0
+                    let trusted = (p["trusted"] as? Int) ?? 0
+                    let tight = (p["tightness"] as? Double) ?? 0
+                    var parts = ["\(samples) voice samples (\(trusted) trusted)"]
+                    if tight > 0 { parts.append(String(format: "tightness %.2f", tight)) }
+                    var text2 = parts.joined(separator: " · ")
+                    let updated = (p["samples_updated"] as? Double) ?? 0
+                    if updated > 0 {
+                        let df = DateFormatter()
+                        df.dateFormat = "M/d h:mm a"
+                        text2 += "\nSamples updated "
+                            + df.string(from: Date(timeIntervalSince1970: updated))
+                    }
+                    if let near = p["nearest"] as? [String: Any],
+                       let nn = near["name"] as? String,
+                       let ns = near["sim"] as? Double {
+                        text2 += String(format: "\nClosest other voice: %@ (%.2f)", nn, ns)
+                    }
+                    text = text2
+                }
+            } else {
+                text = "Diarize server not running — no profile details."
+            }
+            DispatchQueue.main.async { detail?.stringValue = text }
+        }.resume()
+    }
+
+    /// Save from the ⓘ popover. A real profile renames through the
+    /// launcher (server + every transcript + emails.json follow); an
+    /// unassigned label ("Speaker 2", THEM) routes through the same
+    /// assign path the pencil uses, so the voice gets trained too.
+    @objc private func saveSpeakerInfoName() {
+        guard let field = infoNameField else { return }
+        let old = infoOldName
+        let new = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !new.isEmpty, new != old, !new.contains("/"),
+              !new.hasPrefix(".") else {
+            infoPopover?.close(); infoPopover = nil
+            return
+        }
+        infoSaveButton?.isEnabled = false
+        infoSaveButton?.title = "Saving…"
+        let hasProfile = enrolledProfiles().contains {
+            $0.lowercased() == old.lowercased()
+        }
+        if !hasProfile {
+            infoPopover?.close(); infoPopover = nil
+            runAssign(label: old, name: new)
+            flashStatus("Assigning \(old) → \(new)…")
+            return
+        }
+        guard let launcher = launcherPath() else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["profile", "rename", old, new]
+        DispatchQueue.global().async { [weak self] in
+            do { try proc.run() } catch { return }
+            proc.waitUntilExit()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.infoPopover?.close()
+                self.infoPopover = nil
+                self.refreshIfChanged(force: true)
+                self.rebuildPanelRows()
+                self.flashStatus("Renamed \(old) → \(new)")
+            }
+        }
+    }
+
     // MARK: Segment editing (recordings only)
     //
     // No freeform document editing — every mutation is structured and
@@ -3722,7 +3914,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let nameField: NSTextField
         let pctField: NSTextField
         if let reused = tableView.makeView(withIdentifier: cellID, owner: self) as? NSTableCellView,
-           reused.subviews.count >= 3,
+           reused.subviews.count >= 4,
            let n = reused.subviews[0] as? NSTextField,
            let p = reused.subviews[1] as? NSTextField {
             cell = reused; nameField = n; pctField = p
@@ -3738,6 +3930,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             pctField.textColor = .secondaryLabelColor
             pctField.alignment = .right
             pctField.translatesAutoresizingMaskIntoConstraints = false
+            let info = NSButton(title: "", target: self, action: #selector(speakerInfoClicked(_:)))
+            info.image = NSImage(systemSymbolName: "info.circle",
+                                 accessibilityDescription: "Speaker details")
+            info.isBordered = false
+            info.contentTintColor = .tertiaryLabelColor
+            info.toolTip = "Profile details (edit the name to rename everywhere)"
+            info.translatesAutoresizingMaskIntoConstraints = false
             let pencil = NSButton(title: "", target: self, action: #selector(pencilClicked(_:)))
             pencil.image = NSImage(systemSymbolName: "pencil",
                                    accessibilityDescription: "Rename speaker")
@@ -3747,6 +3946,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             pencil.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(nameField)
             cell.addSubview(pctField)
+            cell.addSubview(info)
             cell.addSubview(pencil)
             NSLayoutConstraint.activate([
                 nameField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 12),
@@ -3754,7 +3954,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 pctField.leadingAnchor.constraint(greaterThanOrEqualTo: nameField.trailingAnchor, constant: 6),
                 pctField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
                 pctField.widthAnchor.constraint(equalToConstant: 34),
-                pencil.leadingAnchor.constraint(equalTo: pctField.trailingAnchor, constant: 2),
+                info.leadingAnchor.constraint(equalTo: pctField.trailingAnchor, constant: 2),
+                info.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                info.widthAnchor.constraint(equalToConstant: 18),
+                pencil.leadingAnchor.constraint(equalTo: info.trailingAnchor, constant: 2),
                 pencil.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
                 pencil.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
                 pencil.widthAnchor.constraint(equalToConstant: 18),
@@ -3773,7 +3976,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             nameField.toolTip = "Non-participants (e.g. the Zoom recording "
                 + "announcer) — click to show"
             pctField.stringValue = ""
-            cell.subviews.last?.isHidden = true   // no pencil on the toggle
+            cell.subviews.suffix(2).forEach { $0.isHidden = true }   // no buttons on the toggle
         case .suspicion(let text):
             nameField.stringValue = "⚠ \(text)"
             nameField.font = NSFont.systemFont(ofSize: 10)
@@ -3782,7 +3985,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 + "so far disagree — assign the unknown speakers or "
                 + "ignore if someone extra joined"
             pctField.stringValue = ""
-            cell.subviews.last?.isHidden = true
+            cell.subviews.suffix(2).forEach { $0.isHidden = true }
         case .attendeeHeader(let unassigned, let total):
             nameField.stringValue = (attendeesExpanded ? "▾ Attendees" : "▸ Attendees")
                 + " (\(total))" + (unassigned > 0 ? " · \(unassigned) unlinked" : "")
@@ -3791,7 +3994,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 + "email to a voice profile so future meetings know whose "
                 + "voices to expect"
             pctField.stringValue = ""
-            cell.subviews.last?.isHidden = true
+            cell.subviews.suffix(2).forEach { $0.isHidden = true }
         case .attendee(let email, let profile):
             nameField.font = NSFont.systemFont(ofSize: 11)
             if let profile {
@@ -3805,7 +4008,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 nameField.toolTip = "Click to link this attendee to a voice profile"
             }
             pctField.stringValue = ""
-            cell.subviews.last?.isHidden = true
+            cell.subviews.suffix(2).forEach { $0.isHidden = true }
         case .speaker(let name, let fraction, let hidden, let hint):
             if let hint {
                 let attr = NSMutableAttributedString(
@@ -3831,7 +4034,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             nameField.toolTip = audioPath != nil
                 ? "Click to play their next segment" : "Click to name this speaker"
             pctField.stringValue = "\(Int((fraction * 100).rounded()))%"
-            cell.subviews.last?.isHidden = false
+            cell.subviews.suffix(2).forEach { $0.isHidden = false }
         }
         return cell
     }
@@ -5706,6 +5909,19 @@ final class SettingsViewController: NSViewController {
 
 // MARK: - Today page
 
+/// A Today event row. Clicking anywhere that isn't the action button
+/// opens the event-details popover — the button handles its own clicks,
+/// so plain mouseUp here never fires for it.
+private final class TodayRowView: NSView {
+    var onClick: (() -> Void)?
+    override func mouseUp(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        if bounds.contains(p) { onClick?() } else {
+            super.mouseUp(with: event)
+        }
+    }
+}
+
 /// The day at a glance: the last 3 and next 8 calendar meetings that
 /// have other attendees, each with a Start Recording / Go to Transcript
 /// action, and the event covering the current time highlighted.
@@ -5918,7 +6134,12 @@ final class TodayViewController: NSViewController {
         } ?? false
         let isPast = (end ?? .distantFuture) < now
 
-        let box = NSView()
+        let box = TodayRowView()
+        box.onClick = { [weak self, weak box] in
+            guard let self, let box else { return }
+            self.showEventDetails(e, anchor: box)
+        }
+        box.toolTip = "Click for details"
         box.wantsLayer = true
         box.layer?.cornerRadius = 8
         box.layer?.backgroundColor = isNow
@@ -5988,6 +6209,14 @@ final class TodayViewController: NSViewController {
             // Something else is already recording — one capture at a time.
             button.title = "Start Recording"
             button.isEnabled = false
+        } else if let video = eventVideoLink(e) {
+            // One click to be IN the meeting: open the conference link
+            // (browser or native app claims it) and start capture.
+            button.title = "Open Meeting & Record"
+            rowActions[startISO + title] = { [weak self] in
+                NSWorkspace.shared.open(video)
+                self?.startRecording(for: e)
+            }
         } else {
             button.title = "Start Recording"
             rowActions[startISO + title] = { [weak self] in
@@ -6012,6 +6241,145 @@ final class TodayViewController: NSViewController {
     @objc private func rowAction(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue else { return }
         rowActions[id]?()
+    }
+
+    // MARK: Event details popover
+
+    private var eventPopover: NSPopover?
+    private var eventPopoverLink: URL?
+
+    /// EventKit notes on Google-backed events often arrive as HTML —
+    /// flatten to readable text (breaks → newlines, tags stripped,
+    /// the common entities decoded).
+    private func plainNotes(_ raw: String) -> String {
+        var s = raw
+        s = s.replacingOccurrences(of: #"<br\s*/?>"#, with: "\n",
+                                   options: [.regularExpression, .caseInsensitive])
+        s = s.replacingOccurrences(of: #"</p>|</div>|</li>"#, with: "\n",
+                                   options: [.regularExpression, .caseInsensitive])
+        s = s.replacingOccurrences(of: #"<[^>]+>"#, with: "",
+                                   options: .regularExpression)
+        for (ent, ch) in [("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"),
+                          ("&gt;", ">"), ("&quot;", "\""), ("&#39;", "'")] {
+            s = s.replacingOccurrences(of: ent, with: ch)
+        }
+        // Collapse the blank-line stacks the tag stripping leaves behind.
+        s = s.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n",
+                                   options: .regularExpression)
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func showEventDetails(_ e: [String: Any], anchor: NSView) {
+        eventPopover?.close()
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        func label(_ text: String, size: CGFloat = 12,
+                   weight: NSFont.Weight = .regular,
+                   color: NSColor = .labelColor, maxLines: Int = 0) -> NSTextField {
+            let f = NSTextField(wrappingLabelWithString: text)
+            f.font = NSFont.systemFont(ofSize: size, weight: weight)
+            f.textColor = color
+            f.isSelectable = true
+            if maxLines > 0 {
+                f.maximumNumberOfLines = maxLines
+                f.lineBreakMode = .byTruncatingTail
+            }
+            f.preferredMaxLayoutWidth = 352
+            return f
+        }
+
+        stack.addArrangedSubview(label((e["title"] as? String) ?? "(untitled)",
+                                       size: 14, weight: .semibold))
+
+        let tf = DateFormatter()
+        tf.dateFormat = "EEEE h:mm a"
+        var when = (e["start"] as? String).flatMap { iso.date(from: $0) }
+            .map { tf.string(from: $0) } ?? ""
+        if let end = (e["end"] as? String).flatMap({ iso.date(from: $0) }) {
+            let ef = DateFormatter(); ef.dateFormat = "h:mm a"
+            when += " – " + ef.string(from: end)
+        }
+        if let cal = e["calendarTitle"] as? String, !cal.isEmpty {
+            when += "   ·   \(cal)"
+        }
+        stack.addArrangedSubview(label(when, size: 11, color: .secondaryLabelColor))
+
+        if let loc = e["location"] as? String,
+           !loc.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            stack.addArrangedSubview(label(loc, size: 11,
+                                           color: .secondaryLabelColor, maxLines: 3))
+        }
+
+        if let video = eventVideoLink(e) {
+            eventPopoverLink = video
+            let open = NSButton(title: "Open meeting link",
+                                target: self, action: #selector(openEventLink))
+            open.bezelStyle = .inline
+            open.controlSize = .small
+            stack.setCustomSpacing(10, after: stack.arrangedSubviews.last!)
+            stack.addArrangedSubview(open)
+        } else {
+            eventPopoverLink = nil
+        }
+
+        let attendees = (e["attendees"] as? [[String: String]]) ?? []
+        if !attendees.isEmpty {
+            stack.setCustomSpacing(12, after: stack.arrangedSubviews.last!)
+            stack.addArrangedSubview(label("Attendees (\(attendees.count))",
+                                           size: 11, weight: .semibold,
+                                           color: .tertiaryLabelColor))
+            for a in attendees.prefix(12) {
+                let name = a["name"] ?? ""
+                let email = a["email"] ?? ""
+                let line = name.isEmpty ? email
+                    : (email.isEmpty ? name : "\(name) — \(email)")
+                stack.addArrangedSubview(label(line, size: 11,
+                                               color: .secondaryLabelColor,
+                                               maxLines: 1))
+            }
+            if attendees.count > 12 {
+                stack.addArrangedSubview(label("+ \(attendees.count - 12) more",
+                                               size: 11, color: .tertiaryLabelColor))
+            }
+        }
+
+        let notes = plainNotes((e["notes"] as? String) ?? "")
+        if !notes.isEmpty {
+            stack.setCustomSpacing(12, after: stack.arrangedSubviews.last!)
+            stack.addArrangedSubview(label("Notes", size: 11, weight: .semibold,
+                                           color: .tertiaryLabelColor))
+            stack.addArrangedSubview(label(notes, size: 11,
+                                           color: .secondaryLabelColor,
+                                           maxLines: 18))
+        }
+
+        let vc = NSViewController()
+        let container = NSView()
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            container.widthAnchor.constraint(equalToConstant: 380),
+        ])
+        vc.view = container
+
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.contentViewController = vc
+        eventPopover = pop
+        pop.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .maxY)
+    }
+
+    @objc private func openEventLink() {
+        if let url = eventPopoverLink { NSWorkspace.shared.open(url) }
     }
 
     /// Start + link via the shared helper; the local state just drives
