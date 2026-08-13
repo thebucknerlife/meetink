@@ -1989,6 +1989,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let liveRecording = fixedPath == nil && recordingPID() != nil
         if liveRecording {
             add("Discard Recording…", #selector(discardRecording))
+            if !lastResolvedPath.isEmpty {
+                menu.addItem(.separator())
+                add("Activity…", #selector(showMeetingActivity))
+            }
         } else if !lastResolvedPath.isEmpty {
             // Grouped: exports / pipeline / file / destructive. "…" only
             // on items with a follow-up step (dialog or panel).
@@ -2003,8 +2007,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             // pipeline died before the archive step (field incident:
             // renamed-folder race), and reprocess is exactly the fix.
             let stemBase = (lastResolvedPath as NSString).deletingPathExtension
+            let sessDir = (lastResolvedPath as NSString).deletingLastPathComponent
+            // Stranded session raws (postproc died before ANY archive
+            // step) count too — cmd_reprocess recovers from them.
             let hasStems = FileManager.default.fileExists(atPath: stemBase + ".mic.wav")
                 || FileManager.default.fileExists(atPath: stemBase + ".sys.wav")
+                || FileManager.default.fileExists(atPath: sessDir + "/session-mic.raw")
+                || FileManager.default.fileExists(atPath: sessDir + "/session-sys.raw")
             if audioPath != nil || hasStems {
                 add(reprocessRunning ? "Reprocessing…" : "Reprocess…",
                     #selector(reprocess))
@@ -2013,6 +2022,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     + "and audio enhancement on this meeting's kept audio"
             }
             menu.addItem(.separator())
+            add("Activity…", #selector(showMeetingActivity))
             add("Open Folder", #selector(openFolder))
             add("Duplicate Meeting", #selector(duplicateMeeting))
             add("Archive Meeting", #selector(archiveFromMenu))
@@ -2243,6 +2253,25 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard !lastResolvedPath.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting(
             [URL(fileURLWithPath: lastResolvedPath)])
+    }
+
+    // Its own top-level window (not a popover/sheet) on purpose — the
+    // user drags it aside and keeps it open while poking around the
+    // main window. Retained here; released when the window closes.
+    private static var activityWindows: [MeetingActivityWindowController] = []
+
+    @objc private func showMeetingActivity() {
+        guard !lastResolvedPath.isEmpty else { return }
+        let wc = MeetingActivityWindowController(txtPath: lastResolvedPath)
+        Self.activityWindows.append(wc)
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: wc.window,
+            queue: .main) { _ in
+            Self.activityWindows.removeAll { $0 === wc }
+        }
+        wc.window?.center()
+        wc.showWindow(nil)
+        wc.window?.makeKeyAndOrderFront(nil)
     }
 
     /// Full copy of the meeting under a fresh ID — the safe way to test
@@ -3026,7 +3055,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 rawText = text
                 snapshot = parseTranscript(text)
                 snapshot.hardBreaks = loadHardBreaks(resolved)
-                render(empty: false)
+                // A transcript with headers but no content lines used to
+                // render a blank void (no message, no title, sidebar
+                // empty) — the whole page looked broken until the first
+                // utterance landed (field report: new recordings).
+                render(empty: snapshot.lines.isEmpty)
             }
         } else {
             updateHeader()
@@ -3082,8 +3115,15 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             ? NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12) : NSEdgeInsets()
         for v in playerBar.arrangedSubviews { v.isHidden = (audioPath == nil) }
         noAudioLabel.isHidden = !(archived && audioPath == nil)
-        titleField.isHidden = !archived
-        if archived, view.window?.firstResponder != titleField.currentEditor() {
+        // The title shows for EVERY open meeting — live and empty ones
+        // included. It was gated on `archived`, which (a) hid the title
+        // for the whole call and (b) meant a title landing while the
+        // page sat in the empty state never surfaced ("sometimes the
+        // title doesn't load"). Renames are meta-only now, so editing
+        // the title mid-recording is safe.
+        titleField.isHidden = lastResolvedPath.isEmpty
+        if !lastResolvedPath.isEmpty,
+           view.window?.firstResponder != titleField.currentEditor() {
             titleField.stringValue = meetingDisplayName(lastResolvedPath)
         }
         updatePlayerUI()
@@ -4079,8 +4119,17 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                                                         weight: .regular)
 
         if empty {
+            let live = fixedPath == nil && recordingPID() != nil
+            let msg: String
+            if !lastResolvedPath.isEmpty && live {
+                msg = "Recording — listening for the first words…"
+            } else if !lastResolvedPath.isEmpty {
+                msg = "No transcript content in this meeting yet."
+            } else {
+                msg = "No transcript yet.\n\nStart a recording, or open one from Meetings."
+            }
             out.append(NSAttributedString(
-                string: "No transcript yet.\n\nStart a recording, or open one from Meetings.",
+                string: msg,
                 attributes: [.font: bodyFont, .foregroundColor: NSColor.secondaryLabelColor]))
         } else {
             let headerPara = NSMutableParagraphStyle()
@@ -5546,6 +5595,191 @@ final class PanelDividerView: NSView {
 
 // MARK: - Activity page
 
+/// Titles for activity-log refs: folder stamp → meta.json title. The
+/// log stores permanent stamps (ID-permanent naming); people think in
+/// titles. Cached — the activity views poll every second.
+private var _activityTitleCache: [String: String] = [:]
+private var _activityTitleCacheAt = Date.distantPast
+
+func activityMeetingTitles() -> [String: String] {
+    if Date().timeIntervalSince(_activityTitleCacheAt) < 20 {
+        return _activityTitleCache
+    }
+    var out: [String: String] = [:]
+    let fm = FileManager.default
+    for root in [transcriptsDir(), transcriptsDir() + "/_archive"] {
+        for dir in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
+            let meta = "\(root)/\(dir)/\(dir).meta.json"
+            guard let data = fm.contents(atPath: meta),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let t = obj["title"] as? String,
+                  !t.trimmingCharacters(in: .whitespaces).isEmpty
+            else { continue }
+            out[dir] = t
+        }
+    }
+    _activityTitleCache = out
+    _activityTitleCacheAt = Date()
+    return out
+}
+
+/// "…event — <stamp>" → "…event — <title>" when the stamp has a meta
+/// title; lines whose ref isn't a known meeting pass through untouched.
+func activityDisplayLine(_ line: String, titles: [String: String]) -> String {
+    guard let r = line.range(of: " — ", options: .backwards) else { return line }
+    let ref = String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+    guard let title = titles[ref] else { return line }
+    return line[..<r.lowerBound] + " — " + title
+}
+
+/// One meeting's full story in its own (draggable, keep-open) window:
+/// how it started, every pipeline event that touched it, what's
+/// processing right now, and which artifacts exist on disk.
+final class MeetingActivityWindowController: NSWindowController {
+    private let text = NSTextView()
+    private var timer: Timer?
+    private let txtPath: String
+
+    init(txtPath: String) {
+        self.txtPath = txtPath
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 560),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered, defer: false)
+        // No frame autosave: several of these can be open at once
+        // (different meetings) and would fight over one saved frame.
+        window.title = "Activity — \(meetingDisplayName(txtPath))"
+        super.init(window: window)
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        text.isEditable = false
+        text.isRichText = false
+        text.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+        text.textContainerInset = NSSize(width: 12, height: 12)
+        text.autoresizingMask = [.width]
+        scroll.documentView = text
+        window.contentView = scroll
+
+        rebuild()
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) {
+            [weak self] _ in self?.rebuild()
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+    deinit { timer?.invalidate() }
+
+    private func fileLine(_ label: String, _ path: String) -> String? {
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: path) else { return nil }
+        let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        let mtime = (attrs[.modificationDate] as? Date) ?? .distantPast
+        let df = DateFormatter()
+        df.dateFormat = "M/d h:mm:ss a"
+        let mb = Double(size) / 1_048_576
+        let sizeStr = mb >= 1 ? String(format: "%.1f MB", mb)
+            : String(format: "%d KB", max(1, size / 1024))
+        let padded = label.count < 22
+            ? label.padding(toLength: 22, withPad: " ", startingAt: 0) : label
+        return "  \(padded) \(df.string(from: mtime))  (\(sizeStr))"
+    }
+
+    private func rebuild() {
+        let base = (txtPath as NSString).deletingPathExtension
+        let dir = (txtPath as NSString).deletingLastPathComponent
+        let stamp = (dir as NSString).lastPathComponent
+        var out: [String] = []
+
+        out.append("Meeting: \(meetingDisplayName(txtPath))")
+        out.append("Folder:  \(stamp)")
+        let meta = meetingMeta(txtPath)
+        if let ev = meta["event"] as? [String: Any] {
+            let t = (ev["title"] as? String) ?? "?"
+            let s = (ev["start"] as? String) ?? ""
+            let att = (ev["attendees"] as? [String])?.count
+                ?? (ev["attendees"] as? [[String: String]])?.count ?? 0
+            out.append("Event:   \(t)  \(s)  (\(att) attendees)")
+        } else {
+            out.append("Event:   none linked (manual or instant start)")
+        }
+
+        // Live / processing state, scoped to THIS meeting.
+        out.append("")
+        if isLiveRecording(txtPath: txtPath) {
+            out.append("● RECORDING NOW")
+        }
+        if let ppPath = try? String(contentsOfFile: "/tmp/meetink-postproc.path",
+                                    encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           ppPath == txtPath
+            || (ppPath as NSString).deletingLastPathComponent == dir,
+           let state = try? String(contentsOfFile: "/tmp/meetink-postproc.state",
+                                   encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           let pidRaw = try? String(contentsOfFile: "/tmp/meetink-postproc.pid",
+                                    encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           let pid = Int32(pidRaw), kill(pid, 0) == 0 {
+            out.append("◐ post-processing: \(state)")
+        }
+
+        // Timeline: every activity-log line that references this meeting,
+        // by stamp or by current title (older lines may predate a rename).
+        out.append("")
+        out.append("Timeline")
+        let title = meetingDisplayName(txtPath)
+        var events: [String] = []
+        if let log = try? String(contentsOfFile: "\(mkHome)/activity.log",
+                                 encoding: .utf8) {
+            for line in log.split(separator: "\n") {
+                guard let r = line.range(of: " — ", options: .backwards)
+                else { continue }
+                let ref = String(line[r.upperBound...])
+                    .trimmingCharacters(in: .whitespaces)
+                if ref == stamp || ref == title
+                    || ref == ((base as NSString).lastPathComponent) {
+                    events.append("  " + line)
+                }
+            }
+        }
+        out += events.isEmpty ? ["  (no logged events)"] : events
+
+        // Artifacts: what the pipeline has produced so far, with times —
+        // the "did processing actually finish?" answer at a glance.
+        out.append("")
+        out.append("Artifacts")
+        var artifacts: [String] = []
+        let named: [(String, String)] = [
+            ("transcript", txtPath),
+            ("pre-reprocess copy", base + ".pre-reprocess.txt"),
+            ("pre-edit copy", base + ".pre-edit.txt"),
+            ("live raw (pre-refine)", base + ".live-raw.txt"),
+            ("word timing", base + ".timing.json"),
+            ("audio (m4a)", base + ".m4a"),
+            ("mic spool (wav)", base + ".mic.wav"),
+            ("system spool (wav)", base + ".sys.wav"),
+            ("output routes", base + ".route.jsonl"),
+            ("summary", base + ".summary.md"),
+            ("metadata", base + ".meta.json"),
+        ]
+        for (label, p) in named {
+            if let l = fileLine(label, p) { artifacts.append(l) }
+        }
+        for stranded in ["session-mic.raw", "session-sys.raw",
+                         "session-mic.48k.raw", "session-sys.48k.raw"] {
+            if let l = fileLine("STRANDED \(stranded)", dir + "/" + stranded) {
+                artifacts.append(l + "  ← postproc died; Reprocess… recovers")
+            }
+        }
+        out += artifacts.isEmpty ? ["  (nothing on disk?)"] : artifacts
+
+        let full = out.joined(separator: "\n")
+        if text.string != full { text.string = full }
+        window?.title = "Activity — \(meetingDisplayName(txtPath))"
+    }
+}
+
 /// Live view of everything the system is doing — recording, post-
 /// processing, watch daemon, servers — so 'what is going on right now?'
 /// has one answer instead of four log files.
@@ -5623,7 +5857,9 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
             historyTable.reloadData()
             return
         }
-        let all = text.split(separator: "\n").map(String.init).reversed()
+        let titles = activityMeetingTitles()
+        let all = text.split(separator: "\n").reversed()
+            .map { activityDisplayLine(String($0), titles: titles) }
         history = Array(all.prefix(historyShown))
         moreButton.isHidden = all.count <= historyShown
         historyTable.reloadData()
