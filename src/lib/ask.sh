@@ -59,13 +59,15 @@ cmd_ask() {
     # passes the open meeting). --plain: suppress the human decoration so
     # stdout is exactly the answer (machine consumers).
     local tx_override=""
-    typeset -g _ASK_PLAIN=0
+    typeset -g _ASK_PLAIN=0 _ASK_STREAM=0 _ASK_RESUME=""
     while [[ "$1" == --* ]]; do
         case "$1" in
-            --file)  tx_override="$2"; shift 2 ;;
-            --plain) _ASK_PLAIN=1; shift ;;
-            --)      shift; break ;;
-            *)       shift ;;
+            --file)   tx_override="$2"; shift 2 ;;
+            --plain)  _ASK_PLAIN=1; shift ;;
+            --stream) _ASK_STREAM=1; shift ;;   # stream-json to stdout (app)
+            --resume) _ASK_RESUME="$2"; shift 2 ;;  # continue a claude session
+            --)       shift; break ;;
+            *)        shift ;;
         esac
     done
     local question="$*"
@@ -89,6 +91,13 @@ cmd_ask() {
         return 1
     fi
 
+    # Resuming a claude session: the transcript and context already live
+    # in the session — send ONLY the question. Follow-ups skip the whole
+    # ~20K-token re-upload (the "minute per question" field report).
+    if [[ -n "$_ASK_RESUME" && "$backend" == "claude" ]]; then
+        _ask_claude "$question"
+        return $?
+    fi
     local tx_path=$(_ask_transcript_path)
     [[ -n "$tx_override" && -f "$tx_override" ]] && tx_path="$tx_override"
     local me=$(me_name_get 2>/dev/null)
@@ -179,10 +188,18 @@ _ask_claude() {
     # Same slimming flags as titling: no built-in tools, no MCP — keeps the
     # call fast (~5-10s on Sonnet) and avoids "Prompt is too long" on Haiku
     # when the user has many plugins loaded.
+    local -a extra=()
+    if (( ${_ASK_STREAM:-0} )); then
+        # Streaming JSONL: the app renders tokens (and thinking deltas)
+        # as they arrive instead of a silent minute behind "thinking…".
+        extra+=(--output-format stream-json --verbose --include-partial-messages)
+    fi
+    [[ -n "${_ASK_RESUME:-}" ]] && extra+=(--resume "$_ASK_RESUME")
     claude -p \
         --model "$model" \
         --tools "" \
         --strict-mcp-config \
+        "${extra[@]}" \
         "$prompt" </dev/null
     (( ${_ASK_PLAIN:-0} )) || print -P ""
 }

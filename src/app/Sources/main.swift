@@ -1239,6 +1239,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var chatHistory: [(q: String, a: String)] = []
     private var chatPending: String? = nil
     private var chatBusy = false
+    // Streaming ask: partial thinking + answer render live; the claude
+    // session id lets follow-ups resume instead of re-uploading the
+    // transcript (the first question pays it once).
+    private var chatStreamThinking = ""
+    private var chatStreamAnswer = ""
+    private var chatSessionID: String? = nil
+    private var chatSessionPath: String? = nil
 
     // --- Playback (archived transcripts with a kept .m4a only) ---
     private var player: AVAudioPlayer? = nil
@@ -1675,38 +1682,102 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         chatField.stringValue = ""
         chatPending = q
         renderChatLog()
-        // Fold recent turns into the question so follow-ups have context —
-        // cmd_ask itself is single-shot. The transcript is re-read by the
-        // CLI on every call, which is what makes live chat live.
+        chatStreamThinking = ""
+        chatStreamAnswer = ""
+        // Resume the meeting's claude session when we have one — the
+        // transcript is already in the session's context, so follow-ups
+        // send just the question instead of re-uploading ~20K tokens
+        // (the "a minute per question" field report). First question of
+        // a meeting pays the upload once and remembers the session.
+        var args = ["ask", "--plain", "--stream", "--file", path]
+        let resumed = chatSessionID != nil && chatSessionPath == path
+        if resumed, let sid = chatSessionID {
+            args += ["--resume", sid]
+        }
         var question = q
-        if !chatHistory.isEmpty {
+        if !resumed && !chatHistory.isEmpty {
             let hist = chatHistory.suffix(3)
                 .map { "Q: \($0.q)\nA: \($0.a)" }.joined(separator: "\n")
             question = "Earlier in this chat:\n\(hist)\n\nNew question: \(q)"
         }
+        args.append(question)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launcher)
-        proc.arguments = ["ask", "--plain", "--file", path, question]
+        proc.arguments = args
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = FileHandle.nullDevice
-        DispatchQueue.global().async { [weak self] in
-            var answer = ""
-            do {
-                try proc.run()
-                // Read to EOF BEFORE waitUntilExit (64 KB pipe deadlock).
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                proc.waitUntilExit()
-                answer = String(data: data, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            } catch {}
-            if answer.isEmpty {
-                answer = "(no answer — is the claude CLI or a local LLM configured? See /tmp/meetink-*.log)"
+        var buf = Data()
+        var plainText = ""          // non-JSON fallback (local backends)
+        var finalAnswer: String? = nil
+        var newSession: String? = nil
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] fh in
+            let chunk = fh.availableData
+            guard !chunk.isEmpty else { return }
+            buf.append(chunk)
+            while let nl = buf.firstIndex(of: 0x0A) {
+                let line = Data(buf[buf.startIndex..<nl])
+                buf.removeSubrange(buf.startIndex...nl)
+                guard let obj = try? JSONSerialization.jsonObject(with: line)
+                        as? [String: Any] else {
+                    // Local/lmstudio backends stream plain text.
+                    if let t = String(data: line, encoding: .utf8) {
+                        plainText += t + "\n"
+                        DispatchQueue.main.async {
+                            self?.chatStreamAnswer = plainText
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            self?.renderChatLog()
+                        }
+                    }
+                    continue
+                }
+                if let sid = obj["session_id"] as? String { newSession = sid }
+                switch obj["type"] as? String {
+                case "stream_event":
+                    guard let event = obj["event"] as? [String: Any],
+                          (event["type"] as? String) == "content_block_delta",
+                          let delta = event["delta"] as? [String: Any]
+                    else { break }
+                    let thinking = delta["thinking"] as? String
+                    let text = delta["text"] as? String
+                    if thinking != nil || text != nil {
+                        DispatchQueue.main.async {
+                            guard let self else { return }
+                            if let th = thinking { self.chatStreamThinking += th }
+                            if let tx = text { self.chatStreamAnswer += tx }
+                            self.renderChatLog()
+                        }
+                    }
+                case "result":
+                    if let r = obj["result"] as? String { finalAnswer = r }
+                default:
+                    break
+                }
             }
+        }
+        DispatchQueue.global().async { [weak self] in
+            do { try proc.run() } catch {}
+            proc.waitUntilExit()
+            pipe.fileHandleForReading.readabilityHandler = nil
             DispatchQueue.main.async {
                 guard let self else { return }
+                var answer = (finalAnswer ?? self.chatStreamAnswer)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if answer.isEmpty {
+                    answer = plainText.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if answer.isEmpty {
+                    answer = "(no answer — is the claude CLI or a local LLM "
+                        + "configured? See /tmp/meetink-*.log)"
+                }
+                if let sid = newSession {
+                    self.chatSessionID = sid
+                    self.chatSessionPath = path
+                }
                 self.chatHistory.append((q: q, a: answer))
                 self.chatPending = nil
+                self.chatStreamThinking = ""
+                self.chatStreamAnswer = ""
                 self.chatBusy = false
                 self.chatField.isEnabled = true
                 self.renderChatLog()
@@ -1732,10 +1803,28 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
         if let pending = chatPending {
             out.append(NSAttributedString(string: "\(pending)\n", attributes: qAttrs))
-            out.append(NSAttributedString(
-                string: "thinking…\n",
-                attributes: [.font: NSFont.systemFont(ofSize: size),
-                             .foregroundColor: NSColor.tertiaryLabelColor]))
+            // Live stream: the model's thinking (dim italic) and the
+            // answer render token by token — no more silent minute.
+            if !chatStreamThinking.isEmpty {
+                out.append(NSAttributedString(
+                    string: chatStreamThinking + "\n",
+                    attributes: [
+                        .font: NSFontManager.shared.convert(
+                            NSFont.systemFont(ofSize: size - 1),
+                            toHaveTrait: .italicFontMask),
+                        .foregroundColor: NSColor.tertiaryLabelColor,
+                    ]))
+            }
+            if !chatStreamAnswer.isEmpty {
+                out.append(NSAttributedString(
+                    string: chatStreamAnswer + "\n",
+                    attributes: aAttrs))
+            } else if chatStreamThinking.isEmpty {
+                out.append(NSAttributedString(
+                    string: "thinking…\n",
+                    attributes: [.font: NSFont.systemFont(ofSize: size),
+                                 .foregroundColor: NSColor.tertiaryLabelColor]))
+            }
         }
         chatLog.textStorage?.setAttributedString(out)
         chatLog.scrollToEndOfDocument(nil)
