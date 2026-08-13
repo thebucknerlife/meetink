@@ -163,6 +163,36 @@ func enrolledProfiles() -> [String] {
         .sorted()
 }
 
+private var _profileNamesCache: [String] = []
+private var _profileNamesCacheAt = Date.distantPast
+
+func profileNamesCached() -> [String] {
+    if Date().timeIntervalSince(_profileNamesCacheAt) > 10 {
+        _profileNamesCache = enrolledProfiles()
+        _profileNamesCacheAt = Date()
+    }
+    return _profileNamesCache
+}
+
+/// Display case for a transcript speaker label. The FILE keeps uppercase
+/// labels (every pipeline — rename sweeps, relabel priors, harvest —
+/// greps for them), but people don't read in caps: the profile's own
+/// case wins, synthetic labels get title case. Display-only — commands
+/// and lookups keep using the raw label.
+func displaySpeakerName(_ label: String) -> String {
+    let t = label.trimmingCharacters(in: .whitespaces)
+    if let p = profileNamesCached().first(where: {
+        $0.lowercased() == t.lowercased()
+    }) {
+        return p
+    }
+    guard t == t.uppercased() else { return t }    // already natural case
+    if t == "THEM" { return "Them" }
+    if t == "ME" { return "Me" }
+    if t.hasPrefix("SPEAKER ") { return "Speaker " + t.dropFirst(8) }
+    return t.capitalized
+}
+
 /// Cut [start, start+dur) out of an audio file and return it as a
 /// 16 kHz mono 16-bit WAV — the diarize server's /enroll body format.
 /// Used by the voice-harvest path (segment reassignment = ground truth
@@ -2025,6 +2055,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             add("Activity…", #selector(showMeetingActivity))
             add("Open Folder", #selector(openFolder))
             add("Duplicate Meeting", #selector(duplicateMeeting))
+            // Two back-to-back meetings on one app land in one
+            // recording; the cut point is wherever the playhead sits.
+            if audioPath != nil, (player?.currentTime ?? 0) > 1 {
+                add("Split at Playhead…", #selector(splitAtPlayhead))
+            }
             add("Archive Meeting", #selector(archiveFromMenu))
             add("Rename…", #selector(renameFromMenu))
             menu.addItem(.separator())
@@ -2272,6 +2307,50 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         wc.window?.center()
         wc.showWindow(nil)
         wc.window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Cut everything after the playhead into a NEW meeting — the fix
+    /// for two same-app meetings captured as one recording. Transcript,
+    /// timing and audio all split; the event link stays with the
+    /// original (the second meeting wasn't that event).
+    @objc private func splitAtPlayhead() {
+        guard !lastResolvedPath.isEmpty, let t = player?.currentTime, t > 1,
+              let launcher = launcherPath() else { return }
+        if player?.isPlaying == true { player?.pause(); playTimer?.invalidate() }
+        let secs = Int(t)
+        let stampStr = String(format: "%d:%02d", secs / 60, secs % 60)
+        let alert = NSAlert()
+        alert.messageText = "Split this meeting at \(stampStr)?"
+        alert.informativeText = "Everything after the playhead becomes a "
+            + "new meeting (\"Split from …\"). Transcript, timing and audio "
+            + "are cut; the calendar event stays with this one."
+        alert.addButton(withTitle: "Split")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launcher)
+        proc.arguments = ["split", lastResolvedPath, String(Int(t))]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        flashStatus("Splitting at \(stampStr)…")
+        DispatchQueue.global().async { [weak self] in
+            do { try proc.run() } catch { return }
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                             encoding: .utf8) ?? ""
+            proc.waitUntilExit()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if proc.terminationStatus == 0 {
+                    self.refreshIfChanged(force: true)
+                    self.flashStatus("Split done — new meeting created")
+                } else {
+                    let reason = out.split(separator: "\n").last
+                        .map(String.init) ?? "unknown error"
+                    self.flashStatus("Split failed: \(reason)")
+                }
+            }
+        }
     }
 
     /// Full copy of the meeting under a fresh ID — the safe way to test
@@ -2594,6 +2673,60 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         deleteLines(lines)
     }
 
+    // MARK: Block menu (click a speaker name in a recording)
+
+    private func showBlockMenu(firstLine: Int) {
+        guard let block = snapshot.blocks.first(where: {
+            $0.parts.contains { $0.line == firstLine }
+        }) else { return }
+        let lines = block.parts.map(\.line)
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        func add(_ title: String, _ sel: Selector, _ repr: Any) {
+            let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            item.target = self
+            item.representedObject = repr
+            menu.addItem(item)
+        }
+        if audioPath != nil {
+            add("Play from Here", #selector(blockMenuPlay(_:)), firstLine)
+            menu.addItem(.separator())
+        }
+        let noun = lines.count == 1 ? "1 segment" : "\(lines.count) segments"
+        add("Reassign Block to… (\(noun))", #selector(blockMenuReassign(_:)), lines)
+        add("Delete Block… (\(noun))", #selector(blockMenuDelete(_:)), lines)
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: textView)
+        }
+    }
+
+    @objc private func blockMenuPlay(_ sender: NSMenuItem) {
+        guard let line = sender.representedObject as? Int,
+              line < lineOffsets.count else { return }
+        seek(to: lineOffsets[line], andPlay: true)
+    }
+
+    @objc private func blockMenuReassign(_ sender: NSMenuItem) {
+        guard let lines = sender.representedObject as? [Int],
+              !lines.isEmpty else { return }
+        promptReassign(lines: lines, anchorRange: lineRanges[lines[0]])
+    }
+
+    @objc private func blockMenuDelete(_ sender: NSMenuItem) {
+        guard let lines = sender.representedObject as? [Int],
+              !lines.isEmpty, lines[0] < snapshot.lines.count else { return }
+        let seg = snapshot.lines[lines[0]]
+        let alert = NSAlert()
+        alert.messageText = "Delete this block?"
+        alert.informativeText = "\(displaySpeakerName(seg.speaker)) at "
+            + "\(seg.timestamp) — \(lines.count) segment(s). "
+            + "The first edit keeps a pre-edit copy of the transcript."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Delete")
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        deleteLines(lines)
+    }
+
     /// One name prompt → relabel every line in `lines`. Shared by the
     /// single-segment menu, the multi-segment selection, and the
     /// post-split hand-off. Same popover as the speakers sidebar —
@@ -2611,7 +2744,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 ? "Reassign this segment to…"
                 : "Reassign \(lines.count) segments to…",
             assignTitle: "Reassign",
-            inMeeting: named,
+            inMeeting: named.map(displaySpeakerName),
             invite: inviteAssignEntries(excluding: named),
             onAssign: { [weak self] name in
                 self?.assignPopover?.close()
@@ -2871,6 +3004,14 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             render(empty: snapshot.lines.isEmpty && rawText.isEmpty)
             return true
         }
+        // Block menu (recordings): clicking a speaker NAME offers
+        // block-level actions — play, reassign every segment in the
+        // block, delete the block.
+        if let url = link as? URL, url.scheme == "meetink-block",
+           let first = Int(url.host ?? "") {
+            showBlockMenu(firstLine: first)
+            return true
+        }
         guard let url = link as? URL, url.scheme == "meetink-assign" else { return false }
         // Label travels percent-encoded in ?label= (it can be anything:
         // "Speaker 3", "GREG", "ADRIANA 2"). The old host-only form
@@ -2903,9 +3044,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let pop = NSPopover()
         pop.behavior = .transient
         let vc = AssignPopoverVC(
-            header: isUnnamed ? "Who is \(label)?" : "Reassign \(label) to…",
+            header: isUnnamed ? "Who is \(displaySpeakerName(label))?"
+                              : "Reassign \(displaySpeakerName(label)) to…",
             assignTitle: isUnnamed ? "Assign" : "Reassign",
-            inMeeting: names,
+            inMeeting: names.map(displaySpeakerName),
             invite: inviteAssignEntries(excluding: names + [label]),
             onAssign: { [weak self] name in
                 self?.assignPopover?.close()
@@ -3498,15 +3640,45 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             rebuildPanelRows()
         case .attendee(let email, _):
             promptForAttendeeLink(email: email, anchorRow: row)
-        case .speaker(let name, _, _, _):
-            // With audio: clicking a name hops to their next segment after
-            // the playhead. Renaming is the pencil button. Without audio
-            // the click falls back to renaming (nothing to play).
-            if audioPath != nil {
-                playNextSegment(of: name)
-            } else {
-                promptForName(label: name)
-            }
+        case .speaker(let name, let fraction, _, _):
+            // Clicking the NAME opens the info popover (profile details,
+            // editable name). Jumping to their next segment is the
+            // arrow button; assigning is the pencil.
+            showSpeakerInfo(name: name, fraction: fraction, anchorRow: row)
+        }
+    }
+
+    /// Jump to this speaker's next segment: seek-and-play when audio
+    /// exists, scroll-and-flash in the text otherwise.
+    private var lastTextJumpLine: [String: Int] = [:]
+
+    private func jumpToNextSegment(of speaker: String) {
+        if audioPath != nil {
+            playSpeakerSample(speaker)
+            return
+        }
+        let idxs = snapshot.lines.indices.filter {
+            snapshot.lines[$0].speaker == speaker
+        }
+        guard !idxs.isEmpty else { return }
+        let after = lastTextJumpLine[speaker] ?? -1
+        let next = idxs.first { $0 > after } ?? idxs[0]
+        lastTextJumpLine[speaker] = next
+        guard let r = lineRanges[next],
+              let lm = textView.layoutManager,
+              r.location + r.length <= (textView.string as NSString).length
+        else { return }
+        textView.scrollRangeToVisible(r)
+        lm.addTemporaryAttribute(
+            .backgroundColor,
+            value: NSColor.systemYellow.withAlphaComponent(0.28),
+            forCharacterRange: r)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self, let lm = self.textView.layoutManager,
+                  r.location + r.length
+                      <= (self.textView.string as NSString).length
+            else { return }
+            lm.removeTemporaryAttribute(.backgroundColor, forCharacterRange: r)
         }
     }
 
@@ -3526,7 +3698,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let vc = AssignPopoverVC(
             header: "Who is \(email)?",
             assignTitle: "Link",
-            inMeeting: named,
+            inMeeting: named.map(displaySpeakerName),
             onAssign: { [weak self] name in
                 self?.assignPopover?.close()
                 self?.assignPopover = nil
@@ -3571,12 +3743,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var infoSaveButton: NSButton?
     private var infoOldName = ""
 
-    @objc private func speakerInfoClicked(_ sender: NSButton) {
+    @objc private func speakerGotoClicked(_ sender: NSButton) {
         let row = speakersTable.row(for: sender)
         guard row >= 0, row < panelRows.count,
-              case .speaker(let name, let fraction, _, _) = panelRows[row]
+              case .speaker(let name, _, _, _) = panelRows[row]
         else { return }
-        showSpeakerInfo(name: name, fraction: fraction, anchorRow: row)
+        jumpToNextSegment(of: name)
     }
 
     private func showSpeakerInfo(name: String, fraction: Double, anchorRow: Int) {
@@ -3599,7 +3771,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             return f
         }
 
-        let nameField = NSTextField(string: name)
+        let nameField = NSTextField(string: displaySpeakerName(name))
         nameField.font = NSFont.boldSystemFont(ofSize: 13)
         nameField.translatesAutoresizingMaskIntoConstraints = false
         nameField.widthAnchor.constraint(equalToConstant: 200).isActive = true
@@ -3702,8 +3874,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard let field = infoNameField else { return }
         let old = infoOldName
         let new = field.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !new.isEmpty, new != old, !new.contains("/"),
-              !new.hasPrefix(".") else {
+        // The field is pre-filled with the DISPLAY case ("Judd" for a
+        // JUDD label) — saving it untouched is a no-op, not a rename.
+        guard !new.isEmpty, new != old, new != displaySpeakerName(old),
+              !new.contains("/"), !new.hasPrefix(".") else {
             infoPopover?.close(); infoPopover = nil
             return
         }
@@ -3731,7 +3905,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 self.infoPopover = nil
                 self.refreshIfChanged(force: true)
                 self.rebuildPanelRows()
-                self.flashStatus("Renamed \(old) → \(new)")
+                self.flashStatus("Renamed \(displaySpeakerName(old)) → \(new)")
             }
         }
     }
@@ -3970,12 +4144,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             pctField.textColor = .secondaryLabelColor
             pctField.alignment = .right
             pctField.translatesAutoresizingMaskIntoConstraints = false
-            let info = NSButton(title: "", target: self, action: #selector(speakerInfoClicked(_:)))
-            info.image = NSImage(systemSymbolName: "info.circle",
-                                 accessibilityDescription: "Speaker details")
+            let info = NSButton(title: "", target: self, action: #selector(speakerGotoClicked(_:)))
+            info.image = NSImage(systemSymbolName: "arrow.forward.circle",
+                                 accessibilityDescription: "Jump to next segment")
             info.isBordered = false
             info.contentTintColor = .tertiaryLabelColor
-            info.toolTip = "Profile details (edit the name to rename everywhere)"
+            info.toolTip = "Jump to this speaker's next segment"
             info.translatesAutoresizingMaskIntoConstraints = false
             let pencil = NSButton(title: "", target: self, action: #selector(pencilClicked(_:)))
             pencil.image = NSImage(systemSymbolName: "pencil",
@@ -4050,9 +4224,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             pctField.stringValue = ""
             cell.subviews.suffix(2).forEach { $0.isHidden = true }
         case .speaker(let name, let fraction, let hidden, let hint):
+            let display = displaySpeakerName(name)
             if let hint {
                 let attr = NSMutableAttributedString(
-                    string: name,
+                    string: display,
                     attributes: [.font: NSFont.boldSystemFont(ofSize: 12),
                                  .foregroundColor: hidden
                                      ? NSColor.tertiaryLabelColor
@@ -4063,7 +4238,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                                  .foregroundColor: NSColor.tertiaryLabelColor]))
                 nameField.attributedStringValue = attr
             } else {
-                nameField.stringValue = name
+                nameField.stringValue = display
             }
             nameField.textColor = hidden ? .tertiaryLabelColor : color(for: name)
             cell.wantsLayer = true
@@ -4071,8 +4246,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             cell.layer?.backgroundColor = name == currentSpeakingName
                 ? color(for: name).withAlphaComponent(0.13).cgColor
                 : NSColor.clear.cgColor
-            nameField.toolTip = audioPath != nil
-                ? "Click to play their next segment" : "Click to name this speaker"
+            nameField.toolTip = "Click for profile details"
             pctField.stringValue = "\(Int((fraction * 100).rounded()))%"
             cell.subviews.suffix(2).forEach { $0.isHidden = false }
         }
@@ -4152,17 +4326,18 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     .foregroundColor: NSColor.tertiaryLabelColor,
                     .paragraphStyle: headerPara,
                 ]
-                // With audio available, the NAME means "play from here" —
-                // renaming lives in the speakers panel. WITHOUT audio
-                // (live call), the name opens the assign popover instead:
-                // click a Speaker N mid-call and name them (field ask).
-                if audioPath != nil, let first = block.parts.first,
-                   let purl = URL(string: "meetink-play://\(first.line)") {
-                    speakerAttrs[.link] = purl
-                    speakerAttrs[.toolTip] = "Play from here"
+                // LIVE call: the name opens the assign popover (click a
+                // Speaker N mid-call and name them). Recordings: the
+                // name opens the BLOCK menu — play from here, reassign
+                // the whole block, delete it.
+                let isLive = fixedPath == nil && recordingPID() != nil
+                if !isLive, let first = block.parts.first,
+                   let burl = URL(string: "meetink-block://\(first.line)") {
+                    speakerAttrs[.link] = burl
+                    speakerAttrs[.toolTip] = "Block actions: play, reassign, delete"
                     speakerAttrs[.underlineStyle] = 0
                     speakerAttrs[.cursor] = NSCursor.pointingHand
-                } else if audioPath == nil,
+                } else if isLive,
                           let esc = block.speaker.addingPercentEncoding(
                               withAllowedCharacters: .urlQueryAllowed),
                           let aurl = URL(string: "meetink-assign://x?label=\(esc)") {
@@ -4179,7 +4354,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                         + "elapsed time"
                     stampAttrs[.cursor] = NSCursor.pointingHand
                 }
-                out.append(NSAttributedString(string: block.speaker, attributes: speakerAttrs))
+                out.append(NSAttributedString(string: displaySpeakerName(block.speaker),
+                                              attributes: speakerAttrs))
                 out.append(NSAttributedString(
                     string: "  \(displayStamp(block.timestamp))\n", attributes: stampAttrs))
                 for (pi, part) in block.parts.enumerated() {
