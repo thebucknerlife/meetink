@@ -563,6 +563,38 @@ func formatDuration(_ t: TimeInterval) -> String {
 
 /// Display name for a transcript path: timestamp prefix stripped, slug
 /// prettified — same rule everywhere a meeting is shown.
+/// Move a meeting between the transcripts root and _archive/ (the
+/// meetings scan skips underscore-prefixed dirs, so archived meetings
+/// vanish from Meetings and appear only on the Archive page). Whole
+/// session folder for the current layout; same-basename siblings for
+/// legacy flat files. Refuses the live recording.
+func archiveMeeting(txtPath: String, unarchive: Bool) -> Bool {
+    guard !isLiveRecording(txtPath: txtPath) else { return false }
+    let fm = FileManager.default
+    let base = ((txtPath as NSString).lastPathComponent as NSString)
+        .deletingPathExtension
+    let dir = (txtPath as NSString).deletingLastPathComponent
+    let folderStyle = (dir as NSString).lastPathComponent == base
+    let destRoot = unarchive
+        ? transcriptsDir()
+        : transcriptsDir() + "/_archive"
+    try? fm.createDirectory(atPath: destRoot, withIntermediateDirectories: true)
+    if folderStyle {
+        let dest = destRoot + "/" + base
+        guard !fm.fileExists(atPath: dest) else { return false }
+        return (try? fm.moveItem(atPath: dir, toPath: dest)) != nil
+    }
+    var moved = false
+    for item in (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+    where item.hasPrefix(base + ".") {
+        if (try? fm.moveItem(atPath: dir + "/" + item,
+                             toPath: destRoot + "/" + item)) != nil {
+            moved = true
+        }
+    }
+    return moved
+}
+
 func meetingDisplayName(_ txtPath: String) -> String {
     // Exact title from metadata wins; the filename slug is the fallback
     // (it can't hold dashes or punctuation — they round-trip to spaces).
@@ -1806,6 +1838,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             menu.addItem(.separator())
             add("Open Folder", #selector(openFolder))
             add("Duplicate Meeting", #selector(duplicateMeeting))
+            add("Archive Meeting", #selector(archiveFromMenu))
             add("Rename…", #selector(renameFromMenu))
             menu.addItem(.separator())
             add("Delete Meeting…", #selector(deleteMeeting))
@@ -2047,7 +2080,6 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let base = ((path as NSString).lastPathComponent as NSString)
             .deletingPathExtension
         let dir = (path as NSString).deletingLastPathComponent
-        let title = meetingDisplayName(path) + " (copy)"
         let folderStyle = (dir as NSString).lastPathComponent == base
         let parent = folderStyle ? (dir as NSString).deletingLastPathComponent : dir
         var newBase = base + "_copy"
@@ -2057,6 +2089,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             newBase = base + "_copy\(n)"
             n += 1
         }
+        // Titles number alongside the folders: (copy), (copy 2), …
+        let title = meetingDisplayName(path)
+            + (newBase.hasSuffix("_copy") ? " (copy)" : " (copy \(n - 1))")
         if folderStyle {
             let newDir = parent + "/" + newBase
             guard (try? fm.copyItem(atPath: dir, toPath: newDir)) != nil else {
@@ -2082,6 +2117,16 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             setMeetingMeta(dir + "/" + newBase + ".txt", "title", title)
         }
         flashStatus("duplicated → \(title) (in Meetings)")
+    }
+
+    @objc private func archiveFromMenu() {
+        guard !lastResolvedPath.isEmpty else { return }
+        if archiveMeeting(txtPath: lastResolvedPath, unarchive: false) {
+            onMeetingDeleted?()   // navigate back to Meetings, refresh
+        } else {
+            flashStatus("archive failed (live recording, or a same-named "
+                        + "meeting is already archived)")
+        }
     }
 
     /// Menu "Rename…": the editable title field IS the rename UI —
@@ -3627,6 +3672,11 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
                                     NSTableViewDelegate, NSMenuDelegate,
                                     NSTextFieldDelegate {
     private let table = MeetingsTable()
+    /// Directory this list shows — the transcripts root by default; the
+    /// Archive page points it at _archive/. archiveMode flips the
+    /// context-menu action between Archive and Unarchive.
+    var rootDir: () -> String = { transcriptsDir() }
+    var archiveMode = false
     /// Path of the meeting whose name cell is mid-edit; pauses the 2 s
     /// refresh (a reload would replace the cell under the field editor).
     private var inlineEditPath: String?
@@ -3684,6 +3734,7 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         table.allowsMultipleSelection = true
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Rename…", action: #selector(renameClicked), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Archive", action: #selector(archiveClicked), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Delete", action: #selector(deleteClicked), keyEquivalent: ""))
         for item in menu.items { item.target = self }
         menu.delegate = self
@@ -3708,6 +3759,8 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.items.first { $0.action == #selector(archiveClicked) }?
+            .title = archiveMode ? "Unarchive" : "Archive"
         // Rename is single-meeting-only.
         menu.items.first { $0.action == #selector(renameClicked) }?
             .isHidden = targetRows().count > 1
@@ -3729,6 +3782,13 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         _ = renameMeeting(txtPath: f.path, displayName: field.stringValue)
         refresh()
+    }
+
+    @objc private func archiveClicked() {
+        guard let f = clickedFile() else { return }
+        if archiveMeeting(txtPath: f.path, unarchive: archiveMode) {
+            refresh()
+        }
     }
 
     @objc private func deleteClicked() {
@@ -3824,7 +3884,7 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         // A reload would tear the field editor out of a mid-flight
         // inline rename; the 2 s tick resumes when editing ends.
         guard inlineEditPath == nil else { return }
-        let dir = transcriptsDir()
+        let dir = rootDir()
         let fm = FileManager.default
         let items = (try? fm.contentsOfDirectory(atPath: dir)) ?? []
         var out: [(String, String, Date)] = []
@@ -5485,6 +5545,12 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     let todayVC = TodayViewController()
     let meetingsVC = MeetingsViewController()
+    let archiveVC: MeetingsViewController = {
+        let vc = MeetingsViewController()
+        vc.rootDir = { transcriptsDir() + "/_archive" }
+        vc.archiveMode = true
+        return vc
+    }()
     let vocabVC = VocabViewController()
     let uploadVC = UploadViewController()
     let readerVC = TranscriptViewController()
@@ -5495,6 +5561,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     private let activityButton = NSButton()
     private let profilesButton = NSButton()
     private let vocabButton = NSButton()
+    private let archiveButton = NSButton()
 
     private var pollTimer: Timer?
 
@@ -5602,6 +5669,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
                            #selector(openProfiles))
         styleUtilityButton(vocabButton, "Vocab", "character.book.closed",
                            #selector(openVocab))
+        styleUtilityButton(archiveButton, "Archive", "archivebox",
+                           #selector(openArchive))
 
         let sideDivider = NSBox()
         sideDivider.boxType = .separator
@@ -5616,6 +5685,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         content.addSubview(activityButton)
         content.addSubview(profilesButton)
         content.addSubview(vocabButton)
+        content.addSubview(archiveButton)
         content.addSubview(sideDivider)
         content.addSubview(detailContainer)
         NSLayoutConstraint.activate([
@@ -5645,7 +5715,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             vocabButton.widthAnchor.constraint(equalToConstant: 130),
             vocabButton.heightAnchor.constraint(equalToConstant: 26),
             vocabButton.topAnchor.constraint(equalTo: profilesButton.bottomAnchor, constant: 2),
-            vocabButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
+            archiveButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            archiveButton.widthAnchor.constraint(equalToConstant: 130),
+            archiveButton.heightAnchor.constraint(equalToConstant: 26),
+            archiveButton.topAnchor.constraint(equalTo: vocabButton.bottomAnchor, constant: 2),
+            archiveButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -8),
             sideDivider.topAnchor.constraint(equalTo: stripDivider.bottomAnchor),
             sideDivider.leadingAnchor.constraint(equalTo: sideScroll.trailingAnchor),
             sideDivider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
@@ -5677,6 +5751,9 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         ])
 
         meetingsVC.onOpen = { [weak self] path in
+            self?.openTranscript(path)
+        }
+        archiveVC.onOpen = { [weak self] path in
             self?.openTranscript(path)
         }
         uploadVC.onOpenTranscript = { [weak self] path in
@@ -5730,6 +5807,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         case 4: setDetail(activityVC)
         case 5: setDetail(profilesVC)
         case 6: setDetail(vocabVC)
+        case 7: setDetail(archiveVC)
         default: setDetail(uploadVC)
         }
     }
@@ -5752,6 +5830,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     @objc private func openVocab() {
         sidebar.deselectAll(nil)
         showPage(6)
+    }
+
+    @objc private func openArchive() {
+        sidebar.deselectAll(nil)
+        showPage(7)
     }
 
     func openTranscript(_ path: String?) {
