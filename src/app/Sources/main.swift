@@ -2495,19 +2495,63 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                         + "voice training")
             return
         }
-        var spans: [(start: Double, dur: Double)] = []
+        // Quality-first selection (Sol review): a long transcript line is
+        // not necessarily a clean speaker segment. Split each line at
+        // inner silences, trim the uncertain edges, drop anything that
+        // overlaps ANOTHER line in time (cross-talk), then pick a
+        // time-diverse set instead of the eight longest — eight
+        // near-duplicates from one monologue teach less than eight clean
+        // pieces across different turns and acoustic moments.
+        let lineSet = Set(lines)
+        var otherSpans: [(Double, Double)] = []
+        for (i, e) in tl.enumerated() where !lineSet.contains(i) {
+            if let words = e["words"] as? [[String: Any]],
+               let s0 = words.first?["s"] as? Double,
+               let e1 = words.last?["e"] as? Double {
+                otherSpans.append((s0, e1))
+            }
+        }
+        var pieces: [(start: Double, dur: Double)] = []
         for line in lines where line < tl.count {
             guard let words = tl[line]["words"] as? [[String: Any]],
-                  let s0 = words.first?["s"] as? Double,
-                  let e1 = words.last?["e"] as? Double,
-                  e1 - s0 >= 3.5 else { continue }
-            spans.append((s0, min(e1 - s0, 12)))
+                  !words.isEmpty else { continue }
+            // Split at inner gaps > 2 s (silence / notification audio).
+            var runs: [[[String: Any]]] = [[]]
+            var prevEnd: Double? = nil
+            for w in words {
+                if let ws = w["s"] as? Double, let pe = prevEnd,
+                   ws - pe > 2.0 {
+                    runs.append([])
+                }
+                runs[runs.count - 1].append(w)
+                prevEnd = (w["e"] as? Double) ?? prevEnd
+            }
+            for run in runs {
+                guard let s0 = run.first?["s"] as? Double,
+                      let e1 = run.last?["e"] as? Double else { continue }
+                let start = s0 + 0.3            // trim uncertain edges
+                let end = e1 - 0.3
+                guard end - start >= 3.5 else { continue }
+                // Purity: skip pieces sharing time with any other line.
+                let dirty = otherSpans.contains {
+                    min(end, $0.1) - max(start, $0.0) > 0.25
+                }
+                if !dirty {
+                    pieces.append((start, min(end - start, 12)))
+                }
+            }
         }
-        spans.sort { $0.dur > $1.dur }
-        let picks = Array(spans.prefix(8))
+        pieces.sort { $0.start < $1.start }
+        var picks: [(start: Double, dur: Double)] = []
+        if pieces.count <= 8 {
+            picks = pieces
+        } else {
+            let step = Double(pieces.count) / 8.0
+            picks = (0..<8).map { pieces[Int(Double($0) * step)] }
+        }
         guard !picks.isEmpty else {
-            flashStatus("labels updated — segments under 3.5s carry too "
-                        + "little voice to train on")
+            flashStatus("labels updated — no clean segments ≥3.5s to "
+                        + "train on (short, overlapped, or edge-trimmed away)")
             return
         }
         // Enroll under the canonical profile casing; a brand-new name
@@ -2515,6 +2559,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let low = name.lowercased()
         let enrollName = enrolledProfiles().first { $0.lowercased() == low }
             ?? (name == name.uppercased() ? name.capitalized : name)
+        let meetingBase = ((base as NSString).lastPathComponent)
         DispatchQueue.global(qos: .utility).async {
             var enrolled = 0
             for p in picks {
@@ -2522,8 +2567,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                                               dur: p.dur) else { continue }
                 let enc = enrollName.addingPercentEncoding(
                     withAllowedCharacters: .urlQueryAllowed) ?? enrollName
+                let srcTag = "\(meetingBase):\(Int(p.start))-\(Int(p.start + p.dur))"
+                let srcEnc = srcTag.addingPercentEncoding(
+                    withAllowedCharacters: .urlQueryAllowed) ?? srcTag
                 guard let url = URL(string:
-                    "http://127.0.0.1:8179/enroll?name=\(enc)") else { continue }
+                    "http://127.0.0.1:8179/enroll?name=\(enc)&src=\(srcEnc)") else { continue }
                 var req = URLRequest(url: url)
                 req.httpMethod = "POST"
                 req.httpBody = wav

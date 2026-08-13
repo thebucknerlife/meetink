@@ -706,7 +706,8 @@ def _save(name: str) -> None:
 PROFILE_AUDIO_KEEP = int(os.environ.get("MEETINK_PROFILE_AUDIO_KEEP", "20"))
 
 
-def _save_profile_audio(name: str, samples: np.ndarray) -> None:
+def _save_profile_audio(name: str, samples: np.ndarray,
+                        src: "str | None" = None) -> None:
     if PROFILE_AUDIO_KEEP <= 0:
         return
     try:
@@ -721,6 +722,20 @@ def _save_profile_audio(name: str, samples: np.ndarray) -> None:
             w.setframerate(16000)
             w.writeframes(
                 (np.clip(clip, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+        # Manifest: which meeting/span each snippet came from, and under
+        # which embedding model it was accepted — a future model swap
+        # (or a poisoning investigation) can trace every retained sample.
+        try:
+            with open(d / "manifest.jsonl", "a", encoding="utf-8") as mf:
+                mf.write(json.dumps({
+                    "file": path.name,
+                    "ts": round(time.time(), 1),
+                    "src": src or "live-session",
+                    "model": MODEL_PATH.stem,
+                    "seconds": round(len(clip) / 16000.0, 1),
+                }) + "\n")
+        except OSError:
+            pass
         stale = sorted(d.glob("*.wav"))[:-PROFILE_AUDIO_KEEP]
         for f in stale:
             f.unlink()
@@ -1839,12 +1854,27 @@ class Handler(BaseHTTPRequestHandler):
                 _push_recent_embedding(emb)
                 result = identify(emb)
                 resp = dict(result)
+                # Non-mutating probe (?mutate=0) — the capture's mic-guest
+                # check: no clustering, no auto-train, no hysteresis
+                # state. Mic audio must never mint session clusters.
+                if parse_qs(url.query).get("mutate", ["1"])[0] == "0":
+                    self._json(200, resp)
+                    return
                 # Borderline hysteresis (see _borderline_pending). Skips
                 # session-confirmed names — the user vouched for them.
+                # CLOSE-PAIR decisions that only passed via the lowered
+                # close-pair margin defer the same way (Sol review: two
+                # hard-to-distinguish voices deserve MORE evidence, not
+                # less — a 0.03 one-window advantage becomes a name only
+                # when the same candidate wins twice in a row).
+                _conf = resp.get("confidence") or 0.0
+                _gap = _conf - (resp.get("runner_up_confidence") or 0.0)
+                _thin_close_pair = bool(resp.get("close_pair")) \
+                    and _gap < settings["margin"]
                 if resp["speaker"] is not None \
                         and resp["speaker"] not in session_confirmed \
-                        and (resp.get("confidence") or 0.0) \
-                            < settings["threshold"] + BORDERLINE_BAND:
+                        and (_conf < settings["threshold"] + BORDERLINE_BAND
+                             or _thin_close_pair):
                     now_ts = time.time()
                     same_recent = (
                         _borderline_pending["name"] == resp["speaker"]
@@ -1855,8 +1885,10 @@ class Handler(BaseHTTPRequestHandler):
                     if not same_recent:
                         print(
                             f"identify defer: {resp['speaker']}@"
-                            f"{resp.get('confidence')} borderline — needs a "
-                            f"second consecutive window",
+                            f"{resp.get('confidence')} "
+                            + ("close-pair thin margin"
+                               if _thin_close_pair else "borderline")
+                            + " — needs a second consecutive window",
                             file=sys.stderr,
                         )
                         resp["deferred"] = resp["speaker"]
@@ -2627,6 +2659,7 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/enroll":
                 qs = parse_qs(url.query)
                 name = (qs.get("name", [""])[0]).strip()
+                snippet_src = (qs.get("src", [""])[0]).strip() or None
                 if not name:
                     self._json(400, {"error": "missing ?name=..."})
                     return
@@ -2657,7 +2690,7 @@ class Handler(BaseHTTPRequestHandler):
                         "floor": PROFILE_OUTLIER_FLOOR,
                     })
                     return
-                _save_profile_audio(name, samples)
+                _save_profile_audio(name, samples, src=snippet_src)
                 print(
                     f"enrolled: {name} ({len(samples) / 16000:.1f}s, "
                     f"total={count}, best_sim={best_sim:.3f})",

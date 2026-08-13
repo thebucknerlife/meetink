@@ -752,14 +752,22 @@ final class DiarizeAudioBuffer: @unchecked Sendable {
 
 let diarizeBuffer = DiarizeAudioBuffer()
 
-func diarizeSpeaker(wavData: Data, chunkIndex: Int) -> String? {
+// Mic-guest detection state: an in-person second voice on the user's
+// microphone takes over the ME label only after two CONSECUTIVE chunks
+// strongly match the same different enrolled profile.
+var micGuestName = ""
+var micGuestStreak = 0
+
+func diarizeSpeaker(wavData: Data, chunkIndex: Int,
+                    mutate: Bool = true) -> String? {
     // If recently failed, only retry periodically
     if diarizeFailCount >= diarizeMaxFails {
         if chunkIndex % diarizeRetryInterval != 0 { return nil }
         fputs("  diarize-server: retrying...\n", stderr)
     }
 
-    let url = URL(string: "http://127.0.0.1:\(diarizePort)/identify")!
+    let url = URL(string: "http://127.0.0.1:\(diarizePort)/identify"
+                  + (mutate ? "" : "?mutate=0"))!
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.timeoutInterval = 5
@@ -792,6 +800,13 @@ func diarizeSpeaker(wavData: Data, chunkIndex: Int) -> String? {
               let speaker = json["speaker"] as? String,
               speaker != "unknown" else { return }
 
+        // Probe mode (mic-guest check): only a STRONG profile match
+        // counts — well above the normal acceptance threshold, because
+        // relabeling the user's own mic is the worst false positive.
+        if !mutate {
+            let conf = (json["confidence"] as? Double) ?? 0
+            guard conf >= 0.62 else { return }
+        }
         speakerName = speaker
     }
     task.resume()
@@ -815,6 +830,7 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
     // whisper-server, so the transcript line we write below already has
     // the right label. diarizeBuffer's `lastSpeaker` is now just a fallback
     // for the first chunks before any /identify completes.
+    var speaker = speaker
     if speaker == "THEM" && !wavData.isEmpty {
         if let identified = diarizeSpeaker(wavData: wavData, chunkIndex: chunkIndex) {
             let prev = diarizeBuffer.getCurrentSpeaker()
@@ -825,6 +841,34 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
             if prev != next {
                 fputs("  speaker changed: \(prev) -> \(next)\n", stderr)
             }
+        }
+    } else if speaker == meName && meName != "ME" && !wavData.isEmpty
+        && ProcessInfo.processInfo.environment["MEETINK_MIC_GUEST"] != "off" {
+        // SECOND PERSON ON THE MIC (Sol review): the mic is usually the
+        // user, but not immutably — an in-person guest at the desk was
+        // transcribed as ME. A mic chunk that STRONGLY matches a
+        // different enrolled profile (never an anonymous cluster) on
+        // two consecutive chunks takes that name; anything weaker stays
+        // ME and the offline pass owns it. The probe is non-mutating on
+        // the server (no clustering, no auto-train), so mic audio can't
+        // mint phantom session speakers. Requires /me to be set — with
+        // no known self-profile name, "recognized someone" and
+        // "recognized the user" are indistinguishable.
+        let probe = diarizeSpeaker(wavData: wavData, chunkIndex: chunkIndex,
+                                   mutate: false)
+        if let g = probe, g != meName, g != "THEM",
+           !g.hasPrefix("Speaker ") {
+            if micGuestName == g { micGuestStreak += 1 }
+            else { micGuestName = g; micGuestStreak = 1 }
+        } else {
+            micGuestName = ""
+            micGuestStreak = 0
+        }
+        if micGuestStreak >= 2 {
+            if speaker != micGuestName {
+                fputs("  mic guest detected: \(meName) -> \(micGuestName)\n", stderr)
+            }
+            speaker = micGuestName
         }
     }
 
