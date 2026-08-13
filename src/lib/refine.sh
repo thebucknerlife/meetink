@@ -701,6 +701,35 @@ cmd_reprocess() {
     local -a args=(--out "$tmpdir/out.txt" --me "${me:-ME}" --header-from "$actual" --prior "$actual")
     [[ -n "$started" ]] && args+=(--started "$started")
 
+    # Stranded session spools: a stop pipeline that died mid-flight (app
+    # or watch restart SIGPIPEs its children — the Eddie incident) leaves
+    # raw session PCM next to the transcript with no kept wavs. Materialize
+    # the wavs the pipeline would have produced, then proceed exactly like
+    # any kept-audio meeting. 48 kHz spool preferred (full bandwidth).
+    local sdir="${actual:h}"
+    if [[ ! -s "$base.mic.wav" && ! -s "$base.sys.wav" && ! -s "$base.m4a" ]]; then
+        local st
+        for st in mic sys; do
+            local r48="$sdir/session-$st.48k.raw" r16="$sdir/session-$st.raw"
+            if [[ -s "$r48" ]]; then
+                ffmpeg -v error -y -f s16le -ar 48000 -ac 1 -i "$r48" \
+                    "$base.$st.wav" 2>>/tmp/meetink-refine.log || true
+            elif [[ -s "$r16" ]]; then
+                ffmpeg -v error -y -f s16le -ar 16000 -ac 1 -i "$r16" \
+                    "$base.$st.wav" 2>>/tmp/meetink-refine.log || true
+            fi
+        done
+        if [[ -s "$base.mic.wav" || -s "$base.sys.wav" ]]; then
+            print -P "${C[green]}✓${C[reset]} Recovered stranded session audio ${C[dim]}(a previous post-process died mid-flight)${C[reset]}"
+            [[ -s "$sdir/route.jsonl" && ! -s "$base.route.jsonl" ]] && \
+                cp "$sdir/route.jsonl" "$base.route.jsonl" 2>/dev/null
+            # Each raw is deleted only once its lossless wav exists.
+            [[ -s "$base.mic.wav" ]] && rm -f "$sdir/session-mic.raw" "$sdir/session-mic.48k.raw"
+            [[ -s "$base.sys.wav" ]] && rm -f "$sdir/session-sys.raw" "$sdir/session-sys.48k.raw"
+            rm -f "$sdir/route.jsonl"
+        fi
+    fi
+
     if [[ -s "$base.mic.wav" || -s "$base.sys.wav" ]]; then
         [[ -s "$base.mic.wav" ]] && { ffmpeg -v error -y -i "$base.mic.wav" -ar 16000 -ac 1 -f s16le "$tmpdir/mic.raw" && args+=(--mic "$tmpdir/mic.raw"); }
         [[ -s "$base.sys.wav" ]] && { ffmpeg -v error -y -i "$base.sys.wav" -ar 16000 -ac 1 -f s16le "$tmpdir/sys.raw" && args+=(--sys "$tmpdir/sys.raw"); }
@@ -774,6 +803,17 @@ cmd_reprocess() {
             print -- "enhancing audio (step 3/3)" > /tmp/meetink-postproc.state
             _mix_enhanced_m4a "$tmpdir/mic.raw" "$tmpdir/sys.raw" "${base}.m4a" && \
                 print -P "${C[green]}✓${C[reset]} Audio rebuilt: ${C[dim]}${base:t}.m4a (enhanced)${C[reset]}"
+        fi
+        # Parity with the stop pipeline's tail: title (meta wins, no LLM
+        # guess when one exists) and a summary regenerated from the NEW
+        # transcript. A recovered meeting (stranded spools) gets its
+        # summary here — the original pipeline died before this step.
+        print -- "generating title and summary (step 3/3)" > /tmp/meetink-postproc.state
+        if typeset -f infer_event_link >/dev/null 2>&1; then
+            infer_event_link "$actual"
+        fi
+        if typeset -f title_session_file >/dev/null 2>&1; then
+            title_session_file "$actual"
         fi
     else
         rm -rf "$tmpdir"

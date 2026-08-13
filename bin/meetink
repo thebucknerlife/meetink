@@ -1065,7 +1065,15 @@ cmd_start() {
     # paying the model load + context evaluation. No-op on the claude
     # backend or when the local model isn't installed.
     ( "${0:A}" ask --plain --warm >/dev/null 2>&1 & )
-    mk_activity "recording started — ${session_stamp}"
+    # Trigger annotation: the per-meeting activity view answers "why did
+    # this recording start?" from this line alone.
+    local start_trigger="manual"
+    if [[ "$MEETINK_EVENT_INSTANT" == "true" ]]; then
+        start_trigger="instant (meeting app detected)"
+    elif [[ -n "$MEETINK_EVENT_TITLE" ]]; then
+        start_trigger="event: $MEETINK_EVENT_TITLE"
+    fi
+    mk_activity "recording started ($start_trigger) — ${session_stamp}"
 
     print -P ""
     print -P "${C[green]}${C[bold]}● Recording started${C[reset]}  (PID $(cat "$PID_FILE"))"
@@ -1430,6 +1438,11 @@ case "${1:-}" in
     discard)           cmd_discard ;;
     postproc-kill)     postproc_kill; print -P "${C[green]}✓${C[reset]} Post-processing stopped." ;;
     reprocess)         shift 2>/dev/null; cmd_reprocess "$@" ;;
+    _finish)           # Internal: (re)run just the stop pipeline's tail —
+                       # event link, title, summary — on one meeting.
+                       shift 2>/dev/null
+                       typeset -f infer_event_link >/dev/null 2>&1 && infer_event_link "$1"
+                       title_session_file "$1" ;;
     relabel)           shift 2>/dev/null; cmd_relabel "$@" ;;
     watch-daemon)      # Headless watcher (spawned by Meetink.app; see watch.daemon_main)
                        MEETINK_HOME="$MK_HOME" PYTHONPATH="$MK_ROOT/src" \
