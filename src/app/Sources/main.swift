@@ -2552,20 +2552,34 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             DispatchQueue.main.async { self?.refreshIfChanged(force: true) }
             if proc.terminationStatus == 0,
                out.contains("renaming transcript lines only") {
-                // The transcript was rewritten, but the session had no
-                // voice data for this label (server restarted, or the
-                // meeting is old) — the user must know no profile was
-                // created or trained (field case: "assigned Allen, no
-                // profile exists on the Profiles page").
-                DispatchQueue.main.async {
+                // The session had no live voice data for this label
+                // (server restarted, or the meeting is old). When the
+                // meeting kept its audio, train from THAT instead —
+                // the user just asserted whose voice those lines are
+                // (field gap: the sidebar assign never harvested, only
+                // segment reassign did). No stems → explain the no-op.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let base = (self.lastResolvedPath as NSString)
+                        .deletingPathExtension
+                    if FileManager.default.fileExists(atPath: base + ".sys.wav") {
+                        let up = name.uppercased()
+                        let lines = self.snapshot.lines.enumerated()
+                            .filter { $0.element.speaker.uppercased() == up }
+                            .map(\.offset)
+                        if !lines.isEmpty {
+                            self.harvestVoice(lines: lines, to: up)
+                            return
+                        }
+                    }
                     let alert = NSAlert()
                     alert.messageText = "Renamed in transcript only"
                     alert.informativeText = "No voice data for this "
-                        + "speaker was still available, so no voice "
-                        + "profile was created or trained. The name "
-                        + "shows in this transcript; to give them a "
-                        + "profile, use Profiles → Add when they're "
-                        + "next in a meeting."
+                        + "speaker was available (no live session and "
+                        + "no kept audio), so no voice profile was "
+                        + "created or trained. The name shows in this "
+                        + "transcript; to give them a profile, assign "
+                        + "them in a meeting that kept its audio."
                     alert.runModal()
                 }
             }
