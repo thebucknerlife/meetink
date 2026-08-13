@@ -810,9 +810,20 @@ cmd_relabel() {
     print -- "$actual" > /tmp/meetink-postproc.path
     print -- $$ > /tmp/meetink-postproc.pid
     local rc=0
+    # Stream refine.py's stdout through the state file — the embedding
+    # loop emits "refine: progress diarize N" every ~4%, which is the
+    # bulk of a relabel's wall time (field ask: relabel needs a % too).
     "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" \
         --relabel "$actual" --me "${me:-ME}" --out "$tmp" \
-        2>>/tmp/meetink-refine.log || rc=$?
+        2>>/tmp/meetink-refine.log | while IFS= read -r line; do
+            case "$line" in
+                "refine: progress diarize "*)
+                    print -- "relabeling speakers ${line##* }%" > "$state" 2>/dev/null ;;
+                "refine: status "*)
+                    print -- "relabeling — ${line#refine: status }" > "$state" 2>/dev/null ;;
+            esac
+        done
+    rc=${pipestatus[1]}
     _refine_unlock
     if (( rc == 0 )) && grep -qE '^\[' "$tmp"; then
         cat "$tmp" > "$actual"
@@ -821,7 +832,7 @@ cmd_relabel() {
     else
         print -P "${C[red]}error:${C[reset]} relabel failed ${C[dim]}(see /tmp/meetink-refine.log — full reprocess is the fallback)${C[reset]}"
     fi
-    rm -f "$tmp" /tmp/meetink-postproc.state /tmp/meetink-postproc.path
+    rm -f "$tmp" /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
     (( rc == 0 ))
 }
 
