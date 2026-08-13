@@ -1142,7 +1142,19 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private let menuButton = NSButton(title: "", target: nil, action: nil)
     /// Third header row: post-processing narration ("mixing audio —
     /// rendering 45% (step 3/3)"), visible only while a run is live.
+    /// Also carries short-lived notices (voice-training results) via
+    /// flashStatus.
     private let processingField = NSTextField(labelWithString: "")
+    private var transientStatusUntil = Date.distantPast
+
+    /// Show a short-lived notice on the processing row (goes away after
+    /// a few seconds; live postproc narration always wins).
+    private func flashStatus(_ text: String) {
+        transientStatusUntil = Date().addingTimeInterval(5)
+        processingField.stringValue = text
+        processingField.textColor = .secondaryLabelColor
+        processingField.isHidden = false
+    }
     /// Reprocess lives in the … menu; "running" is derived from the
     /// postproc marker files (the run is a detached process now).
     private var reprocessRunning: Bool {
@@ -2329,7 +2341,15 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard FileManager.default.fileExists(atPath: stem),
               let data = FileManager.default.contents(atPath: base + ".timing.json"),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tl = obj["lines"] as? [[String: Any]] else { return }
+              let tl = obj["lines"] as? [[String: Any]] else {
+            // No kept stems / no timing sidecar (older meeting, or audio
+            // keeping off) — labels changed, but there is nothing to
+            // train from. Say so: silent skips read as broken training
+            // (field report: "I did a bunch, samples never updated").
+            flashStatus("labels updated — no kept audio here, so no "
+                        + "voice training")
+            return
+        }
         var spans: [(start: Double, dur: Double)] = []
         for line in lines where line < tl.count {
             guard let words = tl[line]["words"] as? [[String: Any]],
@@ -2340,7 +2360,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
         spans.sort { $0.dur > $1.dur }
         let picks = Array(spans.prefix(8))
-        guard !picks.isEmpty else { return }
+        guard !picks.isEmpty else {
+            flashStatus("labels updated — segments under 3.5s carry too "
+                        + "little voice to train on")
+            return
+        }
         // Enroll under the canonical profile casing; a brand-new name
         // gets Title Case rather than the transcript's ALL-CAPS label.
         let low = name.lowercased()
@@ -2370,6 +2394,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             }
             NSLog("meetink: voice harvest → %@ (%d/%d segments enrolled)",
                   enrollName, enrolled, picks.count)
+            DispatchQueue.main.async { [weak self] in
+                self?.flashStatus(enrolled > 0
+                    ? "voice training: \(enrolled) sample(s) → \(enrollName)"
+                    : "voice training: 0 of \(picks.count) segments accepted "
+                      + "(didn't match \(enrollName)'s voice or server down)")
+            }
         }
     }
 
@@ -3432,9 +3462,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
            || (target as NSString).deletingLastPathComponent
               == (lastResolvedPath as NSString).deletingLastPathComponent {
             processingField.stringValue = "post-processing… \(pp)"
+            processingField.textColor = .systemOrange
             processingField.isHidden = false
             statusDot.textColor = .systemOrange
-        } else {
+        } else if Date() >= transientStatusUntil {
             processingField.isHidden = true
         }
         if fixedPath == nil && !recording && snapshot.lines.isEmpty {
