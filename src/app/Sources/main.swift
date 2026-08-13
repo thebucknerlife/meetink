@@ -589,11 +589,18 @@ struct TranscriptSnapshot {
     var lines: [TranscriptLine] = []
     var startedAt: Date?
     var endedAt: Date?
+    /// Line indices that must START a new block even when the previous
+    /// line has the same speaker — the user's "Split Segment Here" is a
+    /// hard break, and the normal same-speaker folding would silently
+    /// glue it back together (field report: "split does nothing").
+    /// Persisted as "hard": true on the timing.json entry.
+    var hardBreaks: Set<Int> = []
 
     var blocks: [SpeakerBlock] {
         var out: [SpeakerBlock] = []
         for (i, l) in lines.enumerated() {
-            if var last = out.last, last.speaker == l.speaker {
+            if var last = out.last, last.speaker == l.speaker,
+               !hardBreaks.contains(i) {
                 last.text += " " + l.text
                 last.parts.append((line: i, text: l.text))
                 out[out.count - 1] = last
@@ -2169,6 +2176,22 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         return edit
     }
 
+    /// Hard-break line indices from the timing sidecar ("hard": true on
+    /// an entry = this line starts a new block even under the same
+    /// speaker). Empty during live recording (no sidecar yet).
+    private func loadHardBreaks(_ txtPath: String) -> Set<Int> {
+        let tPath = (txtPath as NSString).deletingPathExtension + ".timing.json"
+        guard let data = FileManager.default.contents(atPath: tPath),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tl = obj["lines"] as? [[String: Any]] else { return [] }
+        var out: Set<Int> = []
+        for (i, e) in tl.enumerated()
+        where (e["hard"] as? Bool) == true || (e["hard"] as? Int) == 1 {
+            out.insert(i)
+        }
+        return out
+    }
+
     private func lineIndex(forChar charIndex: Int) -> Int? {
         for (line, range) in lineRanges
         where charIndex >= range.location && charIndex < range.location + range.length + 1 {
@@ -2575,6 +2598,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             if let text = try? String(contentsOfFile: resolved, encoding: .utf8) {
                 rawText = text
                 snapshot = parseTranscript(text)
+                snapshot.hardBreaks = loadHardBreaks(resolved)
                 render(empty: false)
             }
         } else {
@@ -3118,7 +3142,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let t1 = line < lineOffsets.count ? lineOffsets[line] : 0
         spliceTiming(line: line, with: [
             ["t": t1, "label": seg.speaker, "words": words1],
-            ["t": t2, "label": seg.speaker, "words": words2],
+            ["t": t2, "label": seg.speaker, "words": words2, "hard": true],
         ])
         writeTranscriptLines(all)
         return true
