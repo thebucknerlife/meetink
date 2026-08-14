@@ -1388,11 +1388,19 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// hide/show ordering across opens). Showing must explicitly
     /// re-attach; hiding goes through the stack as before.
     private var titleRowStack: NSStackView? = nil
+    /// Detaching removes every constraint that involves the field —
+    /// reattaching restored the VIEW but not its width, so it came back
+    /// 4 pt wide (the second half of the missing-title bug, caught by
+    /// the debug dump). Stored so reattach can re-activate it.
+    private var titleWidthConstraint: NSLayoutConstraint? = nil
 
     private func setTitleVisible(_ visible: Bool) {
         if visible {
             if titleField.superview == nil, let row = titleRowStack {
                 row.insertArrangedSubview(titleField, at: 0)
+            }
+            if titleWidthConstraint?.isActive != true {
+                titleWidthConstraint?.isActive = true
             }
             titleField.isHidden = false
         } else if titleField.superview != nil {
@@ -1423,13 +1431,17 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         // button right-aligned on the same line (the spacer soaks up
         // the slack, and keeps the button right even when the title
         // is hidden on the live view).
-        let titleSpacer = NSView()
-        titleSpacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1),
-                                              for: .horizontal)
-        let titleRow = NSStackView(views: [titleField, titleSpacer])
+        // Single-view row: the old trailing spacer predates the event
+        // button moving to the strip and only competed with the field
+        // for width. The field fills the row by explicit constraint —
+        // intrinsic-size games are what shrank it to 4 pt.
+        let titleRow = NSStackView(views: [titleField])
         titleRow.orientation = .horizontal
         titleRow.spacing = 8
         titleRowStack = titleRow
+        titleWidthConstraint = titleField.widthAnchor.constraint(
+            equalTo: titleRow.widthAnchor)
+        titleWidthConstraint?.isActive = true
         // Long titles truncate with "…" instead of shoving the buttons:
         // the title compresses first (the event button's width varies
         // with the linked meeting's name and keeps its own ≤220 cap).
@@ -1802,14 +1814,47 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     }
 
     func show(path: String?) {
-        // A different meeting is a different conversation.
+        // A different meeting is a different conversation — but each
+        // meeting's conversation PERSISTS (<base>.chat.json): leave,
+        // come back later, and the chat is where you left it.
         if path != fixedPath {
-            chatHistory.removeAll()
+            // Live view (nil) persists against the live session's base.
+            let effective = path ?? (try? FileManager.default
+                .destinationOfSymbolicLink(atPath: liveSymlinkPath()))
+                .map { $0.hasPrefix("/") ? $0
+                    : (liveSymlinkPath() as NSString)
+                        .deletingLastPathComponent + "/" + $0 }
+            chatHistory = Self.loadChatHistory(effective)
             chatPending = nil
             renderChatLog()
         }
         fixedPath = path
         refreshIfChanged(force: true)
+    }
+
+    private static func chatPath(_ txtPath: String?) -> String? {
+        guard let txtPath, !txtPath.isEmpty else { return nil }
+        return (txtPath as NSString).deletingPathExtension + ".chat.json"
+    }
+
+    private static func loadChatHistory(_ txtPath: String?) -> [(q: String, a: String)] {
+        guard let p = chatPath(txtPath),
+              let data = FileManager.default.contents(atPath: p),
+              let arr = try? JSONSerialization.jsonObject(with: data)
+                  as? [[String: String]] else { return [] }
+        return arr.compactMap {
+            guard let q = $0["q"], let a = $0["a"] else { return nil }
+            return (q: q, a: a)
+        }
+    }
+
+    private func saveChatHistory() {
+        guard let p = Self.chatPath(fixedPath ?? (lastResolvedPath.isEmpty
+            ? nil : lastResolvedPath)) else { return }
+        let arr = chatHistory.map { ["q": $0.q, "a": $0.a] }
+        if let data = try? JSONSerialization.data(withJSONObject: arr) {
+            try? data.write(to: URL(fileURLWithPath: p), options: .atomic)
+        }
     }
 
     /// Re-render the transcript at the current uiZoom (⌘+/⌘-).
@@ -1949,6 +1994,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     self.chatSessionPath = path
                 }
                 self.chatHistory.append((q: q, a: answer))
+                self.saveChatHistory()
                 self.chatPending = nil
                 self.chatStreamThinking = ""
                 self.chatStreamAnswer = ""
@@ -6593,6 +6639,16 @@ final class TodayViewController: NSViewController {
                    (e["title"] as? String) == (anchorEvent["title"] as? String) {
                     scrollAnchor = row
                 }
+                // Details unfold INLINE below the clicked row (field
+                // preference over the old popover).
+                let key = ((e["start"] as? String) ?? "")
+                    + ((e["title"] as? String) ?? "")
+                if key == expandedEventKey {
+                    let details = makeEventDetailsView(e)
+                    stack.addArrangedSubview(details)
+                    details.widthAnchor.constraint(equalTo: stack.widthAnchor,
+                                                   constant: -48).isActive = true
+                }
             }
             stack.setCustomSpacing(14, after: stack.arrangedSubviews.last!)
         }
@@ -6626,9 +6682,8 @@ final class TodayViewController: NSViewController {
         let isPast = (end ?? .distantFuture) < now
 
         let box = TodayRowView()
-        box.onClick = { [weak self, weak box] in
-            guard let self, let box else { return }
-            self.showEventDetails(e, anchor: box)
+        box.onClick = { [weak self] in
+            self?.toggleEventDetails(e)
         }
         box.toolTip = "Click for details"
         box.wantsLayer = true
@@ -6734,9 +6789,10 @@ final class TodayViewController: NSViewController {
         rowActions[id]?()
     }
 
-    // MARK: Event details popover
+    // MARK: Event details (inline expansion under the row)
 
-    private var eventPopover: NSPopover?
+    /// startISO+title of the row whose details are unfolded, nil = none.
+    private var expandedEventKey: String? = nil
     private var eventPopoverLink: URL?
 
     /// EventKit notes on Google-backed events often arrive as HTML —
@@ -6760,9 +6816,15 @@ final class TodayViewController: NSViewController {
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func showEventDetails(_ e: [String: Any], anchor: NSView) {
-        eventPopover?.close()
+    /// Toggle the details fold under a row (click the row again, or
+    /// another row, to collapse).
+    private func toggleEventDetails(_ e: [String: Any]) {
+        let key = ((e["start"] as? String) ?? "") + ((e["title"] as? String) ?? "")
+        expandedEventKey = expandedEventKey == key ? nil : key
+        rebuildRows()
+    }
 
+    private func makeEventDetailsView(_ e: [String: Any]) -> NSView {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -6781,7 +6843,7 @@ final class TodayViewController: NSViewController {
                 f.maximumNumberOfLines = maxLines
                 f.lineBreakMode = .byTruncatingTail
             }
-            f.preferredMaxLayoutWidth = 352
+            f.preferredMaxLayoutWidth = 620
             return f
         }
 
@@ -6850,23 +6912,19 @@ final class TodayViewController: NSViewController {
                                            maxLines: 18))
         }
 
-        let vc = NSViewController()
-        let container = NSView()
-        container.addSubview(stack)
+        let box = NSView()
+        box.wantsLayer = true
+        box.layer?.cornerRadius = 6
+        box.layer?.backgroundColor =
+            NSColor.quaternaryLabelColor.withAlphaComponent(0.05).cgColor
+        box.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: container.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            container.widthAnchor.constraint(equalToConstant: 380),
+            stack.topAnchor.constraint(equalTo: box.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: box.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: box.bottomAnchor),
         ])
-        vc.view = container
-
-        let pop = NSPopover()
-        pop.behavior = .transient
-        pop.contentViewController = vc
-        eventPopover = pop
-        pop.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .maxY)
+        return box
     }
 
     @objc private func openEventLink() {
@@ -7767,13 +7825,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    private func runLauncher(_ subcommand: String) {
+    private func runLauncher(_ subcommand: String, source: String = "app-ui") {
         guard let launcher = launcherPath() else { return }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: launcher)
         proc.arguments = [subcommand]
         var env = ProcessInfo.processInfo.environment
         env["MEETINK_NO_TAIL"] = "1"
+        // Provenance for the activity log — a recording once started
+        // with no one clicking anything; the next phantom should name
+        // its trigger.
+        env["MEETINK_START_SOURCE"] = source
         proc.environment = env
         let logPath = "/tmp/meetink-app-launcher.log"
         if !FileManager.default.fileExists(atPath: logPath) {
@@ -7867,6 +7929,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         mainWC?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        // Never leave a BUTTON focused after a programmatic show: the
+        // relaunch steals focus, and a spacebar meant for another app
+        // fires whatever button holds the key loop (the prime suspect
+        // for the phantom recording start).
+        if mainWC?.window?.firstResponder is NSButton {
+            mainWC?.window?.makeFirstResponder(nil)
+        }
         if let page {
             mainWC?.showPage(page)
         }

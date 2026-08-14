@@ -1067,7 +1067,7 @@ cmd_start() {
     ( "${0:A}" ask --plain --warm >/dev/null 2>&1 & )
     # Trigger annotation: the per-meeting activity view answers "why did
     # this recording start?" from this line alone.
-    local start_trigger="manual"
+    local start_trigger="manual${MEETINK_START_SOURCE:+ via $MEETINK_START_SOURCE}"
     if [[ "$MEETINK_EVENT_INSTANT" == "true" ]]; then
         start_trigger="instant (meeting app detected)"
     elif [[ -n "$MEETINK_EVENT_TITLE" ]]; then
