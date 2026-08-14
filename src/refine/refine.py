@@ -211,12 +211,25 @@ def _http_json(url: str, data: bytes | None = None, timeout: float = 15) -> dict
 
 
 def _wav_bytes(raw: bytes, a: int, b: int) -> bytes:
+    # Clamp defensively: a hand-edited timing entry (segment edits,
+    # splits) can carry an inverted or out-of-range span — struct.pack
+    # then dies on a negative RIFF size (field crash: relabel after
+    # block edits). An empty WAV embeds to None and the window is
+    # dropped, which is the right outcome for a nonsense span.
+    a = max(0, min(a, len(raw)))
+    b = max(a, min(b, len(raw)))
     n = b - a
     wav = bytearray()
     wav += b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt "
     wav += struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16)
     wav += b"data" + struct.pack("<I", n) + raw[a:b]
     return bytes(wav)
+
+
+def _wav_bytes2(pcm: bytes) -> bytes:
+    """Wrap a raw 16 kHz mono s16le buffer as WAV (whole-buffer variant
+    of _wav_bytes, for callers that assembled the PCM themselves)."""
+    return _wav_bytes(pcm, 0, len(pcm))
 
 
 def parse_label_priors(txt_path: str) -> list[tuple[float, float, str]]:
@@ -647,6 +660,18 @@ def offline_diarize_multi(streams: list[dict], port: int,
                     f"mic={mic_seconds(g):.1f}s sim_to_me={float(cents[gi] @ me_cent):.3f} "
                     f"name={names[gi]}")
 
+    # Closed-set rescue knobs, shared by the orphan-window dissolve and
+    # the window-less short-segment pass below. The 0.35 open-set floor
+    # asks "confidently Judd in isolation?"; by now the session roster is
+    # a CLOSED set and the right question is "clearly more like one of
+    # them than the others". Cross-talk resembles several voices at once,
+    # fails the margin, stays THEM. Short segments can't harvest into
+    # profiles (3.5 s minimum), so a miss costs one short label.
+    rescue_max_s = float(os.environ.get("MEETINK_THEM_RESCUE_MAX_S", "3.0"))
+    rescue_floor = float(os.environ.get("MEETINK_THEM_RESCUE_FLOOR", "0.22"))
+    rescue_margin = float(os.environ.get("MEETINK_THEM_RESCUE_MARGIN", "0.06"))
+    rescue_on = os.environ.get("MEETINK_THEM_RESCUE", "on") != "off"
+
     # Tiny unnamed clusters are almost never a real extra person — they're
     # one short interjection whose embedding didn't match anyone. Fold each
     # into the acoustically nearest substantial cluster when plausibly the
@@ -719,6 +744,7 @@ def offline_diarize_multi(streams: list[dict], port: int,
                 label_cents.setdefault(lab2, []).append(cents[gi2])
         dissolved = 0
         kept_unknown = 0
+        rescued = 0
         for gi in temporal_fold:
             for k in groups[gi]:
                 mid = 0.5 * (windows[k][2] + windows[k][3])
@@ -729,6 +755,19 @@ def offline_diarize_multi(streams: list[dict], port: int,
                             for c in label_cents.get(lab, [])]
                     if not sims or max(sims) < 0.35:
                         lab = None
+                if lab is None and rescue_on and label_cents \
+                        and (windows[k][3] - windows[k][2]) <= rescue_max_s:
+                    scored = sorted(
+                        ((max(float(E[k] @ c) for c in cl), l2)
+                         for l2, cl in label_cents.items()),
+                        reverse=True)
+                    top_sim, top_lab = scored[0]
+                    runner = scored[1][0] if len(scored) > 1 else -1.0
+                    if top_sim >= rescue_floor \
+                            and top_sim - runner >= rescue_margin:
+                        win_label[k] = top_lab
+                        rescued += 1
+                        continue
                 if lab is None:
                     win_label[k] = "THEM"
                     kept_unknown += 1
@@ -736,7 +775,8 @@ def offline_diarize_multi(streams: list[dict], port: int,
                     win_label[k] = lab
                     dissolved += 1
         log(f"dissolved {dissolved} orphan window(s) into surrounding "
-            f"voices; {kept_unknown} kept as THEM (no acoustic support)")
+            f"voices; {rescued} short window(s) rescued closed-set; "
+            f"{kept_unknown} kept as THEM (no acoustic support)")
 
     # Exemplar anchoring: the user's per-segment corrections are FEW-SHOT
     # VOICEPRINTS, not just cluster names. When clustering FUSED several
@@ -781,6 +821,51 @@ def offline_diarize_multi(streams: list[dict], port: int,
         if k in win_label:
             by_seg.setdefault((si, i), []).append((t0, t1, win_label[k]))
 
+    # THE junk-drawer source: a sub-second "yeah"/"cool" segment never
+    # produces a diarization window (the 1.0 s floor in step 1) and used
+    # to fall straight to THEM. Embed the short segment itself and match
+    # closed-set against the session's identified voices.
+    rescue_cents: dict[str, list] = {}
+    for gi2, lab2 in enumerate(labels):
+        if lab2:
+            rescue_cents.setdefault(lab2, []).append(cents[gi2])
+    seg_rescued = 0
+
+    def rescue_short(raw: bytes, t0: float, t1: float) -> "str | None":
+        if not rescue_on or not rescue_cents \
+                or (t1 - t0) > rescue_max_s or (t1 - t0) < 0.25:
+            return None
+        a = int(t0 * SAMPLE_RATE) * 2
+        b = int(t1 * SAMPLE_RATE) * 2
+        snip = raw[max(0, a):min(len(raw), b)]
+        # The server refuses < 1 s ("too_short" — unreliable embedding).
+        # TILE the snippet up to ~1.2 s: repeating a short utterance
+        # keeps the speaker's spectral content, unlike silence padding —
+        # and unlike widening the window, which would grab the
+        # SURROUNDING speaker's audio (interjections sit inside someone
+        # else's speech by definition).
+        min_bytes = int(1.2 * SAMPLE_RATE) * 2
+        if snip and len(snip) < min_bytes:
+            snip = (snip * (min_bytes // len(snip) + 1))[:min_bytes]
+        resp = _http_json(f"http://127.0.0.1:{port}/embed", data=_wav_bytes2(snip))
+        vec = (resp or {}).get("embedding")
+        if not vec:
+            if os.environ.get("MEETINK_REFINE_DEBUG"):
+                log(f"debug rescue [{t0:.1f}-{t1:.1f}] embed=None ({resp})")
+            return None
+        e = np.asarray(vec, dtype=np.float32)
+        e = e / (np.linalg.norm(e) + 1e-9)
+        scored = sorted(((max(float(e @ c) for c in cl), l)
+                         for l, cl in rescue_cents.items()), reverse=True)
+        top_sim, top_lab = scored[0]
+        runner = scored[1][0] if len(scored) > 1 else -1.0
+        if os.environ.get("MEETINK_REFINE_DEBUG"):
+            log(f"debug rescue [{t0:.1f}-{t1:.1f}] top={top_lab}:{top_sim:.3f} "
+                f"runner={runner:.3f}")
+        if top_sim >= rescue_floor and top_sim - runner >= rescue_margin:
+            return top_lab
+        return None
+
     for si, stream in enumerate(streams):
         origin = stream["origin"]
         default_label = names[me_gi] if (origin == "mic" and me_gi is not None) \
@@ -788,7 +873,13 @@ def offline_diarize_multi(streams: list[dict], port: int,
         for i, seg in enumerate(stream["segs"]):
             wins = sorted(by_seg.get((si, i), []))
             if not wins:
-                out.append({**seg, "label": default_label, "origin": origin})
+                lab = default_label
+                if lab == "THEM":
+                    r = rescue_short(stream["raw"], seg["start"], seg["end"])
+                    if r is not None:
+                        lab = r
+                        seg_rescued += 1
+                out.append({**seg, "label": lab, "origin": origin})
                 continue
             runs: list = []
             for t0, t1, lab in wins:
@@ -819,7 +910,8 @@ def offline_diarize_multi(streams: list[dict], port: int,
                         "origin": origin})
 
     log(f"offline diarize: {len(groups)} voices "
-        f"({', '.join(sorted(set(labels)))}) across {len(out)} lines")
+        f"({', '.join(sorted(set(labels)))}) across {len(out)} lines; "
+        f"{seg_rescued} short THEM segment(s) rescued closed-set")
 
     # Hand the final clusters (label + sample embeddings) to the sidecar so
     # the session survives the refine: assigning a speaker AFTER the call —
