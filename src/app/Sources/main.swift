@@ -1380,6 +1380,26 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// nil = follow the live symlink; a path = show that transcript.
     private(set) var fixedPath: String? = nil
 
+    /// The title's parent stack. NSStackView detachesHiddenViews (the
+    /// default) REMOVES a hidden arranged view from the hierarchy and
+    /// resets its `isHidden` to false — after which `isHidden = false`
+    /// is a no-op on an orphan and the title never comes back (the
+    /// "randomly missing title": which meetings broke depended on the
+    /// hide/show ordering across opens). Showing must explicitly
+    /// re-attach; hiding goes through the stack as before.
+    private var titleRowStack: NSStackView? = nil
+
+    private func setTitleVisible(_ visible: Bool) {
+        if visible {
+            if titleField.superview == nil, let row = titleRowStack {
+                row.insertArrangedSubview(titleField, at: 0)
+            }
+            titleField.isHidden = false
+        } else if titleField.superview != nil {
+            titleField.isHidden = true    // stack detaches it
+        }
+    }
+
     override func loadView() {
         let content = NSView()
 
@@ -1409,6 +1429,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let titleRow = NSStackView(views: [titleField, titleSpacer])
         titleRow.orientation = .horizontal
         titleRow.spacing = 8
+        titleRowStack = titleRow
         // Long titles truncate with "…" instead of shoving the buttons:
         // the title compresses first (the event button's width varies
         // with the linked meeting's name and keeps its own ≤220 cap).
@@ -1749,6 +1770,35 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             }
         }
         refreshIfChanged(force: true)
+    }
+
+    /// meetink://debug-title — dump the title row's runtime state to
+    /// /tmp so the missing-title bug can be diagnosed from a shell.
+    func dumpTitleDebug() {
+        var out: [String] = ["=== title debug @ \(Date()) ==="]
+        out.append("fixedPath: \(fixedPath ?? "nil")")
+        out.append("lastResolvedPath: \(lastResolvedPath)")
+        out.append("meetingDisplayName: '\(lastResolvedPath.isEmpty ? "-" : meetingDisplayName(lastResolvedPath))'")
+        out.append("titleField.stringValue: '\(titleField.stringValue)'")
+        out.append("titleField.isHidden: \(titleField.isHidden)")
+        out.append("titleField.isHiddenOrHasHiddenAncestor: \(titleField.isHiddenOrHasHiddenAncestor)")
+        out.append("titleField.frame: \(titleField.frame)")
+        out.append("titleField.alphaValue: \(titleField.alphaValue)")
+        out.append("titleField.window: \(titleField.window == nil ? "nil" : "attached")")
+        var v: NSView? = titleField
+        var chain: [String] = []
+        while let cur = v {
+            chain.append("\(type(of: cur)) hidden=\(cur.isHidden) frame=\(cur.frame)")
+            v = cur.superview
+        }
+        out.append("superview chain:")
+        out += chain.map { "  " + $0 }
+        if let row = titleField.superview as? NSStackView {
+            out.append("titleRow arranged: \(row.arrangedSubviews.count), views: \(row.views.count), detached: \(row.detachedViews.count)")
+        }
+        try? (out.joined(separator: "\n") + "\n").write(
+            toFile: "/tmp/meetink-title-debug.txt",
+            atomically: true, encoding: .utf8)
     }
 
     func show(path: String?) {
@@ -2444,7 +2494,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// Menu "Rename…": the editable title field IS the rename UI —
     /// focus it with everything selected so typing replaces the name.
     @objc private func renameFromMenu() {
-        guard !titleField.isHidden else { return }
+        setTitleVisible(!lastResolvedPath.isEmpty)
+        guard titleField.superview != nil, !titleField.isHidden else { return }
         view.window?.makeFirstResponder(titleField)
         titleField.currentEditor()?.selectAll(nil)
     }
@@ -3290,9 +3341,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         // page sat in the empty state never surfaced ("sometimes the
         // title doesn't load"). Renames are meta-only now, so editing
         // the title mid-recording is safe.
-        titleField.isHidden = lastResolvedPath.isEmpty
-        if !lastResolvedPath.isEmpty,
-           view.window?.firstResponder != titleField.currentEditor() {
+        setTitleVisible(!lastResolvedPath.isEmpty)
+        if !lastResolvedPath.isEmpty, titleField.currentEditor() == nil {
             titleField.stringValue = meetingDisplayName(lastResolvedPath)
         }
         updatePlayerUI()
@@ -4468,8 +4518,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         // the physical move to the meetings list's reconciler (the title
         // itself lands in meta.json immediately).
         titleField.isEnabled = true
-        if !titleField.isHidden, titleField.currentEditor() == nil,
-           !lastResolvedPath.isEmpty {
+        // Re-assert visibility every poll — the render-time set can run
+        // while the field is stack-detached (see setTitleVisible).
+        setTitleVisible(!lastResolvedPath.isEmpty)
+        if titleField.currentEditor() == nil, !lastResolvedPath.isEmpty {
             let name = meetingDisplayName(lastResolvedPath)
             if titleField.stringValue != name { titleField.stringValue = name }
         }
@@ -7397,6 +7449,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for url in urls where url.scheme == "meetink" {
             if url.host == "transcribe" {
                 showApp(page: 2)
+            } else if url.host == "debug-title" {
+                // Field-debug hook: dump the reader's title-row runtime
+                // state to a file (the missing-title bug latches in ways
+                // static reads can't see). Harmless to leave in.
+                mainWC?.readerVC.dumpTitleDebug()
             }
         }
     }
