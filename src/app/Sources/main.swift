@@ -1874,6 +1874,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                         .deletingLastPathComponent + "/" + $0 }
             chatHistory = Self.loadChatHistory(effective)
             chatPending = nil
+            chatUnread = 0
+            updateChatToggleBadge()
             renderChatLog()
             // Suggestions are per-meeting state.
             introHints.removeAll()
@@ -1919,6 +1921,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     @objc private func chatToggleClicked() {
         chatBody.isHidden.toggle()
         if !chatBody.isHidden {
+            chatUnread = 0
+            updateChatToggleBadge()
             view.window?.makeFirstResponder(chatField)
             // Pre-warm while the user types: evaluate the transcript
             // delta into the local model server's prompt cache now, so
@@ -3050,6 +3054,30 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         let named = speakers.map(\.name).filter {
             $0 != "THEM" && $0 != "ME" && !$0.hasPrefix("Speaker ")
         }
+        // The person a misattributed segment belongs to is almost always
+        // one of its NEIGHBORS in the conversation — list the nearest
+        // named speaker above and below first, the rest alphabetically.
+        var neighbors: [String] = []
+        if let first = lines.first, let last = lines.last,
+           first < snapshot.lines.count {
+            let segSpeaker = snapshot.lines[first].speaker
+            if let up = (0..<first).reversed().first(where: {
+                named.contains(snapshot.lines[$0].speaker)
+                    && snapshot.lines[$0].speaker != segSpeaker
+            }) {
+                neighbors.append(snapshot.lines[up].speaker)
+            }
+            if last + 1 < snapshot.lines.count,
+               let down = ((last + 1)..<snapshot.lines.count).first(where: {
+                   let s = snapshot.lines[$0].speaker
+                   return named.contains(s) && s != segSpeaker
+                       && !neighbors.contains(s)
+               }) {
+                neighbors.append(snapshot.lines[down].speaker)
+            }
+        }
+        let ordered = neighbors + named.filter { !neighbors.contains($0) }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         let pop = NSPopover()
         pop.behavior = .transient
         let vc = AssignPopoverVC(
@@ -3057,7 +3085,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 ? "Reassign this segment to…"
                 : "Reassign \(lines.count) segments to…",
             assignTitle: "Reassign",
-            inMeeting: named.map(displaySpeakerName),
+            inMeeting: ordered.map(displaySpeakerName),
             invite: inviteAssignEntries(excluding: named),
             onAssign: { [weak self] name in
                 self?.assignPopover?.close()
@@ -3724,23 +3752,24 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private func highlightCurrentLine(scrollTo: Bool) {
         guard let p = player, !lineOffsets.isEmpty else { return }
         let t = p.currentTime
-        // Last line whose offset <= t.
+        // Full scan, NO monotonic-order assumption: live-kept transcripts
+        // (refine failed) preserve flush order, where a buffered long
+        // utterance lands AFTER the interjection it spans — the old
+        // break-at-first-later-offset walk then stuck on the wrong line
+        // and never went "backwards" (field report: highlight skipped
+        // Bob's line in the middle of Alice's). Prefer the line whose
+        // [start, end] span CONTAINS t with the latest start (innermost
+        // interjection wins); fall back to the latest start <= t.
         var idx = -1
-        for (i, off) in lineOffsets.enumerated() { if off <= t { idx = i } else { break } }
-        // A short interjection ("right") lands INSIDE someone's long
-        // sentence: once it ends, hand the highlight back to the latest
-        // earlier line still spanning t instead of sticking on the
-        // interjection until the next line starts.
-        if idx >= 0, idx < lineEnds.count, lineEnds[idx] < t {
-            var j = idx - 1
-            while j >= 0, j >= idx - 8 {
-                if lineOffsets[j] <= t, j < lineEnds.count, lineEnds[j] >= t {
-                    idx = j
-                    break
-                }
-                j -= 1
+        var containing = -1
+        for i in lineOffsets.indices where lineOffsets[i] <= t {
+            if idx < 0 || lineOffsets[i] >= lineOffsets[idx] { idx = i }
+            if i < lineEnds.count, lineEnds[i] >= t,
+               containing < 0 || lineOffsets[i] >= lineOffsets[containing] {
+                containing = i
             }
         }
+        if containing >= 0 { idx = containing }
         guard idx >= 0, let range = lineRanges[idx] else { return }
         if let old = highlightedRange, old == range { return }
         if let old = highlightedRange {
@@ -3775,11 +3804,31 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private var suggestedPairs: Set<String> = []
 
     /// Append a system suggestion into the chat panel (no user turn).
-    /// Persisted with the conversation — it's part of the record.
+    /// Persisted with the conversation — it's part of the record. A
+    /// notice landing while the panel is CLOSED marks the toggle unread
+    /// (subtle accent dot) so suggestions aren't silently missed.
     private func postChatNotice(_ text: String) {
         chatHistory.append((q: "", a: "🔎 \(text)"))
         saveChatHistory()
         renderChatLog()
+        if chatBody.isHidden {
+            chatUnread += 1
+            updateChatToggleBadge()
+        }
+    }
+
+    private var chatUnread = 0
+
+    private func updateChatToggleBadge() {
+        if chatUnread > 0 {
+            chatToggle.title = "Ask about this meeting…   ●"
+            chatToggle.contentTintColor = .controlAccentColor
+            chatToggle.toolTip = "\(chatUnread) new suggestion(s) from the assistant"
+        } else {
+            chatToggle.title = "Ask about this meeting…"
+            chatToggle.contentTintColor = .secondaryLabelColor
+            chatToggle.toolTip = nil
+        }
     }
 
     private func maybeInferIntroductions() {

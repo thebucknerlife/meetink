@@ -1294,6 +1294,67 @@ def main() -> int:
         lines.append("")
     lines.append(f"# refined: parakeet ({MODEL_ID.split('/')[-1]})")
 
+    # Interleave truthfulness: a short interjection fully inside a longer
+    # different-speaker utterance ("alice 0-10s, bob 4-5s") used to render
+    # as alice-then-bob while the AUDIO goes alice/bob/alice — the
+    # transcript looked out of order and the playback highlight jumped
+    # around (field report). Split the container at each contained
+    # interjection so display order == audio order. Token text is
+    # concatenated raw (parakeet emits subwords — space-joining would
+    # mangle "making" into "m aking").
+    if os.environ.get("MEETINK_REFINE_INTERLEAVE", "on").lower() not in \
+            ("off", "0", "false"):
+        def _span(e):
+            toks = e[4] or []
+            if toks:
+                return (float(toks[0].get("start", e[0])),
+                        float(toks[-1].get("end", e[0])))
+            return e[0], e[0]
+
+        split_out = []
+        entries.sort(key=lambda e: e[0])
+        for i, e in enumerate(entries):
+            s0, e0 = _span(e)
+            toks = e[4] or []
+            if not toks or (e0 - s0) < 2.0:
+                split_out.append(e)
+                continue
+            # Contained different-speaker interjections, in time order.
+            cuts = []
+            for j in range(len(entries)):
+                if j == i:
+                    continue
+                s1, e1 = _span(entries[j])
+                if entries[j][1] != e[1] and (e1 - s1) <= 3.0 \
+                        and s1 > s0 + 0.3 and e1 < e0 - 0.3:
+                    cuts.append(s1)
+            if not cuts:
+                split_out.append(e)
+                continue
+            cuts = sorted(set(cuts))
+            parts: list[list] = [[] for _ in range(len(cuts) + 1)]
+            for tk in toks:
+                ts = float(tk.get("start", s0))
+                k = sum(1 for c in cuts if ts >= c)
+                parts[k].append(tk)
+            emitted = 0
+            for part in parts:
+                if not part:
+                    continue
+                ptext = "".join(tk.get("text") or "" for tk in part).strip()
+                if not ptext:
+                    continue
+                split_out.append((float(part[0].get("start", s0)), e[1],
+                                  ptext, e[3], part))
+                emitted += 1
+            if emitted == 0:
+                split_out.append(e)
+        if len(split_out) != len(entries):
+            log(f"interleave: split {len(split_out) - len(entries)} "
+                f"contained interjection container(s)")
+        entries = split_out
+        entries.sort(key=lambda e: e[0])
+
     timing_lines: list[dict] = []
     for start_s, label, text, _origin, toks in entries:
         lines.append(f"[{stamp(start_s)}] {label}: {text}")
