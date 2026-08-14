@@ -76,10 +76,26 @@ def main() -> int:
         elif l == "---" and content_idx and footer_start is None:
             footer_start = i
     if started is None:
-        die("transcript has no 'Started:' header — can't derive the new "
-            "meeting's identity")
+        # Refine can rewrite the header without a Started line (field
+        # case: 'Adriana x Greg 1:1'). The folder stamp IS the recording
+        # start — that's the permanent-ID rule.
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})",
+                     txt.parent.name)
+        if m:
+            started = datetime(*map(int, m.groups())).astimezone()
+    if started is None:
+        die("transcript has no 'Started:' header and the folder isn't a "
+            "timestamp — can't derive the new meeting's identity")
     if len(content_idx) < 2:
         die("nothing to split (fewer than 2 transcript lines)")
+
+    # Refined transcripts stamp lines with ELAPSED time ([00:00:01] …),
+    # captures with wall clock. Detect by the first stamp: meetings
+    # don't start with a 00:0x wall clock outside the midnight minute.
+    m0 = LINE_RE.match(lines[content_idx[0]])
+    first_stamp_s = (int(m0.group(1)) * 3600 + int(m0.group(2)) * 60
+                     + int(m0.group(3)))
+    stamps_elapsed = first_stamp_s < 120
 
     ended_footer = lines[footer_start:] if footer_start is not None else []
 
@@ -99,8 +115,10 @@ def main() -> int:
         if timing is not None:
             return float(timing["lines"][ci].get("t", 0.0))
         m = LINE_RE.match(lines[content_idx[ci]])
-        st_local = started.astimezone()
         stamp_s = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        if stamps_elapsed:
+            return float(stamp_s)
+        st_local = started.astimezone()
         start_s = st_local.hour * 3600 + st_local.minute * 60 + st_local.second
         d = stamp_s - start_s
         if d < -3600:            # crossed midnight
@@ -134,6 +152,18 @@ def main() -> int:
     header_new.append("")
     new_body = lines[cut_line:footer_start] if footer_start is not None \
         else lines[cut_line:]
+    if stamps_elapsed:
+        # Elapsed-style stamps must restart at ~00:00:00 in the new half
+        # or its clock reads as minutes-in when it's seconds-in.
+        def rebase(line: str) -> str:
+            m = LINE_RE.match(line)
+            if not m:
+                return line
+            s = max(0, int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                    + int(m.group(3)) - int(split_s))
+            return f"[{s // 3600:02d}:{(s // 60) % 60:02d}:{s % 60:02d}]" \
+                + line[10:]
+        new_body = [rebase(l) for l in new_body]
     Path(str(new_base) + ".txt").write_text(
         "\n".join(header_new + new_body + ended_footer) + "\n",
         encoding="utf-8")

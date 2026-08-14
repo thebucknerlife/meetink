@@ -2341,13 +2341,34 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             proc.waitUntilExit()
             DispatchQueue.main.async {
                 guard let self else { return }
+                // The split itself is 1-2 s of stream copies — no
+                // progress window needed, but the OUTCOME must be loud
+                // (a transient flash was missable; field report:
+                // "it seemingly did not work").
                 if proc.terminationStatus == 0 {
                     self.refreshIfChanged(force: true)
-                    self.flashStatus("Split done — new meeting created")
+                    let newPath = out.split(separator: "\n")
+                        .map(String.init).last { $0.hasSuffix(".txt") }
+                    let done = NSAlert()
+                    done.messageText = "Split complete"
+                    done.informativeText = "Everything after \(stampStr) "
+                        + "is now its own meeting"
+                        + (newPath.map {
+                            ": “\(meetingDisplayName($0))”." } ?? ".")
+                    done.addButton(withTitle: "Open New Meeting")
+                    done.addButton(withTitle: "Stay Here")
+                    if done.runModal() == .alertFirstButtonReturn,
+                       let newPath {
+                        self.show(path: newPath)
+                    }
                 } else {
-                    let reason = out.split(separator: "\n").last
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText = "Split failed"
+                    alert.informativeText = out.split(separator: "\n").last
                         .map(String.init) ?? "unknown error"
-                    self.flashStatus("Split failed: \(reason)")
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
                 }
             }
         }
