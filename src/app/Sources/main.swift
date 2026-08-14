@@ -174,6 +174,54 @@ func profileNamesCached() -> [String] {
     return _profileNamesCache
 }
 
+/// One-shot JSON task against the resident local model (port 8181, kept
+/// warm during recordings by the start hook). Returns the parsed object
+/// or nil — every caller is best-effort UX sugar, never load-bearing.
+func localLLMJSON(system: String, user: String, maxTokens: Int = 300,
+                  completion: @escaping ([String: Any]?) -> Void) {
+    guard let url = URL(string: "http://127.0.0.1:8181/v1/chat/completions")
+    else { completion(nil); return }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.timeoutInterval = 30
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    let body: [String: Any] = [
+        "messages": [["role": "system", "content": system],
+                     ["role": "user", "content": user]],
+        "stream": false,
+        "max_tokens": maxTokens,
+        "temperature": 0,
+        // Qwen3.5 burns the whole budget reasoning otherwise.
+        "chat_template_kwargs": ["enable_thinking": false],
+    ]
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    URLSession.shared.dataTask(with: req) { data, _, _ in
+        var out: [String: Any]? = nil
+        if let data,
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let choices = obj["choices"] as? [[String: Any]],
+           let msg = (choices.first?["message"] as? [String: Any])?["content"] as? String,
+           let s = msg.firstIndex(of: "{"), let e = msg.lastIndex(of: "}"), s < e {
+            out = try? JSONSerialization.jsonObject(
+                with: Data(String(msg[s...e]).utf8)) as? [String: Any]
+        }
+        DispatchQueue.main.async { completion(out) }
+    }.resume()
+}
+
+/// Snap a spoken/typed name to an existing profile: exact
+/// case-insensitive match first, then a UNIQUE prefix ("Dan" → the one
+/// "Dan May"). Ambiguous or unknown names pass through untouched.
+func snapToProfile(_ name: String) -> String {
+    let profiles = profileNamesCached()
+    let lower = name.lowercased()
+    if let exact = profiles.first(where: { $0.lowercased() == lower }) {
+        return exact
+    }
+    let prefix = profiles.filter { $0.lowercased().hasPrefix(lower) }
+    return prefix.count == 1 ? prefix[0] : name
+}
+
 /// Display case for a transcript speaker label. The FILE keeps uppercase
 /// labels (every pipeline — rename sweeps, relabel priors, harvest —
 /// greps for them), but people don't read in caps: the profile's own
@@ -1827,6 +1875,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             chatHistory = Self.loadChatHistory(effective)
             chatPending = nil
             renderChatLog()
+            // Suggestions are per-meeting state.
+            introHints.removeAll()
+            suggestedPairs.removeAll()
+            lastIntroInferAt = Date.distantPast
         }
         fixedPath = path
         refreshIfChanged(force: true)
@@ -1886,7 +1938,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
 
     @objc private func chatSend() {
         let q = chatField.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty, !chatBusy, let launcher = launcherPath(),
+        guard !q.isEmpty, !chatBusy, launcherPath() != nil,
               !lastResolvedPath.isEmpty else { return }
         let path = lastResolvedPath
         chatBusy = true
@@ -1894,6 +1946,140 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         chatField.stringValue = ""
         chatPending = q
         renderChatLog()
+        // Stage 3: during a LIVE call the chat doubles as roster
+        // management — "confirming this meeting is Judd, me and Alice",
+        // "speaker 2 is Dan". A cheap phrase gate keeps ordinary Q&A on
+        // the fast path; only roster-shaped messages pay the extra
+        // routing hop through the local model.
+        let live = fixedPath == nil && recordingPID() != nil
+        let lower = q.lowercased()
+        let rosterish = live && (
+            lower.contains("this meeting is")
+            || lower.contains("in this meeting")
+            || lower.contains("on this call")
+            || lower.contains("roster")
+            || lower.contains("confirming")
+            || (lower.contains("speaker") && lower.contains(" is ")))
+        if rosterish {
+            routeLiveCommand(q: q, path: path)
+        } else {
+            performAsk(q: q, path: path)
+        }
+    }
+
+    /// Classify a roster-shaped live message into an action; anything
+    /// unclear falls through to the normal ask.
+    private func routeLiveCommand(q: String, path: String) {
+        let known = profileNamesCached().joined(separator: ", ")
+        let labels = speakers.map(\.name).joined(separator: ", ")
+        let system = """
+        You route a message the user typed during a live meeting they are \
+        recording. Reply ONLY JSON, one of:
+        {"action":"roster","present":["Name1","Name2"]} — the user states \
+        who is in the meeting (expand "me" to Me).
+        {"action":"assign","label":"Speaker 2","name":"Dan"} — the user \
+        says a specific speaker label is a specific person.
+        {"action":"chat"} — anything else, including questions ABOUT the \
+        meeting.
+        """
+        let user = "Known voice profiles: \(known)\n"
+            + "Current speaker labels: \(labels)\n\nMessage: \(q)"
+        localLLMJSON(system: system, user: user, maxTokens: 150) { [weak self] obj in
+            guard let self else { return }
+            switch obj?["action"] as? String {
+            case "roster":
+                let names = (obj?["present"] as? [String] ?? [])
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty && !$0.contains("/") }
+                guard !names.isEmpty else {
+                    self.performAsk(q: q, path: path); return
+                }
+                self.applyRoster(names: names, q: q)
+            case "assign":
+                guard let label = obj?["label"] as? String,
+                      let name = (obj?["name"] as? String)?
+                          .trimmingCharacters(in: .whitespaces),
+                      !name.isEmpty,
+                      let match = self.speakers.map(\.name).first(where: {
+                          $0.lowercased() == label.lowercased()
+                      }) else { self.performAsk(q: q, path: path); return }
+                let snapped = snapToProfile(name)
+                self.runAssign(label: match, name: snapped)
+                self.finishChatAction(q: q, answer:
+                    "Assigned \(displaySpeakerName(match)) → \(snapped). "
+                    + "The transcript relabels and their voice trains "
+                    + "from this call's audio.")
+            default:
+                self.performAsk(q: q, path: path)
+            }
+        }
+    }
+
+    private func applyRoster(names: [String], q: String) {
+        let profiles = profileNamesCached()
+        let me = configValue("me_name") ?? ""
+        var linked: [String] = []
+        var newVoices: [String] = []
+        for raw in names {
+            let n = snapToProfile(
+                ["me", "myself", "i"].contains(raw.lowercased())
+                    && !me.isEmpty ? me : raw)
+            if profiles.contains(where: { $0.lowercased() == n.lowercased() }) {
+                linked.append(n)
+            } else {
+                newVoices.append(n)
+            }
+        }
+        func enc(_ s: [String]) -> String {
+            s.joined(separator: ",").addingPercentEncoding(
+                withAllowedCharacters: .urlQueryAllowed) ?? ""
+        }
+        guard let url = URL(string: "http://127.0.0.1:8179/session/expect?"
+            + "linked=\(enc(linked))&unlinked=\(enc(newVoices))") else {
+            finishChatAction(q: q, answer: "Couldn't reach the speaker engine.")
+            return
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 4
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let ok = data != nil
+                var parts: [String] = []
+                if !linked.isEmpty {
+                    parts.append("known voices: \(linked.joined(separator: ", "))")
+                }
+                if !newVoices.isEmpty {
+                    parts.append("new voices expected: \(newVoices.joined(separator: ", "))")
+                }
+                self.finishChatAction(q: q, answer: ok
+                    ? "Roster set — \(parts.joined(separator: "; ")). "
+                        + "The speaker engine regroups against this "
+                        + "expectation; unknowns get matched as they talk."
+                    : "The speaker engine isn't running — roster noted "
+                        + "nowhere. Is the diarize server up?")
+                self.lastAssessmentFetch = .distantPast
+            }
+        }.resume()
+    }
+
+    /// Close out a chat turn that was handled by an ACTION (no LLM
+    /// answer streamed): record the turn, unlock the field.
+    private func finishChatAction(q: String, answer: String) {
+        chatHistory.append((q: q, a: answer))
+        saveChatHistory()
+        chatPending = nil
+        chatBusy = false
+        chatField.isEnabled = true
+        renderChatLog()
+    }
+
+    private func performAsk(q: String, path: String) {
+        guard let launcher = launcherPath() else {
+            finishChatAction(q: q, answer: "meetink launcher not found")
+            return
+        }
         chatStreamThinking = ""
         chatStreamAnswer = ""
         // Resume the meeting's claude session when we have one — the
@@ -2018,7 +2204,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             .foregroundColor: NSColor.labelColor,
         ]
         for turn in chatHistory {
-            out.append(NSAttributedString(string: "\(turn.q)\n", attributes: qAttrs))
+            // Empty q = a system suggestion (proactive nudge), answer only.
+            if !turn.q.isEmpty {
+                out.append(NSAttributedString(string: "\(turn.q)\n", attributes: qAttrs))
+            }
             out.append(NSAttributedString(string: "\(turn.a)\n\n", attributes: aAttrs))
         }
         if let pending = chatPending {
@@ -3571,6 +3760,86 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         }
     }
 
+    // MARK: Stage 3 — LLM introduction inference (live)
+    //
+    // Every ~2 min during a live call with unnamed speakers, the resident
+    // local model reads the transcript tail and reports which Speaker-N
+    // labels introduce themselves ("hey, this is Dan from finance").
+    // Suggestions surface as sidebar "?" hints and a chat notice —
+    // NEVER auto-assigned; the user's click is the assignment.
+
+    private var introHints: [String: String] = [:]     // "Speaker 2" -> "Dan"
+    private var lastIntroInferAt = Date.distantPast
+    private var introInferBusy = false
+    /// Cluster/name pairs already suggested this session (chat noise cap).
+    private var suggestedPairs: Set<String> = []
+
+    /// Append a system suggestion into the chat panel (no user turn).
+    /// Persisted with the conversation — it's part of the record.
+    private func postChatNotice(_ text: String) {
+        chatHistory.append((q: "", a: "🔎 \(text)"))
+        saveChatHistory()
+        renderChatLog()
+    }
+
+    private func maybeInferIntroductions() {
+        let live = fixedPath == nil && recordingPID() != nil
+        guard live, !introInferBusy,
+              Date().timeIntervalSince(lastIntroInferAt) > 120 else { return }
+        let unnamed = speakers.map(\.name).filter {
+            $0.hasPrefix("Speaker ") && introHints[$0] == nil
+        }
+        guard !unnamed.isEmpty else { return }
+        let tail = snapshot.lines.suffix(80)
+            .map { "[\($0.speaker)] \($0.text)" }.joined(separator: "\n")
+        guard tail.count > 500 else { return }      // not enough signal yet
+        introInferBusy = true
+        lastIntroInferAt = Date()
+        let system = """
+        You read a live meeting transcript. Some speakers are unidentified \
+        (labels like "Speaker 2"). Find ONLY cases where an unidentified \
+        speaker's real name is stated — they introduce themselves, or \
+        someone addresses them by name and they respond. Reply ONLY JSON: \
+        {"assignments":[{"label":"Speaker 2","name":"Dan","confidence":0.9}]} \
+        Confidence 0-1; use 0.9+ only for explicit self-introductions. \
+        No guesses from topic or writing style. Empty list if unsure.
+        """
+        let user = "Unidentified labels: \(unnamed.joined(separator: ", "))\n\n"
+            + "Transcript tail:\n\(tail)"
+        localLLMJSON(system: system, user: user, maxTokens: 250) { [weak self] obj in
+            guard let self else { return }
+            self.introInferBusy = false
+            guard let arr = obj?["assignments"] as? [[String: Any]] else { return }
+            var changed = false
+            for a in arr {
+                guard let label = a["label"] as? String,
+                      let name = (a["name"] as? String)?
+                          .trimmingCharacters(in: .whitespaces),
+                      let conf = a["confidence"] as? Double,
+                      conf >= 0.7, !name.isEmpty, !name.contains("/"),
+                      name.count < 40 else { continue }
+                // Only labels that are still unnamed in the sidebar.
+                guard let match = self.speakers.map(\.name).first(where: {
+                    $0.lowercased() == label.lowercased()
+                        && $0.hasPrefix("Speaker ")
+                }) else { continue }
+                if self.introHints[match] != name {
+                    self.introHints[match] = name
+                    changed = true
+                    let key = "intro:\(match):\(name.lowercased())"
+                    if !self.suggestedPairs.contains(key) {
+                        self.suggestedPairs.insert(key)
+                        self.postChatNotice(
+                            "\(match) may be \(name) — they were named in "
+                            + "the conversation. Click their sidebar row "
+                            + "to confirm, or ignore if wrong.")
+                    }
+                }
+            }
+            if changed { self.rebuildPanelRows() }
+        }
+    }
+
     private func fetchAssessment() {
         guard Date().timeIntervalSince(lastAssessmentFetch) > 5 else { return }
         lastAssessmentFetch = Date()
@@ -3597,6 +3866,26 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 if !(self.sessionAssessment as NSDictionary).isEqual(to: assess) {
                     self.sessionAssessment = assess
                     self.rebuildPanelRows()
+                }
+                // Proactive nudge (stage 3): a cluster that strongly
+                // resembles a known profile gets ONE chat suggestion per
+                // session — the model speaks up instead of hoping the
+                // sidebar hint gets noticed. Confidence-gated; weaker
+                // resemblance stays sidebar-only.
+                for c in (assess["clusters"] as? [[String: Any]]) ?? [] {
+                    guard let letter = c["letter"] as? String,
+                          let r = c["resembles"] as? [String: Any],
+                          let n = r["name"] as? String,
+                          let sim = r["sim"] as? Double, sim >= 0.45,
+                          let samples = c["samples"] as? Int, samples >= 4
+                    else { continue }
+                    let key = "acoustic:\(letter):\(n.lowercased())"
+                    guard !self.suggestedPairs.contains(key) else { continue }
+                    self.suggestedPairs.insert(key)
+                    self.postChatNotice(String(format:
+                        "Speaker %@ sounds like %@ (similarity %.2f). "
+                        + "Click their sidebar row to assign, or ignore "
+                        + "if someone else.", letter, n, sim))
                 }
             }
         }.resume()
@@ -3696,6 +3985,11 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                     hints["Speaker \(letter)"] = "sounds like \(n)?"
                 }
             }
+        }
+        // A name spoken IN the conversation ("hey, this is Dan") beats
+        // acoustic resemblance — strongest evidence, still just a hint.
+        for (label, name) in introHints {
+            hints[label] = "\(name)? — named in call"
         }
         var rows: [PanelRow] = visible.map {
             .speaker(name: $0.name, fraction: $0.fraction / vTotal,
@@ -4580,6 +4874,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             if eventButton.title != label { eventButton.title = label }
         }
         updateSpeakersPanel()
+        maybeInferIntroductions()
     }
 }
 
