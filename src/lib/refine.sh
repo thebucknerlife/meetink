@@ -188,7 +188,9 @@ if os.path.exists(meta):
     except Exception:
         d = {}
 d["trimmed_trailing_s"] = cut
-json.dump(d, open(meta, "w"), sort_keys=True)
+with open(meta + ".tmp", "w") as f:
+    json.dump(d, f, sort_keys=True)
+os.replace(meta + ".tmp", meta)
 data = open(txt, errors="replace").read()
 note = (f"# note: trimmed {cut // 60} minutes of trailing silence "
         "(recording ran past the end of the meeting)\n")

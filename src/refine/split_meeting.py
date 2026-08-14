@@ -202,7 +202,10 @@ def main() -> int:
             meta = {}
         if hard_breaks:
             meta["hard_breaks"] = [b for b in hard_breaks if b < k]
-            meta_path.write_text(json.dumps(meta))
+            # Atomic — the app polls meta.json; see _meta_set_title.
+            tmp = Path(str(meta_path) + ".tmp")
+            tmp.write_text(json.dumps(meta))
+            tmp.replace(meta_path)
     mm, ss = int(split_s) // 60, int(split_s) % 60
     new_meta: dict = {"title": f"Split from {title} ({mm}:{ss:02d} to end)"}
     moved_breaks = [b - k for b in hard_breaks if b >= k and b - k > 0]

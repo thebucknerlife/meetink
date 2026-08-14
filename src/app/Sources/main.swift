@@ -529,7 +529,13 @@ func setMeetingMeta(_ txtPath: String, _ key: String, _ value: Any) {
     meta[key] = value
     if let data = try? JSONSerialization.data(withJSONObject: meta,
                                               options: [.sortedKeys]) {
-        try? data.write(to: URL(fileURLWithPath: meetingMetaPath(txtPath)))
+        // .atomic (write-temp-then-rename): meta.json is polled every
+        // couple of seconds by three timers — a truncate-then-write
+        // lets a reader see empty JSON and the title "randomly" falls
+        // back to the folder slug. Nothing tails meta.json by inode,
+        // so the swap is safe.
+        try? data.write(to: URL(fileURLWithPath: meetingMetaPath(txtPath)),
+                        options: .atomic)
     }
 }
 

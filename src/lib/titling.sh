@@ -607,7 +607,12 @@ if os.path.exists(p):
     except Exception:
         d = {}
 d["title"] = title
-json.dump(d, open(p, "w"), sort_keys=True)
+# Atomic: the app polls meta.json every couple of seconds — a reader
+# landing inside a truncate-then-write window sees empty JSON and the
+# title "randomly" falls back to the folder slug.
+with open(p + ".tmp", "w") as f:
+    json.dump(d, f, sort_keys=True)
+os.replace(p + ".tmp", p)
 PYEOF2
 }
 
@@ -693,7 +698,9 @@ except Exception:
 meta["event"] = {"title": best.get("title") or "",
                  "start": best.get("start") or "",
                  "attendees": names}
-json.dump(meta, open(meta_p, "w"), sort_keys=True)
+with open(meta_p + ".tmp", "w") as f:
+    json.dump(meta, f, sort_keys=True)
+os.replace(meta_p + ".tmp", meta_p)
 data = open(txt, errors="replace").read()
 lines = []
 if "# event: " not in data:
