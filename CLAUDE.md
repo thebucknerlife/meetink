@@ -19,6 +19,27 @@ zsh launcher ──spawns──▶ whisper-server (:8178)  ◀── HTTP /infer
                                                   diarize-server (:8179)  ◀───┘   (optional)
 ```
 
+## Deploy flow (multi-workspace)
+
+Write code in any worktree/workspace, but **deploys always run from the
+canonical checkout at `~/src/meetink`** (on `main`). `/opt/homebrew/bin/meetink`
+symlinks there, and the running app resolves it at runtime: the watch daemon
+and refine pipeline execute *that checkout's* Python/zsh live, while `app build`
+installs compiled binaries to `~/.meetink/bin/`. Building from a feature
+worktree deploys mismatched halves — don't.
+
+Any agent ships from its own workspace with:
+
+```sh
+git push origin HEAD:main                      # publish (rebase on origin/main first if it moved)
+git -C ~/src/meetink pull --ff-only            # sync the canonical checkout
+~/src/meetink/bin/meetink app build            # kills + relaunches the app — NEVER while a
+                                               # recording or its post-processing is live
+```
+
+Script-only changes (`src/watch/`, `src/lib/`, `src/refine/`) need no build —
+step 2 alone deploys them; the app picks them up on the next daemon respawn.
+
 ## Common commands
 
 ```sh
