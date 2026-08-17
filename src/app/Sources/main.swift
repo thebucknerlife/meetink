@@ -5001,6 +5001,7 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     override func loadView() {
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
 
         let nameCol = NSTableColumn(identifier: .init("name"))
         nameCol.title = "Meeting"
@@ -5031,7 +5032,16 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
             col.sortDescriptorPrototype = NSSortDescriptor(
                 key: col.identifier.rawValue,
                 ascending: col.identifier.rawValue == "name")
+            // Floor keeps a mis-drag from collapsing a column to an
+            // ungrabbable sliver (autosave restore clamps to this too).
+            col.minWidth = 30
         }
+        // Resizes are absolute: the default lastColumnOnly style takes
+        // the space FROM the last column, and once that hits minWidth
+        // every widen-drag silently no-ops (field case: Duration stuck
+        // narrow after a reorder put a skinny column last). Overflow
+        // scrolls horizontally instead.
+        table.columnAutoresizingStyle = .noColumnAutoresizing
         // Drag-reordered/resized columns persist across relaunches.
         // Set AFTER the columns exist so the saved layout can restore.
         table.autosaveTableColumns = true
