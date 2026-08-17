@@ -342,6 +342,16 @@ build_agent() {
         # The interruptionLevel hint in the code is harmless without it.
         codesign --force --sign "$(mk_codesign_identity)" "$app" || \
             print -P "${C[yellow]}⚠${C[reset]} agent codesign failed — notifications/calendar will re-prompt"
+        # VERIFY the identity landed: identity lookup can fail silently
+        # (locked keychain under automation) and fall back to ad-hoc —
+        # which burned the agent's Calendar TCC grant mid-day (field
+        # case: every calendar-driven feature died until re-signed).
+        if security find-identity -v -p codesigning 2>/dev/null | grep -q "Meetink Signing" \
+           && ! codesign -dvvv "$app" 2>&1 | grep -q "Authority=Meetink Signing"; then
+            print -P "${C[red]}⚠ agent got an AD-HOC signature despite the stable identity existing${C[reset]}"
+            print -P "  ${C[dim]}TCC grants (Calendar, notifications) are keyed to the signature and just reset.${C[reset]}"
+            print -P "  Re-sign: ${C[bright_cyan]}codesign --force --sign \"Meetink Signing\" $app${C[reset]}"
+        fi
     fi
 
     print -P "${C[green]}✓${C[reset]} Built: ${C[dim]}$app${C[reset]}"

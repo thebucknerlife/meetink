@@ -474,7 +474,12 @@ let kConferencingProcesses: [(label: String, patterns: [String])] = [
     // here since most users only run Teams when working.
     ("teams", ["Microsoft Teams (workOrSchool)", "MSTeams"]),
     ("webex", ["Webex", "WebexHelper"]),
-    ("meet",  ["GoogleMeet"]),  // standalone Meet PWA when installed
+    // Standalone Meet PWA: the process is app_mode_loader inside
+    // ".../Google Meet.app/..." — pgrep -lf matches the PATH, and the
+    // real name has a space ("GoogleMeet" alone never matched; field
+    // case: native-app call produced zero presence → no auto-start,
+    // no auto-stop).
+    ("meet",  ["GoogleMeet", "Google Meet"]),
 ]
 
 func runningConferencingApp() -> String? {
@@ -510,8 +515,15 @@ func cameraInUseElsewhere() -> Bool {
     // detect anything we don't already get via processes (Continuity
     // Camera implies the iPhone is acting as a camera for an app we're
     // already detecting).
+    // .external too: a Mac Studio/mini has NO built-in camera — the
+    // camera signal was permanently dead on desktop Macs (field case),
+    // and external webcams are exactly what those machines use.
+    var types: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera]
+    if #available(macOS 14.0, *) {
+        types.append(.external)
+    }
     let session = AVCaptureDevice.DiscoverySession(
-        deviceTypes: [.builtInWideAngleCamera],
+        deviceTypes: types,
         mediaType: .video,
         position: .unspecified
     )

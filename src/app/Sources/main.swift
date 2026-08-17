@@ -8198,6 +8198,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func startRecording() {
+        // Phantom-start forensics: a recording has twice started via
+        // this selector with no intentional click. Record the exact
+        // input event so the next occurrence names its trigger.
+        let ev = NSApp.currentEvent
+        let evDesc = ev.map {
+            "type=\($0.type.rawValue) win=\($0.window?.title ?? "nil") "
+            + ($0.type == .keyDown || $0.type == .keyUp
+               ? "key=\($0.keyCode)" : "loc=\($0.locationInWindow)")
+        } ?? "no-event"
+        let line = "\(Date())  startRecording trigger: \(evDesc)\n"
+        if let d = line.data(using: .utf8),
+           let h = FileHandle(forWritingAtPath: "/tmp/meetink-start-forensics.log")
+            ?? {
+                FileManager.default.createFile(
+                    atPath: "/tmp/meetink-start-forensics.log", contents: nil)
+                return FileHandle(forWritingAtPath:
+                    "/tmp/meetink-start-forensics.log")
+            }() {
+            h.seekToEndOfFile()
+            h.write(d)
+            try? h.close()
+        }
         runLauncher("start")
         showApp()
         mainWC?.openTranscript(nil)
