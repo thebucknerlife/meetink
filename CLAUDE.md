@@ -40,6 +40,37 @@ git -C ~/src/meetink pull --ff-only            # sync the canonical checkout
 Script-only changes (`src/watch/`, `src/lib/`, `src/refine/`) need no build —
 step 2 alone deploys them; the app picks them up on the next daemon respawn.
 
+### Multi-agent rules (read before deploying anything)
+
+This machine is a LIVE meeting recorder for a real user, not a dev sandbox.
+Several agents may work in parallel workspaces; these rules keep them from
+stepping on each other and on live recordings:
+
+- **Gate every deploy on recorder state.** Before the pull OR the build, check
+  `meetink status` says "not recording" AND no post-processing is live
+  (`/tmp/meetink-postproc.pid` absent or its PID dead). A mid-postproc pull
+  swaps pipeline scripts between stages (mixed-version run); a mid-recording
+  `app build` kills the app-owned watch daemon over a live call. Gate on the
+  CHECK RESULT — never chain `status && deploy` and proceed regardless.
+- **`pull --ff-only` failed → stop and ask the user.** It means the canonical
+  checkout has uncommitted work (another agent mid-task) or main diverged.
+  Never force-pull, stash someone else's WIP, or reset the canonical tree.
+- **Never "test" against live data.** `~/.meetink` and `~/Documents/meetink`
+  are the user's real profiles, meetings, and session state. `meetink stop`,
+  `discard`, `profile` mutations, or importing server modules with the real
+  env all mutate it (a unit test once wrote fake merges into the live session
+  journal). Tests set `MEETINK_HOME`/`MEETINK_TRANSCRIPTS_DIR` to a tempdir,
+  and destructive experiments run on a **Duplicate Meeting** copy, never the
+  original.
+- The subcommand is `app build` — `app --build` silently relaunches the OLD
+  binary and exits 0 (verify a deploy landed via a fresh string in the binary
+  or the bundle mtime).
+- A running watch daemon keeps pre-pull code until it respawns; don't kill it
+  to force that unless the recorder is idle (the app's reconciler respawns it
+  within seconds).
+- The diarize server (`:8179`) holds LIVE session voice clusters — restarting
+  it mid-call loses them. Same gate: check, then act.
+
 ## Common commands
 
 ```sh
