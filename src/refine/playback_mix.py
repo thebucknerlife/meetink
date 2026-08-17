@@ -156,14 +156,18 @@ def detect_modes(mic16: np.ndarray, sys16: np.ndarray,
 
 
 def load_duck_spans(timing_path: str, label: str,
-                    pad: float = 0.12, gap: float = 0.4) -> list[tuple[float, float]]:
+                    pad_lead: float = 0.15, pad_tail: float = 0.7,
+                    gap: float = 1.0) -> list[tuple[float, float]]:
     """The USER's speech spans from timing.json — sys-duck windows for
     the sum render. A far-end return of the user's own voice in sys
     (a participant echoing the meeting back) summed onto the direct mic
     is manufactured echo: neither stream echoes alone, the sum doubles
     them (AE x Tom incident). Ducking sys under the user's words kills
     that copy; genuine crosstalk survives, just quieter under their
-    voice. Merged word spans with edge padding.
+    voice. Merged word spans; the TAIL pad is generous because the
+    returned copy lags the direct voice by a 100-400 ms round trip —
+    each echoed phrase-ending outlives the words that caused it (field
+    listen: v1's symmetric 0.12 s pad let every tail through).
     """
     import json
     try:
@@ -187,7 +191,32 @@ def load_duck_spans(timing_path: str, label: str,
             spans[-1][1] = max(spans[-1][1], e)
         else:
             spans.append([s, e])
-    return [(max(0.0, s - pad), e + pad) for s, e in spans]
+    return [(max(0.0, s - pad_lead), e + pad_tail) for s, e in spans]
+
+
+def gate_duck_spans_on_mic(spans: list[tuple[float, float]],
+                           mic16: np.ndarray,
+                           floor: float = 0.008) -> list[tuple[float, float]]:
+    """Keep only spans where the MIC actually carried the user.
+
+    The dual failure mode (the AE x Adam Russell meeting): when the mic
+    dies, the sys stream holds the ONLY copy of the user — machinery
+    that treats sys-user audio as a disposable duplicate then erases
+    them from the record. Ducking is only correct where the direct mic
+    copy exists; a span whose mic audio is near-silent keeps sys at
+    full level. Per-span, so a mid-call mic death flips behavior right
+    at the boundary.
+    """
+    kept: list[tuple[float, float]] = []
+    for s, e in spans:
+        a, b = int(s * RATE), int(min(e, s + 8.0) * RATE)
+        seg = mic16[a:b]
+        if len(seg) < RATE // 4:
+            continue
+        rms = float(np.sqrt(np.mean(seg ** 2)))
+        if rms >= floor:
+            kept.append((s, e))
+    return kept
 
 
 def stream_gain(x: np.ndarray, target: float = 0.07) -> float:
@@ -328,11 +357,17 @@ def main() -> int:
     # meetings (sys is near-silent there anyway) and on mic-only renders.
     duck_spans: list[tuple[float, float]] = []
     if args.duck_timing and not all(modes):
-        duck_spans = load_duck_spans(args.duck_timing, args.duck_label)
+        raw_spans = load_duck_spans(args.duck_timing, args.duck_label)
+        duck_spans = gate_duck_spans_on_mic(raw_spans, mic16)
         if duck_spans:
             total = sum(e - s for s, e in duck_spans)
-            log(f"sys duck armed: {len(duck_spans)} span(s) of "
-                f"{args.duck_label} speech ({total:.0f}s)")
+            log(f"sys duck armed: {len(duck_spans)}/{len(raw_spans)} "
+                f"span(s) of {args.duck_label} speech ({total:.0f}s; "
+                f"{len(raw_spans) - len(duck_spans)} skipped, mic silent)")
+        elif raw_spans:
+            log(f"sys duck stood down: mic silent across all "
+                f"{len(raw_spans)} span(s) — sys is the only copy of "
+                f"{args.duck_label} (dead-mic meeting)")
 
     log("progress 25 rendering")
     mic_gain = stream_gain(mic16)
@@ -370,7 +405,11 @@ def main() -> int:
                 a[s0 - pos:s1 - pos] = seg.astype(np.float32)
         return a
 
-    DUCK = 0.2                      # -14 dB
+    # -26 dB: the far-end copy runs as HOT as the direct mic (measured
+    # 0.146 vs 0.147 on AE x Tom) and the level-match can run sys hotter
+    # than mic — v1's -14 dB left the echo only ~11 dB under the direct
+    # voice, plainly audible. -26 dB puts it ~23 dB down: masked.
+    DUCK = 0.05
     duck_ramp = int(0.08 * args.rate)
 
     def duck_for_chunk(pos: int, take: int) -> "np.ndarray | None":
