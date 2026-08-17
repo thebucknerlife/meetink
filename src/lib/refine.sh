@@ -339,6 +339,13 @@ _mix_enhanced_m4a() {
         local rjson="${mic:h}/route.jsonl"
         [[ -s "$rjson" ]] || rjson="${out%.m4a}.route.jsonl"
         [[ -s "$rjson" ]] && fm+=(--route "$rjson")
+        # Far-end echo guard: the user's word spans (timing.json) duck
+        # sys in sum renders, so a participant echoing the meeting back
+        # can't double the user's voice (AE x Tom incident).
+        if [[ -s "$timing" ]]; then
+            local duck_me=$(me_name_get 2>/dev/null)
+            fm+=(--duck-timing "$timing" --duck-label "${duck_me:-ME}")
+        fi
         _pmix_run --mic16 "$amic" --sys16 "$asys" \
                 --mic "$dmic" --sys "$psys" --rate $par \
                 "${fm[@]}" \

@@ -155,6 +155,41 @@ def detect_modes(mic16: np.ndarray, sys16: np.ndarray,
     return modes
 
 
+def load_duck_spans(timing_path: str, label: str,
+                    pad: float = 0.12, gap: float = 0.4) -> list[tuple[float, float]]:
+    """The USER's speech spans from timing.json — sys-duck windows for
+    the sum render. A far-end return of the user's own voice in sys
+    (a participant echoing the meeting back) summed onto the direct mic
+    is manufactured echo: neither stream echoes alone, the sum doubles
+    them (AE x Tom incident). Ducking sys under the user's words kills
+    that copy; genuine crosstalk survives, just quieter under their
+    voice. Merged word spans with edge padding.
+    """
+    import json
+    try:
+        with open(timing_path) as f:
+            lines = json.load(f)["lines"]
+    except (OSError, ValueError, KeyError):
+        return []
+    words: list[tuple[float, float]] = []
+    want = label.upper()
+    for ln in lines:
+        if str(ln.get("label", "")).upper() != want:
+            continue
+        for w in ln.get("words") or []:
+            s = float(w.get("s", 0.0))
+            e = max(float(w.get("e", s)), s + 0.05)
+            words.append((s, e))
+    words.sort()
+    spans: list[list[float]] = []
+    for s, e in words:
+        if spans and s - spans[-1][1] <= gap:
+            spans[-1][1] = max(spans[-1][1], e)
+        else:
+            spans.append([s, e])
+    return [(max(0.0, s - pad), e + pad) for s, e in spans]
+
+
 def stream_gain(x: np.ndarray, target: float = 0.07) -> float:
     B = RATE // 10
     nb = len(x) // B
@@ -179,6 +214,10 @@ def main() -> int:
                     help="override detection (mix_mode config)")
     ap.add_argument("--route", help="capture's route.jsonl (OS output-"
                     "device journal) — prior for the mode decision")
+    ap.add_argument("--duck-timing", help="timing.json — the user's word "
+                    "spans duck sys in sum renders (far-end echo guard)")
+    ap.add_argument("--duck-label", default="ME",
+                    help="the user's transcript label (e.g. GREG)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -203,9 +242,30 @@ def main() -> int:
         log(f"route journal: {len(route)} event(s), "
             f"initial {route[0][1]} ({args.route})")
 
+    # An UNAMBIGUOUS route journal is ground truth about the physical
+    # setup: one kind, zero switches, no virtual-device gaps ("unknown"
+    # breaks unambiguity and falls through to acoustics). Per-window
+    # acoustic detection exists for the ambiguous cases — letting it
+    # override hard fact is how a far-end return of the user's voice
+    # (indistinguishable from speaker bleed by correlation) hallucinated
+    # 48 device switches on an all-AirPods meeting (AE x Tom).
+    route_forced: str | None = None
+    if not args.force_mode and route:
+        kinds = {k for _, k in route}
+        if kinds == {"headphones"}:
+            route_forced = "split"
+        elif kinds == {"speakers"}:
+            route_forced = "mic"
+
     if args.force_mode:
         modes = [args.force_mode == "mic"]
         log(f"mode forced: {'speakers/mic-only' if modes[0] else 'headphones/sum'}")
+    elif route_forced:
+        modes = [route_forced == "mic"]
+        log(f"route journal unambiguous ({route[0][1]}, {len(route)} "
+            f"event(s), 0 switches) — "
+            f"{'speakers/mic-only' if modes[0] else 'headphones/sum'} "
+            f"throughout, acoustic detection skipped")
     else:
         modes = detect_modes(mic16, sys16, route)
         switches = sum(1 for i in range(1, len(modes)) if modes[i] != modes[i - 1])
@@ -263,6 +323,17 @@ def main() -> int:
                 else:
                     log(f"echo gate armed (delay {delay/16.0:.0f} ms)")
 
+    # Far-end echo guard: wherever the SUM renders, sys drops -14 dB
+    # under the user's own words (see load_duck_spans). No-op on normal
+    # meetings (sys is near-silent there anyway) and on mic-only renders.
+    duck_spans: list[tuple[float, float]] = []
+    if args.duck_timing and not all(modes):
+        duck_spans = load_duck_spans(args.duck_timing, args.duck_label)
+        if duck_spans:
+            total = sum(e - s for s, e in duck_spans)
+            log(f"sys duck armed: {len(duck_spans)} span(s) of "
+                f"{args.duck_label} speech ({total:.0f}s)")
+
     log("progress 25 rendering")
     mic_gain = stream_gain(mic16)
     sys_gain = stream_gain(sys16)
@@ -299,6 +370,50 @@ def main() -> int:
                 a[s0 - pos:s1 - pos] = seg.astype(np.float32)
         return a
 
+    DUCK = 0.2                      # -14 dB
+    duck_ramp = int(0.08 * args.rate)
+
+    def duck_for_chunk(pos: int, take: int) -> "np.ndarray | None":
+        """Sys gain envelope for [pos, pos+take): DUCK inside the user's
+        spans with raised-cosine edges, 1.0 elsewhere. Absolute-sample
+        math so ramps crossing chunk boundaries stay continuous."""
+        if not duck_spans:
+            return None
+        t0 = pos / args.rate
+        t1 = (pos + take) / args.rate
+        d = np.ones(take, dtype=np.float32)
+        touched = False
+        for s0, e0 in duck_spans:
+            if e0 < t0 - 0.2:
+                continue
+            if s0 > t1 + 0.2:
+                break
+            a = int(s0 * args.rate)
+            b = int(e0 * args.rate)
+            ca, cb = max(a - pos, 0), min(b - pos, take)
+            if ca < cb:
+                d[ca:cb] = DUCK
+                touched = True
+            # entry ramp [a-ramp, a): 1 -> DUCK
+            ra, rb = max(a - duck_ramp - pos, 0), min(a - pos, take)
+            if ra < rb:
+                t = (np.arange(ra, rb) + pos - (a - duck_ramp)) / duck_ramp
+                d[ra:rb] = np.minimum(
+                    d[ra:rb],
+                    (1.0 - (1 - np.cos(np.pi * t)) / 2 * (1 - DUCK))
+                    .astype(np.float32))
+                touched = True
+            # exit ramp [b, b+ramp): DUCK -> 1
+            ra, rb = max(b - pos, 0), min(b + duck_ramp - pos, take)
+            if ra < rb:
+                t = (np.arange(ra, rb) + pos - b) / duck_ramp
+                d[ra:rb] = np.minimum(
+                    d[ra:rb],
+                    (DUCK + (1 - np.cos(np.pi * t)) / 2 * (1 - DUCK))
+                    .astype(np.float32))
+                touched = True
+        return d if touched else None
+
     B_hi = args.rate // 20
     CHUNK = args.rate * 10
     sys_src = args.sys_ if fsize(args.sys_) else os.devnull
@@ -322,6 +437,9 @@ def main() -> int:
                 gidx = np.minimum((np.arange(take) + pos) // B_hi,
                                   len(gains) - 1)
                 s = s * gains[gidx]
+            duck = duck_for_chunk(pos, take)
+            if duck is not None:
+                s = s * duck
             alpha = alpha_for_chunk(pos, take)   # 1 = mic-only, 0 = sum
             mic_track = m * mic_gain             # shared by both renders
             sum_track = mic_track + s * sys_gain
