@@ -764,7 +764,7 @@ class WatchManager:
                 # mid-call without letting the NEW app's camera keep the
                 # OLD recording alive).
                 present = (self._recording_source in labels
-                           or labels == {"camera"})
+                           or labels <= {"camera", "mic"})
             # Foreign-source boundary tracking: while ANY recording runs
             # (watch-started or adopted) with a known source, count
             # consecutive polls where an identifiable DIFFERENT app is in
@@ -774,7 +774,8 @@ class WatchManager:
                           if self._currently_recording is not None
                           else self._adopted_source
                           if self._adopted_pid is not None else None)
-            identifiable = labels - {"camera"}
+            # camera and mic are corroborators, not app identities.
+            identifiable = labels - {"camera", "mic"}
             if (active and rec_source and identifiable
                     and rec_source not in labels):
                 self._foreign_streak += 1
@@ -1376,7 +1377,7 @@ class WatchManager:
                 if self._adopted_source is None:
                     labels = {sig.split(":", 1)[-1]
                               for sig in (last.get("signals") or [])}
-                    named = sorted(labels - {"camera"})
+                    named = sorted(labels - {"camera", "mic"})
                     if named:
                         self._adopted_source = named[0]
                 return

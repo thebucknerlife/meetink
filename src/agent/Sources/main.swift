@@ -454,6 +454,7 @@ func cmdNotify(args: [String]) -> Int32 {
 // MARK: - meeting-active mode
 
 import AVFoundation
+import CoreAudio
 
 // Process-name patterns that indicate an active video-call client.
 // Patterns must be specific enough to avoid matching always-running
@@ -531,6 +532,36 @@ func cameraInUseElsewhere() -> Bool {
         if d.isInUseByAnotherApplication { return true }
     }
     return false
+}
+
+// Mic-in-use via CoreAudio: is the default input device running for
+// ANYONE? The definitive "in a call" corroborator — but it cannot be
+// attributed per-process, and meetink's own capture holds the mic for
+// the whole recording, so the signal is only meaningful when we are
+// NOT recording (suppressed via the capture pid file, same convention
+// the launcher uses).
+func micInUseElsewhere() -> Bool {
+    if let pidStr = try? String(contentsOfFile: "/tmp/meetink-capture.pid",
+                                encoding: .utf8),
+       let p = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+       kill(p, 0) == 0 {
+        return false
+    }
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var deviceID = AudioObjectID(0)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &size, &deviceID) == noErr,
+          deviceID != 0 else { return false }
+    addr.mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere
+    var running: UInt32 = 0
+    size = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size,
+                                     &running) == noErr else { return false }
+    return running != 0
 }
 
 // Browser tab URL scan via AppleScript. Catches Google Meet, Whereby,
@@ -616,12 +647,36 @@ func cmdMeetingActive(args: [String]) -> Int32 {
     var sources: [String] = []
     var primary: String? = nil
 
+    let mic = micInUseElsewhere()
+    let camera: Bool = {
+        if #available(macOS 14.0, *) { return cameraInUseElsewhere() }
+        return false
+    }()
+    let recording = {
+        if let pidStr = try? String(contentsOfFile: "/tmp/meetink-capture.pid",
+                                    encoding: .utf8),
+           let p = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return kill(p, 0) == 0
+        }
+        return false
+    }()
+
     if let p = runningConferencingApp() {
-        sources.append("process:\(p)")
-        primary = primary ?? p
+        // Idle-capable apps (their process runs OUTSIDE calls too: the
+        // Meet PWA on its landing page, Teams in the tray) need mic or
+        // camera corroboration — an open-but-idle app must not read as
+        // a meeting. Call-only processes (Zoom's CptHost, Webex helper)
+        // stand alone. While a recording runs the mic is self-held and
+        // unknowable, so process presence suffices — never drop a
+        // camera-off call mid-recording for lack of corroboration.
+        let idleCapable = (p == "meet" || p == "teams")
+        if !idleCapable || mic || camera || recording {
+            sources.append("process:\(p)")
+            primary = primary ?? p
+        }
     }
 
-    if #available(macOS 14.0, *), cameraInUseElsewhere() {
+    if camera {
         sources.append("camera")
         primary = primary ?? "video"
     }
@@ -629,6 +684,13 @@ func cmdMeetingActive(args: [String]) -> Int32 {
     if let b = browserMeetingActive() {
         sources.append("browser:\(b)")
         primary = primary ?? b
+    }
+
+    // Mic is a CORROBORATOR, never standalone evidence — dictation and
+    // voice memos hold the mic too. Reported only alongside a matched
+    // source so the watcher can see what confirmed it.
+    if mic && !sources.isEmpty {
+        sources.append("mic")
     }
 
     let active = !sources.isEmpty
