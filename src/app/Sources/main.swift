@@ -6435,6 +6435,15 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
     private var history: [String] = []      // newest first
     private var historyShown = 50
     private var timer: Timer? = nil
+    // Live presence signals — rendered VERBATIM from the agent's
+    // `checks` array (the same booleans its verdict used). This view
+    // knows nothing about individual signals, so detector changes
+    // propagate here automatically; never add per-signal code.
+    private let signalsBody = NSTextField(wrappingLabelWithString: "")
+    private let signalsCountdown = NSTextField(labelWithString: "")
+    private var signalsTicksLeft = 0
+    private var signalsProbeBusy = false
+    private static let signalsIntervalS = 5
     /// Wired to the upload queue so in-app jobs show here too.
     var uploadJobsProvider: (() -> [(String, String)])? = nil
 
@@ -6445,6 +6454,20 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
         title.translatesAutoresizingMaskIntoConstraints = false
         body.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         body.translatesAutoresizingMaskIntoConstraints = false
+
+        // Live signals: the presence detector's raw observations.
+        let sigTitle = NSTextField(labelWithString: "Live signals")
+        sigTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        sigTitle.translatesAutoresizingMaskIntoConstraints = false
+        signalsCountdown.font = NSFont.monospacedDigitSystemFont(
+            ofSize: 11, weight: .regular)
+        signalsCountdown.textColor = .tertiaryLabelColor
+        signalsCountdown.translatesAutoresizingMaskIntoConstraints = false
+        signalsBody.font = NSFont.monospacedSystemFont(ofSize: 11.5,
+                                                       weight: .regular)
+        signalsBody.textColor = .secondaryLabelColor
+        signalsBody.stringValue = "probing…"
+        signalsBody.translatesAutoresizingMaskIntoConstraints = false
 
         // History: every past event the pipeline logged, newest first.
         let histTitle = NSTextField(labelWithString: "History")
@@ -6469,6 +6492,9 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
 
         root.addSubview(title)
         root.addSubview(body)
+        root.addSubview(sigTitle)
+        root.addSubview(signalsCountdown)
+        root.addSubview(signalsBody)
         root.addSubview(histTitle)
         root.addSubview(scroll)
         root.addSubview(moreButton)
@@ -6478,7 +6504,14 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
             body.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 16),
             body.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
             body.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -24),
-            histTitle.topAnchor.constraint(equalTo: body.bottomAnchor, constant: 20),
+            sigTitle.topAnchor.constraint(equalTo: body.bottomAnchor, constant: 20),
+            sigTitle.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            signalsCountdown.leadingAnchor.constraint(equalTo: sigTitle.trailingAnchor, constant: 10),
+            signalsCountdown.firstBaselineAnchor.constraint(equalTo: sigTitle.firstBaselineAnchor),
+            signalsBody.topAnchor.constraint(equalTo: sigTitle.bottomAnchor, constant: 8),
+            signalsBody.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            signalsBody.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -24),
+            histTitle.topAnchor.constraint(equalTo: signalsBody.bottomAnchor, constant: 20),
             histTitle.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
             scroll.topAnchor.constraint(equalTo: histTitle.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
@@ -6537,12 +6570,70 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.refresh()
             self?.loadHistory()
+            self?.tickSignals()
         }
+        signalsTicksLeft = 0
+        tickSignals()
     }
 
     override func viewWillDisappear() {
         super.viewWillDisappear()
         timer?.invalidate()
+    }
+
+    /// One countdown tick: probe when it hits zero, otherwise just
+    /// update the "next check in Ns" label.
+    private func tickSignals() {
+        signalsTicksLeft -= 1
+        if signalsTicksLeft <= 0, !signalsProbeBusy {
+            signalsTicksLeft = Self.signalsIntervalS
+            probeSignals()
+        }
+        signalsCountdown.stringValue = signalsProbeBusy
+            ? "checking…"
+            : "next check in \(max(0, signalsTicksLeft))s"
+    }
+
+    /// Run the agent's meeting-active detection and render its `checks`
+    /// array VERBATIM — same booleans the auto-record verdict uses.
+    private func probeSignals() {
+        let agent = "\(mkHome)/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
+        guard FileManager.default.isExecutableFile(atPath: agent) else {
+            signalsBody.stringValue = "agent not installed — run: meetink setup"
+            return
+        }
+        signalsProbeBusy = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: agent)
+            proc.arguments = ["meeting-active"]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = Pipe()
+            var text = "detector failed to run"
+            if (try? proc.run()) != nil {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                if let obj = try? JSONSerialization.jsonObject(with: data)
+                       as? [String: Any],
+                   let checks = obj["checks"] as? [[String: Any]] {
+                    text = checks.map { c in
+                        let on = (c["state"] as? Bool) ?? false
+                        let label = (c["label"] as? String) ?? "?"
+                        let detail = (c["detail"] as? String) ?? ""
+                        return "\(on ? "●" : "○")  \(label) — \(detail)"
+                    }.joined(separator: "\n")
+                } else {
+                    // Old agent binary (no checks array): show the raw
+                    // verdict rather than nothing.
+                    text = String(data: data, encoding: .utf8) ?? text
+                }
+            }
+            DispatchQueue.main.async {
+                self?.signalsBody.stringValue = text
+                self?.signalsProbeBusy = false
+            }
+        }
     }
 
     private func pidAlive(_ pidFile: String) -> Bool {

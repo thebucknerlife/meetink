@@ -483,26 +483,33 @@ let kConferencingProcesses: [(label: String, patterns: [String])] = [
     ("meet",  ["GoogleMeet", "Google Meet"]),
 ]
 
-func runningConferencingApp() -> String? {
+/// Every conferencing group's state from ONE pgrep scan — the debug
+/// view needs the negatives ("Zoom call process: not running") as much
+/// as the verdict needs the first positive.
+func conferencingProcessStates() -> [(label: String, matched: String?)] {
     // `pgrep -lf` matches against the full command line; -i ignores case.
-    // We invoke it once, then scan its output for any of our patterns.
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
     proc.arguments = ["-lf", "."]
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = Pipe()
-    do { try proc.run() } catch { return nil }
+    do { try proc.run() } catch {
+        return kConferencingProcesses.map { ($0.label, nil) }
+    }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     proc.waitUntilExit()
-    guard let s = String(data: data, encoding: .utf8) else { return nil }
-    let lower = s.lowercased()
-    for (label, patterns) in kConferencingProcesses {
-        for p in patterns {
-            if lower.contains(p.lowercased()) { return label }
-        }
+    guard let s = String(data: data, encoding: .utf8) else {
+        return kConferencingProcesses.map { ($0.label, nil) }
     }
-    return nil
+    let lower = s.lowercased()
+    return kConferencingProcesses.map { (label, patterns) in
+        (label, patterns.first { lower.contains($0.lowercased()) })
+    }
+}
+
+func runningConferencingApp() -> String? {
+    conferencingProcessStates().first { $0.matched != nil }?.label
 }
 
 // Camera-in-use check via AVCaptureDevice. Returns true if *any* video
@@ -540,13 +547,16 @@ func cameraInUseElsewhere() -> Bool {
 // the whole recording, so the signal is only meaningful when we are
 // NOT recording (suppressed via the capture pid file, same convention
 // the launcher uses).
-func micInUseElsewhere() -> Bool {
+func meetinkCaptureRunning() -> Bool {
     if let pidStr = try? String(contentsOfFile: "/tmp/meetink-capture.pid",
                                 encoding: .utf8),
-       let p = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
-       kill(p, 0) == 0 {
-        return false
+       let p = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        return kill(p, 0) == 0
     }
+    return false
+}
+
+func micDeviceRunning() -> Bool {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDefaultInputDevice,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -646,22 +656,46 @@ func browserMeetingActive() -> String? {
 func cmdMeetingActive(args: [String]) -> Int32 {
     var sources: [String] = []
     var primary: String? = nil
+    // Debug transparency: every observation this function makes lands
+    // in `checks` AS IT IS MADE — the Activity page renders this array
+    // verbatim and knows nothing about individual signals, so a signal
+    // added here shows up there automatically. Never compute a check
+    // from separate logic: the row must be the same boolean the verdict
+    // used, or the debug view lies (the anti-regression contract).
+    var checks: [[String: Any]] = []
 
-    let mic = micInUseElsewhere()
+    let recording = meetinkCaptureRunning()
+    let micRaw = micDeviceRunning()
+    let mic = micRaw && !recording   // self-held while we record
     let camera: Bool = {
         if #available(macOS 14.0, *) { return cameraInUseElsewhere() }
         return false
     }()
-    let recording = {
-        if let pidStr = try? String(contentsOfFile: "/tmp/meetink-capture.pid",
-                                    encoding: .utf8),
-           let p = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            return kill(p, 0) == 0
-        }
-        return false
-    }()
 
-    if let p = runningConferencingApp() {
+    checks.append(["label": "mic in use",
+                   "state": mic,
+                   "detail": recording
+                       ? (micRaw ? "held by meetink capture — unknowable"
+                                 : "idle")
+                       : (micRaw ? "hot (some app is listening)" : "idle")])
+    checks.append(["label": "camera in use",
+                   "state": camera,
+                   "detail": camera ? "in use (built-in or external)"
+                                    : "idle"])
+
+    // Per-app call-process descriptions: which pattern class each group
+    // watches, so "Zoom open but no call" reads correctly (we watch
+    // Zoom's call-only CptHost, not the idling main app).
+    let procDesc: [String: String] = [
+        "zoom":  "Zoom in-call process (CptHost)",
+        "teams": "Teams app process",
+        "webex": "Webex process",
+        "meet":  "Google Meet app process",
+    ]
+    var firstProc: String? = nil
+    var procCounted = false
+    for (label, matched) in conferencingProcessStates() {
+        let isMatch = matched != nil
         // Idle-capable apps (their process runs OUTSIDE calls too: the
         // Meet PWA on its landing page, Teams in the tray) need mic or
         // camera corroboration — an open-but-idle app must not read as
@@ -669,11 +703,23 @@ func cmdMeetingActive(args: [String]) -> Int32 {
         // stand alone. While a recording runs the mic is self-held and
         // unknowable, so process presence suffices — never drop a
         // camera-off call mid-recording for lack of corroboration.
-        let idleCapable = (p == "meet" || p == "teams")
-        if !idleCapable || mic || camera || recording {
-            sources.append("process:\(p)")
-            primary = primary ?? p
+        let idleCapable = (label == "meet" || label == "teams")
+        let counted = isMatch && (!idleCapable || mic || camera || recording)
+        var detail = isMatch ? "running (\(matched!))" : "not running"
+        if isMatch && !counted {
+            detail += " — open but no mic/camera, NOT counted as a meeting"
         }
+        checks.append(["label": procDesc[label] ?? label,
+                       "state": counted,
+                       "detail": detail])
+        if counted && firstProc == nil {
+            firstProc = label
+            procCounted = true
+        }
+    }
+    if procCounted, let p = firstProc {
+        sources.append("process:\(p)")
+        primary = primary ?? p
     }
 
     if camera {
@@ -681,7 +727,12 @@ func cmdMeetingActive(args: [String]) -> Int32 {
         primary = primary ?? "video"
     }
 
-    if let b = browserMeetingActive() {
+    let tab = browserMeetingActive()
+    checks.append(["label": "browser meeting tab",
+                   "state": tab != nil,
+                   "detail": tab.map { "room URL open (\($0))" }
+                       ?? "no meeting-room tab"])
+    if let b = tab {
         sources.append("browser:\(b)")
         primary = primary ?? b
     }
@@ -694,10 +745,16 @@ func cmdMeetingActive(args: [String]) -> Int32 {
     }
 
     let active = !sources.isEmpty
+    checks.append(["label": "VERDICT: in a meeting",
+                   "state": active,
+                   "detail": active
+                       ? "source: \(primary ?? "?")  signals: \(sources.joined(separator: ", "))"
+                       : "no qualifying signals"])
     let out: [String: Any] = [
         "active":  active,
         "source":  primary ?? NSNull(),
         "signals": sources,
+        "checks":  checks,
     ]
     print(jsonString(out))
     return 0
