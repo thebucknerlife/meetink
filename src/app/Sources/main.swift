@@ -4954,7 +4954,9 @@ final class MeetingsTable: NSTableView {
         let r = row(at: p)
         let wasSingleSelection = r >= 0
             && selectedRowIndexes == IndexSet(integer: r)
-        let onName = column(at: p) == 0
+        // By identifier, not index 0 — column order is user-reorderable.
+        let c = column(at: p)
+        let onName = c >= 0 && tableColumns[c].identifier.rawValue == "name"
         super.mouseDown(with: event)
         guard wasSingleSelection, onName, event.clickCount == 1,
               selectedRowIndexes == IndexSet(integer: r) else { return }
@@ -4984,8 +4986,13 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     /// audio is currently playing (nil when paused/stopped).
     var playingProvider: (() -> String?)? = nil
     private var files: [(path: String, name: String, date: Date,
-                         status: MeetingStatus, duration: TimeInterval?)] = []
+                         status: MeetingStatus, duration: TimeInterval?,
+                         attendees: Int?, profiles: Int?)] = []
     private var durCache: [String: (mtime: Date, dur: TimeInterval?)] = [:]
+    /// Attendee/profile counts are keyed on BOTH mtimes: the txt grows
+    /// during a call, and meta.json gains the event record at link time.
+    private var countCache: [String: (txtMtime: Date, metaMtime: Date,
+                                      attendees: Int?, profiles: Int?)] = [:]
     private var sortKey = "date"
     private var sortAscending = false
     private var refreshTimer: Timer?
@@ -5004,12 +5011,20 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         let durCol = NSTableColumn(identifier: .init("duration"))
         durCol.title = "Length"
         durCol.width = 70
+        let attCol = NSTableColumn(identifier: .init("attendees"))
+        attCol.title = "Attendees #"
+        attCol.width = 85
+        let profCol = NSTableColumn(identifier: .init("profiles"))
+        profCol.title = "Profiles #"
+        profCol.width = 75
         let statusCol = NSTableColumn(identifier: .init("status"))
         statusCol.title = "Status"
         statusCol.width = 130
         table.addTableColumn(nameCol)
         table.addTableColumn(dateCol)
         table.addTableColumn(durCol)
+        table.addTableColumn(attCol)
+        table.addTableColumn(profCol)
         table.addTableColumn(statusCol)
         // Click a header to sort; date descending is the default.
         for col in table.tableColumns {
@@ -5017,6 +5032,10 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
                 key: col.identifier.rawValue,
                 ascending: col.identifier.rawValue == "name")
         }
+        // Drag-reordered/resized columns persist across relaunches.
+        // Set AFTER the columns exist so the saved layout can restore.
+        table.autosaveTableColumns = true
+        table.autosaveName = archiveMode ? "archiveColumns" : "meetingsColumns"
         table.sortDescriptors = [NSSortDescriptor(key: "date", ascending: false)]
         table.dataSource = self
         table.delegate = self
@@ -5137,7 +5156,9 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     private func beginInlineRename(row: Int) {
         guard row >= 0, row < files.count, inlineEditPath == nil else { return }
         let f = files[row]
-        guard let cell = table.view(atColumn: 0, row: row, makeIfNecessary: false)
+        let nameIdx = table.column(withIdentifier: .init("name"))
+        guard nameIdx >= 0,
+              let cell = table.view(atColumn: nameIdx, row: row, makeIfNecessary: false)
                 as? NSTableCellView,
               let tf = cell.textField else { return }
         inlineEditPath = f.path
@@ -5177,6 +5198,47 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     override func viewDidAppear() {
         super.viewDidAppear()
         refresh()
+    }
+
+    /// (attendees, profiles) for a meeting. Attendees: the linked event's
+    /// invite list (meta.json), else the transcript's '# attendees:'
+    /// header. Profiles: distinct speaker labels that name a person —
+    /// synthetic labels (ME, THEM, THEM-B clusters, SPEAKER N) and the
+    /// hidden non-participants (the Zoom announcer class) don't count.
+    /// profiles is nil when the transcript has no utterances yet.
+    private func meetingCounts(_ txtPath: String) -> (attendees: Int?, profiles: Int?) {
+        var attendees: Int? = nil
+        if let ev = meetingMeta(txtPath)["event"] as? [String: Any],
+           let list = ev["attendees"] as? [String], !list.isEmpty {
+            attendees = list.count
+        }
+        guard let text = try? String(contentsOfFile: txtPath, encoding: .utf8) else {
+            return (attendees, nil)
+        }
+        var labels = Set<String>()
+        for line in text.components(separatedBy: "\n") {
+            if attendees == nil, line.hasPrefix("# attendees:") {
+                let n = line.dropFirst("# attendees:".count)
+                    .components(separatedBy: ",")
+                    .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                    .count
+                if n > 0 { attendees = n }
+                continue
+            }
+            guard line.hasPrefix("[") else { continue }
+            let ns = line as NSString
+            if let m = lineRegex.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) {
+                labels.insert(ns.substring(with: m.range(at: 2))
+                    .trimmingCharacters(in: .whitespaces).uppercased())
+            }
+        }
+        guard !labels.isEmpty else { return (attendees, nil) }
+        let hidden = hiddenSpeakerNames()
+        let profiles = labels.filter {
+            $0 != "ME" && $0 != "THEM" && !$0.hasPrefix("THEM-")
+                && !$0.hasPrefix("SPEAKER ") && !hidden.contains($0)
+        }.count
+        return (attendees, profiles)
     }
 
     func refresh() {
@@ -5223,7 +5285,8 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         let processing = postprocPath()
         let playing = playingProvider?()
         let fm2 = FileManager.default
-        var stamped: [(String, String, Date, MeetingStatus, TimeInterval?)] = out.map {
+        var stamped: [(String, String, Date, MeetingStatus, TimeInterval?,
+                       Int?, Int?)] = out.map {
             let st: MeetingStatus = (recording && $0.0 == liveTarget) ? .live
                 : ($0.0 == processing ? .processing
                    : ($0.0 == playing ? .playing : .ended))
@@ -5238,15 +5301,33 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
                 dur = meetingDuration($0.0, isLive: st == .live)
                 if st != .live { durCache[$0.0] = (mtime, dur) }
             }
-            return ($0.0, $0.1, $0.2, st, dur)
+            // Attendee/profile counts, same caching discipline.
+            var att: Int? = nil
+            var prof: Int? = nil
+            let metaPath = meetingMetaPath($0.0)
+            let metaMtime = ((try? fm2.attributesOfItem(atPath: metaPath))?[.modificationDate]
+                             as? Date) ?? .distantPast
+            if st != .live, let hit = countCache[$0.0],
+               hit.txtMtime == mtime, hit.metaMtime == metaMtime {
+                att = hit.attendees
+                prof = hit.profiles
+            } else {
+                (att, prof) = meetingCounts($0.0)
+                if st != .live {
+                    countCache[$0.0] = (mtime, metaMtime, att, prof)
+                }
+            }
+            return ($0.0, $0.1, $0.2, st, dur, att, prof)
         }
         stamped.sort { a, b in
             let r: Bool
             switch sortKey {
-            case "name":     r = a.1.localizedCaseInsensitiveCompare(b.1) == .orderedAscending
-            case "duration": r = (a.4 ?? -1) < (b.4 ?? -1)
-            case "status":   r = "\(a.3)" < "\(b.3)"
-            default:         r = a.2 < b.2
+            case "name":      r = a.1.localizedCaseInsensitiveCompare(b.1) == .orderedAscending
+            case "duration":  r = (a.4 ?? -1) < (b.4 ?? -1)
+            case "status":    r = "\(a.3)" < "\(b.3)"
+            case "attendees": r = (a.5 ?? -1) < (b.5 ?? -1)
+            case "profiles":  r = (a.6 ?? -1) < (b.6 ?? -1)
+            default:          r = a.2 < b.2
             }
             return sortAscending ? r : !r
         }
@@ -5259,7 +5340,10 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
             || stamped.map(\.1) != files.map(\.name)
             || stamped.map(\.3) != files.map(\.status)
             || stamped.map { Int(($0.4 ?? 0) / 60) } != files.map { Int(($0.duration ?? 0) / 60) }
-        files = stamped.map { (path: $0.0, name: $0.1, date: $0.2, status: $0.3, duration: $0.4) }
+            || stamped.map(\.5) != files.map(\.attendees)
+            || stamped.map(\.6) != files.map(\.profiles)
+        files = stamped.map { (path: $0.0, name: $0.1, date: $0.2, status: $0.3,
+                               duration: $0.4, attendees: $0.5, profiles: $0.6) }
         if changed { table.reloadData() }
     }
 
@@ -5288,6 +5372,10 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
             text = formatMeetingDate(files[row].date)
         } else if id == "duration" {
             text = files[row].duration.map(formatDuration) ?? "—"
+        } else if id == "attendees" {
+            text = files[row].attendees.map(String.init) ?? "—"
+        } else if id == "profiles" {
+            text = files[row].profiles.map(String.init) ?? "—"
         } else if id == "status" {
             switch files[row].status {
             case .live:       text = "● live"
@@ -5316,7 +5404,7 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
             ])
         }
         cell.textField?.stringValue = text
-        if id == "date" || id == "duration" {
+        if id == "date" || id == "duration" || id == "attendees" || id == "profiles" {
             cell.textField?.textColor = .secondaryLabelColor
             cell.textField?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         } else if id == "status" {
