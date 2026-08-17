@@ -1102,10 +1102,15 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
     }
 
     /// The dropdown's universe: every enrolled profile EXCEPT the ones
-    /// already listed as rows above (they'd be duplicates).
+    /// already listed as rows above (they'd be duplicates) and the
+    /// hidden non-participants (nobody reassigns a segment to the Zoom
+    /// announcer; typing the exact name still works).
     private func availableProfiles() -> [String] {
         let taken = Set(inMeeting.map { $0.lowercased() })
-        return enrolledProfiles().filter { !taken.contains($0.lowercased()) }
+        let hidden = hiddenSpeakerNames()
+        return enrolledProfiles().filter {
+            !taken.contains($0.lowercased()) && !hidden.contains($0.uppercased())
+        }
     }
 
     private func select(_ i: Int) {
@@ -1579,6 +1584,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             let w = min(400, max(120, c.constant - dx))
             c.constant = w
             UserDefaults.standard.set(Double(w), forKey: "speakersPanelWidth")
+            // Wrapped speaker rows re-measure against the new width.
+            self.speakersTable.noteHeightOfRows(withIndexesChanged:
+                IndexSet(integersIn: 0..<self.speakersTable.numberOfRows))
         }
 
         let scroll = NSScrollView()
@@ -3967,16 +3975,29 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// transcript's "# attendees:" header.
     private func meetingAttendees() -> [String] {
         guard !lastResolvedPath.isEmpty else { return [] }
+        // Attendees sometimes arrive as "Name <email>" — reduce to the
+        // bare address or the emails.json link lookup misses and a
+        // linked (possibly hidden) profile renders as an unlinked email.
+        func norm(_ s: String) -> String {
+            let t = s.trimmingCharacters(in: .whitespaces).lowercased()
+            if let l = t.firstIndex(of: "<"), let r = t.lastIndex(of: ">"),
+               l < r {
+                let inner = String(t[t.index(after: l)..<r])
+                    .trimmingCharacters(in: .whitespaces)
+                if inner.contains("@") { return inner }
+            }
+            return t
+        }
         if let ev = meetingMeta(lastResolvedPath)["event"] as? [String: Any],
            let list = ev["attendees"] as? [String] {
-            let emails = list.filter { $0.contains("@") }.map { $0.lowercased() }
+            let emails = list.map(norm).filter { $0.contains("@") }
             if !emails.isEmpty { return emails }
         }
         for line in rawText.components(separatedBy: "\n")
         where line.hasPrefix("# attendees:") {
             return line.dropFirst("# attendees:".count)
                 .components(separatedBy: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+                .map(norm)
                 .filter { $0.contains("@") }
         }
         return []
@@ -3987,9 +4008,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     private func inviteAssignEntries(excluding present: [String]) -> [String] {
         let map = profileEmailMap()
         let low = Set(present.map { $0.lowercased() })
+        let hidden = hiddenSpeakerNames()
         var out: [String] = []
         for email in meetingAttendees() {
+            guard !hidden.contains(email.uppercased()) else { continue }
             if let name = map[email] {
+                if hidden.contains(name.uppercased()) { continue }
                 if !low.contains(name.lowercased())
                     && !low.contains(name.uppercased().lowercased()) {
                     out.append(name)
@@ -4067,10 +4091,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             let map = profileEmailMap()
             // Attendees whose linked profile is HIDDEN (the Zoom
             // announcer class) stay out of the list too — same rule as
-            // the speaker rows above.
+            // the speaker rows above. The email itself also counts: a
+            // profile NAMED by its email (assign-to-invitee) lands in
+            // hidden_speakers under that email form.
             let entries = attendees.map { (email: $0, profile: map[$0]) }
                 .filter { e in
-                    e.profile.map { !hiddenNames.contains($0.uppercased()) } ?? true
+                    guard !hiddenNames.contains(e.email.uppercased()) else { return false }
+                    return e.profile.map { !hiddenNames.contains($0.uppercased()) } ?? true
                 }
             let unassigned = entries.filter { $0.profile == nil }
             guard !entries.isEmpty else { panelRows = rows
@@ -4646,6 +4673,9 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         guard row < panelRows.count else { return cell }
         // Cells are reused across row types — reset what other types set.
         nameField.lineBreakMode = .byTruncatingTail
+        nameField.maximumNumberOfLines = 1
+        nameField.cell?.wraps = false
+        nameField.cell?.usesSingleLineMode = true
         nameField.font = NSFont.boldSystemFont(ofSize: 12)
         cell.layer?.backgroundColor = NSColor.clear.cgColor
         switch panelRows[row] {
@@ -4691,6 +4721,13 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             cell.subviews.suffix(2).forEach { $0.isHidden = true }
         case .speaker(let name, let fraction, let hidden, let hint):
             let display = displaySpeakerName(name)
+            // Long names / "sounds like…?" hints wrap; heightOfRow sizes
+            // the row to match (field case: wrapped text, 26 pt row).
+            nameField.lineBreakMode = .byWordWrapping
+            nameField.maximumNumberOfLines = 0
+            nameField.cell?.wraps = true
+            nameField.cell?.usesSingleLineMode = false
+            nameField.preferredMaxLayoutWidth = speakerNameWidth()
             if let hint {
                 let attr = NSMutableAttributedString(
                     string: display,
@@ -4717,6 +4754,32 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             cell.subviews.suffix(2).forEach { $0.isHidden = false }
         }
         return cell
+    }
+
+    /// Width the sidebar name label actually gets: panel width minus the
+    /// leading inset (12), % column (34), the two 18 pt buttons, their
+    /// 2 pt gaps, the 8 pt trailing inset and the 6 pt minimum gap.
+    private func speakerNameWidth() -> CGFloat {
+        max(40, speakersTable.bounds.width - 100)
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard tableView == speakersTable, row < panelRows.count,
+              case .speaker(let name, _, _, let hint) = panelRows[row]
+        else { return 26 }
+        // Mirror the cell's attributed string so measurement matches.
+        let attr = NSMutableAttributedString(
+            string: displaySpeakerName(name),
+            attributes: [.font: NSFont.boldSystemFont(ofSize: 12)])
+        if let hint {
+            attr.append(NSAttributedString(
+                string: "  \(hint)",
+                attributes: [.font: NSFont.systemFont(ofSize: 10)]))
+        }
+        let bounds = attr.boundingRect(
+            with: NSSize(width: speakerNameWidth(), height: 10_000),
+            options: [.usesLineFragmentOrigin, .usesFontLeading])
+        return max(26, ceil(bounds.height) + 10)
     }
 
     /// Block timestamp as displayed: the wall-clock "HH:mm:ss" from the
@@ -5910,6 +5973,8 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
     private let emailsLabel = NSTextField(wrappingLabelWithString: "")
     private let addEmailBtn = NSButton(title: "Add Email…", target: nil, action: nil)
     private let removeEmailBtn = NSButton(title: "Remove Email…", target: nil, action: nil)
+    /// Headline over the details pane: which profile is selected.
+    private let detailName = NSTextField(labelWithString: "")
 
     override func loadView() {
         let root = NSView()
@@ -5985,9 +6050,12 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         emailsLabel.setContentHuggingPriority(NSLayoutConstraint.Priority(1),
                                               for: .horizontal)
         emailsRow.isHidden = true
+        detailName.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        detailName.lineBreakMode = .byTruncatingTail
+        detailName.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(scroll); root.addSubview(meetScroll)
         root.addSubview(hiddenBox); root.addSubview(emailsRow)
-        root.addSubview(detail)
+        root.addSubview(detail); root.addSubview(detailName)
         NSLayoutConstraint.activate([
             emailsRow.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
             emailsRow.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -12),
@@ -5996,7 +6064,10 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             scroll.heightAnchor.constraint(equalTo: root.heightAnchor, multiplier: 0.55),
-            meetScroll.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
+            detailName.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 8),
+            detailName.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            detailName.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -12),
+            meetScroll.topAnchor.constraint(equalTo: detailName.bottomAnchor, constant: 6),
             meetScroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             meetScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             meetScroll.bottomAnchor.constraint(equalTo: hiddenBox.topAnchor, constant: -8),
@@ -6049,8 +6120,12 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
             }
             DispatchQueue.main.async {
                 guard let self else { return }
-                let changed = out.map { "\($0.name)|\($0.samples)|\($0.samplesUpdated)" }
-                    != self.profiles.map { "\($0.name)|\($0.samples)|\($0.samplesUpdated)" }
+                // Order-insensitive compare: `out` is server order but
+                // self.profiles is SORTED, so a naive == was true every
+                // 3 s tick — reloadData wiped the selection while the
+                // user looked at a profile.
+                let key = { (p: ProfileRow) in "\(p.name)|\(p.samples)|\(p.samplesUpdated)" }
+                let changed = out.map(key).sorted() != self.profiles.map(key).sorted()
                 guard changed else { return }
                 self.profiles = out
                 self.applySort()
@@ -6077,6 +6152,14 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
             return asc ? r : !r
         }
         table.reloadData()
+        // reloadData drops the selection — restore it so the row stays
+        // highlighted in step with the details pane below.
+        if let canon = selectedCanonical,
+           let idx = profiles.firstIndex(where: { $0.name == canon }),
+           table.selectedRow != idx {
+            table.selectRowIndexes(IndexSet(integer: idx),
+                                   byExtendingSelection: false)
+        }
     }
 
     func tableView(_ tableView: NSTableView,
@@ -6135,6 +6218,7 @@ final class ProfilesViewController: NSViewController, NSTableViewDataSource, NST
         let name = profiles[row].name.uppercased()
         selectedProfile = name
         selectedCanonical = profiles[row].name
+        detailName.stringValue = profiles[row].name
         hiddenBox.isHidden = false
         hiddenBox.state = hiddenSpeakerNames().contains(name) ? .on : .off
         refreshEmailsRow()
