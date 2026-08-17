@@ -266,27 +266,39 @@ def _agent_meeting_active() -> dict:
 
 
 def _agent_notify(title: str, body: str, actions: list[str],
-                  default: str, timeout: int, linger: int = 0) -> str:
+                  default: str, timeout: int, linger: int = 0,
+                  group: str = "") -> str:
     """Blocking call. Caller usually runs this on a dedicated worker
     thread because the agent waits up to `timeout` seconds for a click.
-    Concurrent calls are fine — simultaneous events stack their banners
-    on screen (each agent process owns its own notification)."""
+    Concurrent calls are fine — simultaneous DISTINCT events stack their
+    banners on screen (each agent process owns its own notification).
+    `group` names the logical notification: same-group posts replace
+    each other on screen instead of stacking, so callers that might
+    announce the same thing twice can never show duplicates."""
     if not MK_AGENT.is_file():
         return default
     try:
+        cmd = [str(MK_AGENT), "notify",
+               "--title", title,
+               "--body", body,
+               "--actions", ",".join(actions),
+               "--default", default,
+               "--timeout", str(timeout),
+               "--linger", str(linger)]
+        if group:
+            cmd += ["--group", group]
         proc = subprocess.run(
-            [str(MK_AGENT), "notify",
-             "--title", title,
-             "--body", body,
-             "--actions", ",".join(actions),
-             "--default", default,
-             "--timeout", str(timeout),
-             "--linger", str(linger)],
-            capture_output=True, text=True, timeout=timeout + 15,
+            cmd, capture_output=True, text=True, timeout=timeout + 15,
         )
         return proc.stdout.strip() or default
     except Exception:
         return default
+
+
+def _event_group(kind: str, e) -> str:
+    """Stable per-(kind, event) notification identity — the same event
+    arriving twice (two calendars) or asked twice collapses on screen."""
+    return f"{kind}:{e.title.strip()}:{e.start.isoformat()[:16]}"
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +862,32 @@ class WatchManager:
                     EventStatus.DEFERRED,
                 ):
                     del self._events[eid]
+            # The same event on two calendars (a company-wide invite on a
+            # shared calendar + the user's copy) arrives as two EventKit
+            # ids — two entries that each fire their own notifications
+            # (field case: four lunch banners = 2 conflict prompts × 2
+            # linger re-posts). Collapse to one per (title, start, end);
+            # keep the most-advanced copy so acted-on status and the
+            # one-shot ask-guards survive, OR-merging the guards.
+            rank = {EventStatus.PENDING: 0, EventStatus.NOTIFIED: 1}
+            by_key: dict = {}
+            for eid, e in sorted(self._events.items()):
+                if e.detected_source is not None:
+                    continue  # synthetic instant events never dedup
+                key = (e.title.strip(), e.start.isoformat()[:16],
+                       e.end.isoformat()[:16])
+                kept = by_key.get(key)
+                if kept is None:
+                    by_key[key] = e
+                    continue
+                loser, winner = ((kept, e) if rank.get(e.status, 2)
+                                 > rank.get(kept.status, 2) else (e, kept))
+                winner.fallback_asked |= loser.fallback_asked
+                winner.conflict_asked |= loser.conflict_asked
+                by_key[key] = winner
+                _wlog(f"'{winner.title}': duplicate calendar copy dropped "
+                      f"({loser.calendar_title or loser.id})")
+                del self._events[loser.id]
 
     # -- notification ------------------------------------------------------
 
@@ -899,6 +937,7 @@ class WatchManager:
                 # Hold the warning on screen — one banner-flash is easy
                 # to miss and Skip is only clickable while it's visible.
                 linger=30,
+                group=_event_group("warn", ev),
             )
             if response.strip().lower() == "skip":
                 with self._lock:
@@ -1026,6 +1065,7 @@ class WatchManager:
                 default="Skip",
                 timeout=600,
                 linger=20,
+                group=_event_group("fallback", ev),
             )
             if "start" not in (response or "").lower():
                 _wlog(f"fallback declined/ignored for '{ev.title}'")
@@ -1098,6 +1138,7 @@ class WatchManager:
                         actions=["Switch", "Keep recording"],
                         default="Keep recording",
                         timeout=120, linger=15,
+                        group=f"foreign:{new_src}",
                     )
                     if "switch" not in (response or "").lower():
                         _wlog(f"foreign source '{new_src}' during '{old_src}' "
@@ -1291,6 +1332,7 @@ class WatchManager:
                         title="Switched recording",
                         body=f"“{ev.title}” — previous meeting ended.",
                         actions=["OK"], default="OK", timeout=1, linger=0,
+                        group=_event_group("switched", ev),
                     )
                 threading.Thread(target=switch_worker, daemon=True).start()
                 return
@@ -1306,6 +1348,7 @@ class WatchManager:
                 default="Keep current",
                 timeout=240,
                 linger=30,
+                group=_event_group("conflict", ev),
             )
             if "switch" not in (response or "").lower():
                 _wlog(f"conflict: keeping current over '{ev.title}'")
@@ -1414,6 +1457,7 @@ class WatchManager:
             title="Recording stopped",
             body="The meeting app closed — auto mode stopped the recording.",
             actions=["OK"], default="OK", timeout=1, linger=0,
+            group="stopped",
         )
         _stop_recording_subprocess()
 
@@ -1430,6 +1474,7 @@ class WatchManager:
             default="(timeout)",
             timeout=300,
             linger=25,
+            group=f"nudge:{pid}",
         )
         low = (response or "").lower()
         if "stop" in low:
@@ -1463,6 +1508,7 @@ class WatchManager:
                     body="The meeting ended and nothing was said for 5 "
                          "minutes.",
                     actions=["OK"], default="OK", timeout=1, linger=0,
+                    group="stopped",
                 )
                 if _capture_pid() == pid:
                     _stop_recording_subprocess()
@@ -1560,6 +1606,7 @@ class WatchManager:
                             default="Skip",
                             timeout=600,
                             linger=15,
+                            group=_event_group("confirm", ev),
                         )
                         if "start" not in (response or "").lower():
                             with self._lock:
@@ -1615,6 +1662,7 @@ class WatchManager:
                     default="Skip",
                     timeout=600,
                     linger=15,
+                    group=f"instant:{source}",
                 )
                 if "start" not in (response or "").lower():
                     response = "skip"
@@ -1625,6 +1673,7 @@ class WatchManager:
                     actions=["Skip"],
                     default="Continue",
                     timeout=NOTIFY_TIMEOUT_S,
+                    group=f"instant:{source}",
                 )
             if response.strip().lower() == "skip":
                 with self._lock:

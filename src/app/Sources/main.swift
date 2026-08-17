@@ -8133,15 +8133,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// timeout / missing agent.
     private func agentNotify(title: String, body: String, actions: [String],
                              defaultAction: String, timeout: Int,
-                             linger: Int) -> String {
+                             linger: Int, group: String = "") -> String {
         guard let agent = agentPathIfPresent() else { return defaultAction }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: agent)
-        proc.arguments = ["notify", "--title", title, "--body", body,
-                          "--actions", actions.joined(separator: ","),
-                          "--default", defaultAction,
-                          "--timeout", String(timeout),
-                          "--linger", String(linger)]
+        var args = ["notify", "--title", title, "--body", body,
+                    "--actions", actions.joined(separator: ","),
+                    "--default", defaultAction,
+                    "--timeout", String(timeout),
+                    "--linger", String(linger)]
+        if !group.isEmpty { args += ["--group", group] }
+        proc.arguments = args
         let pipe = Pipe()
         proc.standardOutput = pipe
         do { try proc.run() } catch { return defaultAction }
@@ -8202,7 +8204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     body: "\(mins) minutes of silence on both streams.",
                     actions: ["Stop recording", "Keep recording"],
                     defaultAction: "Keep recording",
-                    timeout: 240, linger: 25)
+                    timeout: 240, linger: 25, group: "guard:silence")
                 DispatchQueue.main.async {
                     self.silenceNotifyInFlight = false
                     if response.lowercased().contains("stop") {
@@ -8228,7 +8230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 body: "Long recordings are usually forgotten ones — still going?",
                 actions: ["Stop recording", "Keep recording"],
                 defaultAction: "Keep recording",
-                timeout: 240, linger: 25)
+                timeout: 240, linger: 25, group: "guard:backstop")
             DispatchQueue.main.async {
                 self.backstopHoursFired = stage + 1
                 self.backstopInFlight = false

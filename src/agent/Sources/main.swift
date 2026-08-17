@@ -274,6 +274,7 @@ func cmdNotify(args: [String]) -> Int32 {
     var timeoutSecs: Double = 60.0
     var lingerSecs: Double = 0
     var defaultAction = ""
+    var group = ""
 
     var i = 0
     while i < args.count {
@@ -298,6 +299,8 @@ func cmdNotify(args: [String]) -> Int32 {
             } else { i += 1 }
         case "--default":
             if i + 1 < args.count { defaultAction = args[i + 1]; i += 2 } else { i += 1 }
+        case "--group":
+            if i + 1 < args.count { group = args[i + 1]; i += 2 } else { i += 1 }
         default:
             i += 1
         }
@@ -368,7 +371,11 @@ func cmdNotify(args: [String]) -> Int32 {
     }
     styleSem.wait()
 
-    let identifier = UUID().uuidString
+    // --group: a stable identity for the logical notification. UN
+    // replaces a delivered notification that shares an identifier, so
+    // two callers announcing the same thing (or a repost racing a
+    // still-visible banner) can never stack duplicates on screen.
+    let identifier = group.isEmpty ? UUID().uuidString : "mk-group-\(group)"
     let request = UNNotificationRequest(
         identifier: identifier,
         content: content,
@@ -411,19 +418,18 @@ func cmdNotify(args: [String]) -> Int32 {
     // Center, buttons still live until --timeout.
     let deadline = Date().addingTimeInterval(timeoutSecs)
     let lingerEnd = Date().addingTimeInterval(lingerSecs)
-    var currentId = identifier
     var reposts = 0
     var nextRepost = Date().addingTimeInterval(18.0)
     while delegate.clicked == nil && Date() < deadline {
         RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
         // Banner-style linger: a GENTLE re-post (every ~20 s, capped) —
         // the old 6 s remove-then-add cycle strobed ("popping up,
-        // dismissing, popping up again"). New banner posts BEFORE the
-        // old one is removed so there is never a visible gap.
+        // dismissing, popping up again"). Reusing the SAME identifier
+        // makes UN replace the previous copy in place: no remove/add
+        // gap, and a repost racing a still-visible banner can't stack.
         if !styleIsAlert, lingerSecs > 0, reposts < 4,
            delegate.clicked == nil,
            Date() >= nextRepost, Date() < lingerEnd {
-            let previousId = currentId
             let repost = UNMutableNotificationContent()
             repost.title = title
             repost.body = body
@@ -432,20 +438,25 @@ func cmdNotify(args: [String]) -> Int32 {
             if #available(macOS 12.0, *) {
                 repost.interruptionLevel = .timeSensitive
             }
-            currentId = UUID().uuidString
             center.add(UNNotificationRequest(
-                identifier: currentId, content: repost, trigger: nil
-            )) { _ in
-                center.removeDeliveredNotifications(withIdentifiers: [previousId])
-            }
+                identifier: identifier, content: repost, trigger: nil
+            ))
             reposts += 1
             nextRepost = Date().addingTimeInterval(18.0 + Double.random(in: 0...4))
         }
     }
 
-    // Best-effort cleanup so dismissed notifications don't linger.
-    center.removeDeliveredNotifications(withIdentifiers: [currentId])
-    center.removePendingNotificationRequests(withIdentifiers: [currentId])
+    // Cleanup policy: a prompt whose buttons just died with this
+    // process (anything offering a real choice — Skip, Switch, Start)
+    // must not sit in Notification Center looking clickable — remove
+    // it. An OK-only informational notice ("Recording stopped",
+    // timeout 1 s) is the opposite: removing it here yanked the banner
+    // off screen almost immediately, so let it live out its natural
+    // banner life and rest in Notification Center.
+    if actions.contains(where: { $0.lowercased() != "ok" }) || delegate.clicked != nil {
+        center.removeDeliveredNotifications(withIdentifiers: [identifier])
+        center.removePendingNotificationRequests(withIdentifiers: [identifier])
+    }
 
     print(delegate.clicked ?? defaultAction)
     return 0
