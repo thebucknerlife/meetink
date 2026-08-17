@@ -1102,15 +1102,12 @@ final class AssignPopoverVC: NSViewController, NSComboBoxDelegate {
     }
 
     /// The dropdown's universe: every enrolled profile EXCEPT the ones
-    /// already listed as rows above (they'd be duplicates) and the
-    /// hidden non-participants (nobody reassigns a segment to the Zoom
-    /// announcer; typing the exact name still works).
+    /// already listed as rows above (they'd be duplicates). Hidden
+    /// profiles stay listed here — the dropdown is the full roster;
+    /// only the SUGGESTION rows (in-meeting + invite) omit them.
     private func availableProfiles() -> [String] {
         let taken = Set(inMeeting.map { $0.lowercased() })
-        let hidden = hiddenSpeakerNames()
-        return enrolledProfiles().filter {
-            !taken.contains($0.lowercased()) && !hidden.contains($0.uppercased())
-        }
+        return enrolledProfiles().filter { !taken.contains($0.lowercased()) }
     }
 
     private func select(_ i: Int) {
