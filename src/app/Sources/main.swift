@@ -5029,9 +5029,13 @@ final class MeetingsTable: NSTableView {
     }
 }
 
+/// Clip view that pins its document to the TOP (NSClipView default is
+/// bottom-up) — used by popover checklists.
+final class FlippedClipView: NSClipView { override var isFlipped: Bool { true } }
+
 final class MeetingsViewController: NSViewController, NSTableViewDataSource,
                                     NSTableViewDelegate, NSMenuDelegate,
-                                    NSTextFieldDelegate {
+                                    NSSearchFieldDelegate {
     private let table = MeetingsTable()
     /// Directory this list shows — the transcripts root by default; the
     /// Archive page points it at _archive/. archiveMode flips the
@@ -5051,8 +5055,19 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     private var durCache: [String: (mtime: Date, dur: TimeInterval?)] = [:]
     /// Attendee/profile counts are keyed on BOTH mtimes: the txt grows
     /// during a call, and meta.json gains the event record at link time.
+    /// `names` is the meeting's named-speaker label set (uppercased,
+    /// hidden ones INCLUDED) — the profile filter matches against it.
     private var countCache: [String: (txtMtime: Date, metaMtime: Date,
-                                      attendees: Int?, profiles: Int?)] = [:]
+                                      attendees: Int?, profiles: Int?,
+                                      names: Set<String>)] = [:]
+    // Search + profile filter (the bar above the header).
+    private let searchField = NSSearchField()
+    private let profilesButton = NSButton(title: "Profiles ▾", target: nil, action: nil)
+    private var searchQuery = ""
+    private var selectedProfiles: Set<String> = []          // UPPERCASED labels
+    private var knownProfileNames: Set<String> = []          // union over all meetings
+    private var profilesPopover: NSPopover?
+    private var popoverChecks: [NSButton] = []
     private var sortKey = "date"
     private var sortAscending = false
     private var refreshTimer: Timer?
@@ -5128,7 +5143,184 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         menu.delegate = self
         table.menu = menu
         scroll.documentView = table
-        self.view = scroll
+
+        // Filter bar above the header: name search + profile multi-select.
+        searchField.placeholderString = "Search meetings"
+        searchField.sendsSearchStringImmediately = true
+        searchField.sendsWholeSearchString = false
+        searchField.target = self
+        searchField.action = #selector(searchChanged)
+        searchField.delegate = self
+        searchField.alphaValue = 0.6            // muted until focused/dirty
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        profilesButton.bezelStyle = .rounded
+        profilesButton.controlSize = .small
+        profilesButton.font = NSFont.systemFont(ofSize: 11)
+        profilesButton.target = self
+        profilesButton.action = #selector(profilesClicked)
+        profilesButton.translatesAutoresizingMaskIntoConstraints = false
+        let bar = NSView()
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(searchField)
+        bar.addSubview(profilesButton)
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let root = NSView()
+        root.addSubview(bar)
+        root.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            bar.topAnchor.constraint(equalTo: root.topAnchor),
+            bar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            bar.heightAnchor.constraint(equalToConstant: 34),
+            searchField.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 8),
+            searchField.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            searchField.widthAnchor.constraint(equalToConstant: 220),
+            profilesButton.leadingAnchor.constraint(equalTo: searchField.trailingAnchor, constant: 8),
+            profilesButton.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            profilesButton.trailingAnchor.constraint(lessThanOrEqualTo: bar.trailingAnchor, constant: -8),
+            scroll.topAnchor.constraint(equalTo: bar.bottomAnchor),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+        ])
+        self.view = root
+    }
+
+    // MARK: search + profile filter
+
+    @objc private func searchChanged() {
+        searchQuery = searchField.stringValue
+        updateSearchAppearance()
+        refresh()
+    }
+
+    private func updateSearchAppearance(editing: Bool = false) {
+        searchField.alphaValue =
+            (editing || !searchField.stringValue.isEmpty) ? 1.0 : 0.6
+    }
+
+    /// Word-prefix match: every query token must start SOME word of the
+    /// name, case-insensitively — "raf" finds "Coffee with Rafael".
+    private func matchesQuery(_ name: String, _ query: String) -> Bool {
+        let words = name.lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        for tok in query.lowercased()
+            .split(whereSeparator: { $0.isWhitespace }) {
+            guard words.contains(where: { $0.hasPrefix(tok) }) else { return false }
+        }
+        return true
+    }
+
+    private func updateProfilesButton() {
+        if selectedProfiles.isEmpty {
+            profilesButton.attributedTitle = NSAttributedString(
+                string: "Profiles ▾",
+                attributes: [.font: NSFont.systemFont(ofSize: 11)])
+        } else {
+            let names = selectedProfiles.sorted().map(displaySpeakerName)
+            let label = names.count <= 2
+                ? names.joined(separator: ", ")
+                : "\(names[0]) +\(names.count - 1)"
+            profilesButton.attributedTitle = NSAttributedString(
+                string: "Profiles: \(label) ▾",
+                attributes: [.font: NSFont.boldSystemFont(ofSize: 11),
+                             .foregroundColor: NSColor.controlAccentColor])
+        }
+    }
+
+    @objc private func profilesClicked() {
+        if let p = profilesPopover, p.isShown { p.close(); profilesPopover = nil; return }
+        let content = NSView()
+        let filter = NSSearchField()
+        filter.placeholderString = "Filter profiles"
+        filter.controlSize = .small
+        filter.sendsSearchStringImmediately = true
+        filter.sendsWholeSearchString = false
+        filter.target = self
+        filter.action = #selector(popoverFilterChanged(_:))
+        filter.translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        popoverChecks = []
+        let sorted = knownProfileNames.sorted {
+            displaySpeakerName($0).localizedCaseInsensitiveCompare(
+                displaySpeakerName($1)) == .orderedAscending
+        }
+        for label in sorted {
+            let cb = NSButton(checkboxWithTitle: displaySpeakerName(label),
+                              target: self, action: #selector(profileCheckToggled(_:)))
+            cb.font = NSFont.systemFont(ofSize: 12)
+            cb.state = selectedProfiles.contains(label) ? .on : .off
+            cb.identifier = NSUserInterfaceItemIdentifier(label)
+            popoverChecks.append(cb)
+            stack.addArrangedSubview(cb)
+        }
+        let listScroll = NSScrollView()
+        listScroll.hasVerticalScroller = true
+        listScroll.drawsBackground = false
+        listScroll.translatesAutoresizingMaskIntoConstraints = false
+        let flipped = FlippedClipView()
+        listScroll.contentView = flipped
+        listScroll.documentView = stack
+        let clear = NSButton(title: "Clear", target: self,
+                             action: #selector(profileFilterCleared))
+        clear.bezelStyle = .rounded
+        clear.controlSize = .small
+        clear.font = NSFont.systemFont(ofSize: 11)
+        clear.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(filter); content.addSubview(listScroll)
+        content.addSubview(clear)
+        NSLayoutConstraint.activate([
+            content.widthAnchor.constraint(equalToConstant: 240),
+            filter.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
+            filter.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            filter.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            listScroll.topAnchor.constraint(equalTo: filter.bottomAnchor, constant: 8),
+            listScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            listScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            listScroll.heightAnchor.constraint(equalToConstant:
+                min(260, max(60, CGFloat(sorted.count) * 22))),
+            stack.leadingAnchor.constraint(equalTo: flipped.leadingAnchor),
+            stack.topAnchor.constraint(equalTo: flipped.topAnchor),
+            stack.widthAnchor.constraint(equalTo: flipped.widthAnchor),
+            clear.topAnchor.constraint(equalTo: listScroll.bottomAnchor, constant: 8),
+            clear.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            clear.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10),
+        ])
+        let vc = NSViewController()
+        vc.view = content
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.contentViewController = vc
+        profilesPopover = pop
+        pop.show(relativeTo: profilesButton.bounds, of: profilesButton,
+                 preferredEdge: .maxY)
+    }
+
+    @objc private func popoverFilterChanged(_ sender: NSSearchField) {
+        let q = sender.stringValue
+        for cb in popoverChecks {
+            cb.isHidden = !q.isEmpty && !matchesQuery(cb.title, q)
+        }
+    }
+
+    @objc private func profileCheckToggled(_ sender: NSButton) {
+        guard let label = sender.identifier?.rawValue else { return }
+        if sender.state == .on { selectedProfiles.insert(label) }
+        else { selectedProfiles.remove(label) }
+        updateProfilesButton()
+        refresh()
+    }
+
+    @objc private func profileFilterCleared() {
+        selectedProfiles.removeAll()
+        for cb in popoverChecks { cb.state = .off }
+        updateProfilesButton()
+        refresh()
     }
 
     private func clickedFile() -> (path: String, name: String)? {
@@ -5240,7 +5432,17 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         tf.currentEditor()?.selectAll(nil)
     }
 
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        if (obj.object as? NSSearchField) == searchField {
+            updateSearchAppearance(editing: true)
+        }
+    }
+
     func controlTextDidEndEditing(_ obj: Notification) {
+        if (obj.object as? NSSearchField) == searchField {
+            updateSearchAppearance()
+            return
+        }
         guard let tf = obj.object as? NSTextField,
               let path = inlineEditPath else { return }
         tf.isEditable = false
@@ -5270,20 +5472,21 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         refresh()
     }
 
-    /// (attendees, profiles) for a meeting. Attendees: the linked event's
-    /// invite list (meta.json), else the transcript's '# attendees:'
-    /// header. Profiles: distinct speaker labels that name a person —
-    /// synthetic labels (ME, THEM, THEM-B clusters, SPEAKER N) and the
-    /// hidden non-participants (the Zoom announcer class) don't count.
-    /// profiles is nil when the transcript has no utterances yet.
-    private func meetingCounts(_ txtPath: String) -> (attendees: Int?, profiles: Int?) {
+    /// (attendees, profiles, names) for a meeting. Attendees: the linked
+    /// event's invite list (meta.json), else the transcript's
+    /// '# attendees:' header. `names` is every speaker label that names a
+    /// person — synthetic labels (ME, THEM, THEM-B clusters, SPEAKER N)
+    /// excluded, HIDDEN ones kept (the profile filter offers them).
+    /// `profiles` is the count minus hidden, nil with no utterances yet.
+    private func meetingCounts(_ txtPath: String)
+        -> (attendees: Int?, profiles: Int?, names: Set<String>) {
         var attendees: Int? = nil
         if let ev = meetingMeta(txtPath)["event"] as? [String: Any],
            let list = ev["attendees"] as? [String], !list.isEmpty {
             attendees = list.count
         }
         guard let text = try? String(contentsOfFile: txtPath, encoding: .utf8) else {
-            return (attendees, nil)
+            return (attendees, nil, [])
         }
         var labels = Set<String>()
         for line in text.components(separatedBy: "\n") {
@@ -5302,13 +5505,13 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
                     .trimmingCharacters(in: .whitespaces).uppercased())
             }
         }
-        guard !labels.isEmpty else { return (attendees, nil) }
-        let hidden = hiddenSpeakerNames()
-        let profiles = labels.filter {
+        guard !labels.isEmpty else { return (attendees, nil, []) }
+        let named = labels.filter {
             $0 != "ME" && $0 != "THEM" && !$0.hasPrefix("THEM-")
-                && !$0.hasPrefix("SPEAKER ") && !hidden.contains($0)
-        }.count
-        return (attendees, profiles)
+                && !$0.hasPrefix("SPEAKER ")
+        }
+        let hidden = hiddenSpeakerNames()
+        return (attendees, named.filter { !hidden.contains($0) }.count, named)
     }
 
     func refresh() {
@@ -5356,7 +5559,7 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         let playing = playingProvider?()
         let fm2 = FileManager.default
         var stamped: [(String, String, Date, MeetingStatus, TimeInterval?,
-                       Int?, Int?)] = out.map {
+                       Int?, Int?, Set<String>)] = out.map {
             let st: MeetingStatus = (recording && $0.0 == liveTarget) ? .live
                 : ($0.0 == processing ? .processing
                    : ($0.0 == playing ? .playing : .ended))
@@ -5374,6 +5577,7 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
             // Attendee/profile counts, same caching discipline.
             var att: Int? = nil
             var prof: Int? = nil
+            var names: Set<String> = []
             let metaPath = meetingMetaPath($0.0)
             let metaMtime = ((try? fm2.attributesOfItem(atPath: metaPath))?[.modificationDate]
                              as? Date) ?? .distantPast
@@ -5381,13 +5585,27 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
                hit.txtMtime == mtime, hit.metaMtime == metaMtime {
                 att = hit.attendees
                 prof = hit.profiles
+                names = hit.names
             } else {
-                (att, prof) = meetingCounts($0.0)
+                (att, prof, names) = meetingCounts($0.0)
                 if st != .live {
-                    countCache[$0.0] = (mtime, metaMtime, att, prof)
+                    countCache[$0.0] = (mtime, metaMtime, att, prof, names)
                 }
             }
-            return ($0.0, $0.1, $0.2, st, dur, att, prof)
+            return ($0.0, $0.1, $0.2, st, dur, att, prof, names)
+        }
+        // The dropdown's universe comes from ALL meetings in this
+        // folder, collected before filtering shrinks the list.
+        knownProfileNames = stamped.reduce(into: Set<String>()) { $0.formUnion($1.7) }
+        // Apply the bar's filters: word-prefix name search, then
+        // profile multi-select (a meeting passes when ANY selected
+        // profile spoke in it).
+        let q = searchQuery.trimmingCharacters(in: .whitespaces)
+        if !q.isEmpty {
+            stamped = stamped.filter { matchesQuery($0.1, q) }
+        }
+        if !selectedProfiles.isEmpty {
+            stamped = stamped.filter { !$0.7.isDisjoint(with: selectedProfiles) }
         }
         stamped.sort { a, b in
             let r: Bool
