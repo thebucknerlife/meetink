@@ -216,17 +216,22 @@ enhance_enabled() {
 # traffic — stationary ambience is DFN's sweet spot). Attenuation is
 # capped so voices stay natural (the "tinny" scars); sys is NEVER
 # touched. denoise=off in config disables. Prints the path to use.
-_denoise_mic() {
-    local in="$1" rate="$2" td="$3"
+_denoise_mic() { _denoise_stream "$1" "$2" "$3" 12 mic }
+
+# DFN a raw stream. $4 = attenuation cap dB (mic keeps the conservative
+# 12; contaminated sys runs 100 = full — the Krisp-parity lever the
+# user validated by ear), $5 = label for progress lines.
+_denoise_stream() {
+    local in="$1" rate="$2" td="$3" atten="${4:-12}" what="${5:-mic}"
     local dfn="$MK_HOME/enhance-venv/bin/deepFilter"
     local v=$(grep '^denoise=' "$MK_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2-)
     if [[ "$v" == "off" || "$v" == "false" || ! -x "$dfn" || ! -s "$in" ]]; then
         print -- "$in"; return 0
     fi
-    print -- "mixing audio — denoising mic ~0% (step 3/3)" \
+    print -- "mixing audio — denoising ${what} ~0% (step 3/3)" \
         > /tmp/meetink-postproc.state 2>/dev/null
     local drc=1
-    if ffmpeg -v error -y -f s16le -ar $rate -ac 1 -i "$in" "$td/dn-in.wav" 2>>/tmp/meetink-refine.log; then
+    if ffmpeg -v error -y -f s16le -ar $rate -ac 1 -i "$in" "$td/dn-in-$what.wav" 2>>/tmp/meetink-refine.log; then
         # DFN prints nothing until it finishes, but its realtime factor
         # is stable (~0.04 on this hardware) — an elapsed/expected
         # estimate is honest enough to prove it hasn't hung. Capped at
@@ -234,21 +239,21 @@ _denoise_mic() {
         local audio_s=$(( $(stat -f%z "$in" 2>/dev/null || echo 0) / (2 * rate) ))
         local expect=$(( audio_s / 18 ))
         (( expect < 6 )) && expect=6
-        "$dfn" "$td/dn-in.wav" -o "$td" --atten-lim 12 >>/tmp/meetink-refine.log 2>&1 &
+        "$dfn" "$td/dn-in-$what.wav" -o "$td" --atten-lim $atten >>/tmp/meetink-refine.log 2>&1 &
         local dpid=$! dt0=$SECONDS dpct=0
         while kill -0 $dpid 2>/dev/null; do
             sleep 2
             dpct=$(( (SECONDS - dt0) * 100 / expect ))
             (( dpct > 95 )) && dpct=95
-            print -- "mixing audio — denoising mic ~${dpct}% (step 3/3)" \
+            print -- "mixing audio — denoising ${what} ~${dpct}% (step 3/3)" \
                 > /tmp/meetink-postproc.state 2>/dev/null
         done
         wait $dpid 2>/dev/null; drc=$?
     fi
-    if (( drc == 0 )) && [[ -f "$td/dn-in_DeepFilterNet3.wav" ]] \
-        && ffmpeg -v error -y -i "$td/dn-in_DeepFilterNet3.wav" -f s16le -ar $rate -ac 1 \
-               "$td/dn-mic.raw" 2>>/tmp/meetink-refine.log; then
-        print -- "$td/dn-mic.raw"
+    if (( drc == 0 )) && [[ -f "$td/dn-in-${what}_DeepFilterNet3.wav" ]] \
+        && ffmpeg -v error -y -i "$td/dn-in-${what}_DeepFilterNet3.wav" -f s16le -ar $rate -ac 1 \
+               "$td/dn-$what.raw" 2>>/tmp/meetink-refine.log; then
+        print -- "$td/dn-$what.raw"
     else
         print -- "$in"   # denoise is best-effort, never blocks the mix
     fi
@@ -330,10 +335,43 @@ _mix_enhanced_m4a() {
             fi
         fi
         local dmic=$(_denoise_mic "$pmic" $par "$pd")
+        # Returned-self contamination (a participant echoing the meeting
+        # back): the sys stream then carries the user's echo AND the
+        # others under someone's bad audio path. The mixer handles the
+        # user side (selection); the others' side gets DFN at FULL
+        # attenuation — the Krisp-parity lever the user validated by ear
+        # ("cleaned was definitely the best"). Clean meetings keep the
+        # faithful untouched sys.
+        local psys_render="$psys"
+        local sys_processor=raw
+        # Probe only under an UNAMBIGUOUS headphones route — the
+        # energy-domain detector is invalid where speaker bleed exists
+        # (field false-positive: a clean speakers 1:1 measured 2.1).
+        local rjson_pre="${mic:h}/route.jsonl"
+        [[ -s "$rjson_pre" ]] || rjson_pre="${out%.m4a}.route.jsonl"
+        local contam=""
+        if [[ -s "$rjson_pre" ]] \
+           && grep -q '"kind": "headphones"' "$rjson_pre" \
+           && ! grep -qE '"kind": "(speakers|unknown)"' "$rjson_pre"; then
+            contam=$("$MK_PARAKEET_VENV/bin/python" \
+                "$MK_ROOT/src/refine/playback_mix.py" \
+                --mic16 "$amic" --sys16 "$asys" --mic /dev/null --sys /dev/null \
+                --out /dev/null --probe-contamination 2>/dev/null)
+        fi
+        if print -- "$contam" | grep -q '"contaminated": true'; then
+            print -r -- "playback-mix: contamination probe: $contam" \
+                >> /tmp/meetink-refine.log
+            local dsys=$(_denoise_stream "$psys" $par "$pd" 100 sys)
+            if [[ "$dsys" != "$psys" ]]; then
+                psys_render="$dsys"
+                sys_processor=deepfilternet3-full
+            fi
+        fi
         local -a fm=()
         local mic_processor=raw
         [[ "$dmic" != "$pmic" ]] && mic_processor=deepfilternet3-capped-12db
         fm+=(--mic-processor "$mic_processor")
+        fm+=(--sys-processor "$sys_processor")
         [[ "$mix_mode" == "mic" || "$mix_mode" == "split" ]] && \
             fm+=(--force-mode "$mix_mode")
         # A complete one-kind physical route journal is authoritative; mixed
@@ -354,7 +392,7 @@ _mix_enhanced_m4a() {
         fi
         fm+=(--decision-out "${out%.m4a}.audio.json")
         _pmix_run --mic16 "$amic" --sys16 "$asys" \
-                --mic "$dmic" --sys "$psys" --rate $par \
+                --mic "$dmic" --sys "$psys_render" --rate $par \
                 "${fm[@]}" \
                 --out "$pd/mixed.raw"
         local pmrc=$?

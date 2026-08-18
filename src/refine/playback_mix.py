@@ -349,6 +349,53 @@ def mic_energy_duck_spans(mic16: np.ndarray,
     return [(max(0.0, s - pad_lead), e + pad_tail) for s, e in spans]
 
 
+def returned_self_contamination(mic16: np.ndarray,
+                                sys16: np.ndarray) -> dict:
+    """Meeting-level returned-self detector, energy domain.
+
+    A participant echoing the meeting back puts a copy of the USER into
+    sys — so sys is HOT exactly when the user's mic is vocal. Compare
+    sys loudness under the user's vocal blocks vs under others-active
+    blocks: a clean headphone meeting measures near-zero under the user
+    (nobody plays your voice back to you); the AE x Tom incident
+    measured RATIO 1.65 (sys louder under the user than under the
+    others). Energy-domain on purpose — conferencing codecs decorrelate
+    the returned waveform until correlation detectors read noise, but
+    they cannot hide its energy. Drives the render recipe: contaminated
+    meetings duck sys to ZERO under the user (selection, the returned
+    copy never admitted) and get the sys stream enhanced.
+    """
+    B = RATE // 10
+    nb = min(len(mic16), len(sys16)) // B
+    verdict = {"contaminated": False, "ratio": 0.0,
+               "sys_rms_under_user": 0.0, "sys_rms_under_others": 0.0,
+               "user_blocks": 0, "others_blocks": 0}
+    if nb < 100:
+        return verdict
+    m = np.sqrt((mic16[: nb * B].reshape(nb, B) ** 2).mean(axis=1))
+    s = np.sqrt((sys16[: nb * B].reshape(nb, B) ** 2).mean(axis=1))
+    act = m[m > 0.003]
+    if len(act) < 20:
+        return verdict
+    thr = max(0.01, float(np.percentile(act, 75)) * 0.15)
+    user = m > thr
+    others = (~user) & (s > 0.003)
+    verdict["user_blocks"] = int(user.sum())
+    verdict["others_blocks"] = int(others.sum())
+    if user.sum() < 50 or others.sum() < 50:
+        return verdict
+    under_user = float(np.median(s[user]))
+    under_others = float(np.median(s[others]))
+    ratio = under_user / max(under_others, 1e-6)
+    verdict.update({
+        "sys_rms_under_user": round(under_user, 4),
+        "sys_rms_under_others": round(under_others, 4),
+        "ratio": round(ratio, 3),
+        "contaminated": bool(under_user > 0.01 and ratio >= 0.8),
+    })
+    return verdict
+
+
 def merge_spans(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
     """Sort + coalesce overlapping spans from multiple candidate sources."""
     out: list[list[float]] = []
@@ -497,11 +544,17 @@ def main() -> int:
     ap.add_argument("--health", help="capture's health.jsonl event journal")
     ap.add_argument("--mic-processor", default="raw",
                     help="description/version of upstream mic processing")
+    ap.add_argument("--sys-processor", default="raw",
+                    help="description/version of upstream sys processing "
+                    "(e.g. deepfilternet3-full on contaminated meetings)")
     ap.add_argument("--duck-timing", help="timing.json whose user-word "
                     "spans nominate returned-self echo candidates")
     ap.add_argument("--duck-label", default="ME",
                     help="the user's transcript label (e.g. GREG)")
     ap.add_argument("--decision-out", help="write the audio decision manifest")
+    ap.add_argument("--probe-contamination", action="store_true",
+                    help="print the returned-self verdict as JSON and exit "
+                    "(the shell wrapper decides sys enhancement from it)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -513,6 +566,9 @@ def main() -> int:
 
     mic16 = load16(args.mic16)
     sys16 = load16(args.sys16)
+    if args.probe_contamination:
+        print(json.dumps(returned_self_contamination(mic16, sys16)))
+        return 0
     sys_was_empty = not len(sys16)
     health = assess_mic_health(mic16, sys16, RATE)
     manifest = {
@@ -635,8 +691,54 @@ def main() -> int:
     # block. Global degraded health and per-window raw-sys passthrough
     # remain stronger invariants, so the only surviving user copy can
     # never be ducked.
+    # Contamination decides WHETHER to duck at all:
+    #   clean meeting        → NO duck. Sys under the user is silence,
+    #                          and the only thing a duck could touch is
+    #                          genuine crosstalk ("cool" mid-sentence) —
+    #                          full-level sum preserves every word of it.
+    #   contaminated meeting → SELECTION: duck factor 0. Sys under the
+    #                          user is their own returned echo; it is
+    #                          never admitted, not attenuated. Real
+    #                          crosstalk in those spans is sacrificed in
+    #                          the PLAYBACK only — the transcript keeps
+    #                          it (sys is transcribed in full).
     duck_spans: list[tuple[float, float]] = []
-    if not degraded_sys_passthrough and has_sum_windows:
+    duck_factor = 0.0
+    # The energy-domain detector is only VALID under headphones: on a
+    # speakers meeting the mic carries bleed, so "user-vocal blocks"
+    # conflate the user with the room (field false-positive: a clean
+    # speakers 1:1 measured ratio 2.1). Unambiguous-headphones routes
+    # get the real verdict; mixed/unknown routes are INDETERMINATE and
+    # keep the legacy -26 dB duck as insurance.
+    headphones_context = (route_mode == "split")
+    contamination = (returned_self_contamination(mic16, sys16)
+                     if headphones_context else
+                     {"contaminated": False, "indeterminate": True})
+    manifest["returned_self_contamination"] = contamination
+    if headphones_context and not contamination["contaminated"] \
+            and has_sum_windows and not degraded_sys_passthrough:
+        log(f"headphones meeting measures CLEAN (ratio "
+            f"{contamination.get('ratio', 0)}) — plain sum, no duck, "
+            f"crosstalk preserved at full level")
+    elif not headphones_context and has_sum_windows \
+            and not degraded_sys_passthrough:
+        # Indeterminate context: keep yesterday's insurance duck.
+        duck_factor = 0.05
+        word_spans = (load_duck_spans(args.duck_timing, args.duck_label)
+                      if args.duck_timing else [])
+        energy_spans = mic_energy_duck_spans(mic16)
+        raw_spans = merge_spans(word_spans + energy_spans)
+        duck_spans = gate_duck_spans_on_mic(raw_spans, mic16)
+        if duck_spans:
+            manifest["processors"].append("mic-alive-span-duck-v3-energy")
+            log(f"indeterminate route: insurance duck (-26 dB) over "
+                f"{len(duck_spans)} span(s)")
+    if not degraded_sys_passthrough and has_sum_windows \
+            and contamination["contaminated"]:
+        log(f"returned-self contamination: sys RMS under the user "
+            f"{contamination['sys_rms_under_user']} vs under others "
+            f"{contamination['sys_rms_under_others']} (ratio "
+            f"{contamination['ratio']}) — selection render, duck to zero")
         word_spans = (load_duck_spans(args.duck_timing, args.duck_label)
                       if args.duck_timing else [])
         energy_spans = mic_energy_duck_spans(mic16)
@@ -649,18 +751,21 @@ def main() -> int:
             "authorized_spans": len(duck_spans),
             "authorized_seconds": round(
                 sum(end - start for start, end in duck_spans), 2),
-            "factor": 0.05,
+            "factor": duck_factor,
         }
         if duck_spans:
             total = sum(end - start for start, end in duck_spans)
-            manifest["processors"].append("mic-alive-span-duck-v3-energy")
-            log(f"mic-alive sys duck armed: {total:.0f}s across "
+            manifest["processors"].append("returned-self-selection-v1")
+            log(f"selection armed: {total:.0f}s across "
                 f"{len(duck_spans)} span(s) "
                 f"(words {len(word_spans)} + energy {len(energy_spans)} "
                 f"candidates)")
         elif raw_spans:
-            log(f"mic-alive sys duck stood down: mic silent across all "
+            log(f"selection stood down: mic silent across all "
                 f"{len(raw_spans)} candidate span(s)")
+    elif has_sum_windows and not degraded_sys_passthrough:
+        log("no returned-self contamination — plain sum, crosstalk "
+            "preserved at full level")
 
     # Block-level dead-mic passthrough inside mic-only regions: a mic
     # dying MID-WINDOW (the AirPods handoff wedge) previously rendered
@@ -696,6 +801,8 @@ def main() -> int:
     if not degraded_sys_passthrough:
         if args.mic_processor != "raw":
             manifest["processors"].append(args.mic_processor)
+        if args.sys_processor != "raw":
+            manifest["processors"].append("sys:" + args.sys_processor)
         manifest["processors"].extend(
             ["static-level-match-v1", "soft-headroom-v1"])
 
@@ -776,7 +883,7 @@ def main() -> int:
                                   len(gains) - 1)
                 s = s * gains[gidx]
             duck = duck_envelope_for_chunk(
-                duck_spans, pos, take, args.rate)
+                duck_spans, pos, take, args.rate, factor=duck_factor)
             if duck is not None:
                 s = s * duck
             alpha = alpha_for_chunk(pos, take)   # 1 = mic-only, 0 = sum

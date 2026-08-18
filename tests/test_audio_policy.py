@@ -290,10 +290,16 @@ class AudioPolicyTests(unittest.TestCase):
             plain_out = tmp / "plain.raw"
             ducked_out = tmp / "ducked.raw"
             manifest = tmp / "audio.json"
-            mic = (np.clip(self.source(seconds=6, level=0.10), -0.9, 0.9)
-                   * 32767).astype(np.int16)
-            sys_audio = (np.clip(self.source(seconds=6, level=0.10),
-                                 -0.9, 0.9) * 32767).astype(np.int16)
+            # Contaminated-by-construction: the user talks 0-15 s and a
+            # returned copy of them fills sys there (hot under the user);
+            # others talk 15-30 s at a lower level. Detector: ratio >> 0.8.
+            mic_f = np.zeros(30 * RATE, dtype=np.float32)
+            mic_f[:15 * RATE] = self.source(seconds=15, level=0.10)
+            sys_f = np.zeros(30 * RATE, dtype=np.float32)
+            sys_f[:15 * RATE] = mic_f[:15 * RATE] * 0.8   # returned self
+            sys_f[15 * RATE:] = self.source(seconds=15, level=0.05)
+            mic = (np.clip(mic_f, -0.9, 0.9) * 32767).astype(np.int16)
+            sys_audio = (np.clip(sys_f, -0.9, 0.9) * 32767).astype(np.int16)
             mic_path.write_bytes(mic.tobytes())
             sys_path.write_bytes(sys_audio.tobytes())
             route_path.write_text('{"t": 0, "kind": "headphones"}\n')
@@ -337,11 +343,16 @@ class AudioPolicyTests(unittest.TestCase):
 
             decision = json.loads(manifest.read_text())
             self.assertEqual(decision["render"], "route-authoritative-split")
-            self.assertTrue(all(window["render"] == "sum"
-                                for window in decision["windows"]))
+            # The user's half renders sum; the mic-silent half is
+            # per-window sys-passthrough — both legal here.
+            self.assertTrue(all(w["render"] in ("sum", "sys-passthrough")
+                                for w in decision["windows"]))
+            self.assertTrue(
+                decision["returned_self_contamination"]["contaminated"])
             self.assertEqual(
                 decision["mic_alive_span_duck"]["word_candidate_spans"], 1)
-            self.assertIn("mic-alive-span-duck-v3-energy",
+            self.assertEqual(decision["mic_alive_span_duck"]["factor"], 0.0)
+            self.assertIn("returned-self-selection-v1",
                           decision["processors"])
 
 
