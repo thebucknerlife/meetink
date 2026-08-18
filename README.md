@@ -81,6 +81,13 @@ If you take a lot of meetings on your Mac and want a private transcript, you usu
 | **Required tools** | Xcode Command Line Tools (`xcode-select --install`), [Homebrew](https://brew.sh), Python 3 (ships with macOS), [`uv`](https://github.com/astral-sh/uv) (auto-installed by `setup` if missing). |
 | **Optional** | `claude` CLI (Claude Code) if you want the `claude` backend for titling / summaries / `/ask`. |
 
+> **Build compatibility:** Meetink targets macOS 14, but the optional AEC3
+> capture build (`meetink aec install`) links locally built WebRTC and
+> Homebrew Abseil libraries. Those dependencies may inherit the build Mac's
+> deployment target; for example, artifacts built on macOS 26 may not run on
+> macOS 14. If you distribute the capture binary to older Macs, rebuild the
+> AEC dependencies for the oldest macOS version you support.
+
 ---
 
 ## Install
