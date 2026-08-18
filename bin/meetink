@@ -286,6 +286,33 @@ cmd_dtln_install() {
 # arguments. Bundling is required so the app gets a CFBundleIdentifier
 # (com.meetink.agent) — without it, UserNotifications refuses to deliver
 # and EventKit can't request Full Calendar Access.
+# EXPERIMENTAL device-tap sidecar (records what the user hears — the
+# post-Krisp inbound when Krisp is in the chain). Separate binary on
+# purpose: a tap failure can never touch the main capture.
+build_tap() {
+    print -P "${C[bright_yellow]}▸${C[reset]} Building meetink-tap (experimental output-device tap)..."
+    local sdk
+    sdk=$(find_sdk) || { print -P "${C[red]}error:${C[reset]} no SDK"; return 1 }
+    swiftc -O -o "$MK_HOME/bin/meetink-tap" \
+        "$MK_ROOT/src/tap/Sources/main.swift" \
+        -framework Foundation -framework CoreAudio -framework AudioToolbox \
+        -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist \
+        -Xlinker "$MK_ROOT/src/tap/Info.plist" \
+        -target arm64-apple-macosx14.4 -sdk "$sdk" || {
+        print -P "${C[red]}error:${C[reset]} tap build failed"
+        return 1
+    }
+    if command -v codesign >/dev/null 2>&1; then
+        codesign --force --sign "$(mk_codesign_identity)" "$MK_HOME/bin/meetink-tap" || \
+            print -P "${C[yellow]}⚠${C[reset]} tap codesign failed — audio-capture TCC will re-prompt"
+        if security find-identity -v -p codesigning 2>/dev/null | grep -q "Meetink Signing" \
+           && ! codesign -dvvv "$MK_HOME/bin/meetink-tap" 2>&1 | grep -q "Authority=Meetink Signing"; then
+            print -P "${C[red]}⚠ tap got an AD-HOC signature despite the stable identity existing${C[reset]}"
+        fi
+    fi
+    print -P "${C[green]}✓${C[reset]} Built: $MK_HOME/bin/meetink-tap"
+}
+
 build_agent() {
     print -P "${C[bright_yellow]}▸${C[reset]} Building meetink-agent (calendar + notifications)..."
     if ! command -v swiftc >/dev/null 2>&1; then
@@ -1069,6 +1096,19 @@ cmd_start() {
     echo $! > "$PID_FILE"
     disown 2>/dev/null || true
 
+    # EXPERIMENTAL device-tap sidecar: records what the user HEARS
+    # (post-Krisp when Krisp is in the chain) as tap-experiment.wav in
+    # the session folder. Fully best-effort and separate — a tap
+    # failure must never touch the real recording. Disable with
+    # tap_experiment=off in config. The tap self-exits when capture
+    # dies; cmd_stop SIGINTs it for a clean WAV finalize.
+    if [[ "$(grep '^tap_experiment=' "$MK_CONFIG_FILE" 2>/dev/null | cut -d= -f2-)" != "off" \
+          && -x "$MK_HOME/bin/meetink-tap" ]]; then
+        ( "$MK_HOME/bin/meetink-tap" --out "$session_dir/tap-experiment.wav" \
+            >> /tmp/meetink-tap.log 2>&1 &
+          print -- $! > /tmp/meetink-tap.pid ) 2>/dev/null || true
+    fi
+
     mk_notify "Recording started" "${session_stamp} — live transcript is filling in"
     # Pre-warm the local /ask model in the background: load it into
     # Metal and prime the prompt cache with the stable context (docs +
@@ -1167,6 +1207,11 @@ cmd_stop() {
         fi
     fi
     rm -f "$PID_FILE"
+    # Experimental tap sidecar: clean SIGINT finalizes its WAV header.
+    if [[ -f /tmp/meetink-tap.pid ]]; then
+        kill -INT "$(cat /tmp/meetink-tap.pid)" 2>/dev/null || true
+        rm -f /tmp/meetink-tap.pid
+    fi
     stop_whisper_server
     # Note: we deliberately leave diarize-server running across /stop. It's
     # cheap (~25MB embedding model) and the user often wants to inspect or
@@ -1276,6 +1321,12 @@ cmd_discard() {
     fi
     kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true
     rm -f "$PID_FILE"
+    # Tap sidecar dies with the discard (WAV header pre-sized: playable
+    # even without a clean finalize; the folder is deleted anyway).
+    if [[ -f /tmp/meetink-tap.pid ]]; then
+        kill "$(cat /tmp/meetink-tap.pid)" 2>/dev/null || true
+        rm -f /tmp/meetink-tap.pid
+    fi
     stop_whisper_server
     # A discard means "this meeting is garbage" — any post-processing
     # already chewing on it dies too.
@@ -1464,6 +1515,7 @@ case "${1:-}" in
     pyannote)          case "$2" in install) cmd_pyannote_install ;; *) print -P "usage: meetink pyannote install" ;; esac ;;
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
+    _build_tap)        build_tap ;;
     _build_capture)    build_capture ;;
     aec)               case "$2" in
                            install)  cmd_aec_install ;;
