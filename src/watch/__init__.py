@@ -1451,7 +1451,11 @@ class WatchManager:
         # ghost: adopted stop, camera lingered, instant start 45 s later).
         with self._lock:
             self._end_cooldown_until = time.time() + INSTANT_END_COOLDOWN_S
-            self._end_cooldown_source = self._recording_source
+            # Adopted recordings carry their source in _adopted_source;
+            # _recording_source is None for them, which made the cooldown
+            # unattributed (any-app) instead of scoped to the stopped app.
+            self._end_cooldown_source = (self._adopted_source
+                                         or self._recording_source)
             self._instant_streak = 0
         _agent_notify(
             title="Recording stopped",
@@ -1534,6 +1538,16 @@ class WatchManager:
                 return
             if now_wall < self._skip_cooldown_until:
                 return
+            # A live capture — watch-started, adopted, or manual so fresh
+            # it isn't adopted yet — means presence is already being
+            # recorded. Only _currently_recording routes the tick away
+            # from this path; an ADOPTED recording that outlives its
+            # calendar slot otherwise reads as "meeting active, nothing
+            # recording" and arms against its own call (field case: 8
+            # blocked /starts during a long Diogo call, then a phantom
+            # instant start the moment the real stop freed the slot).
+            if self._adopted_pid is not None or _capture_pid() is not None:
+                return
             # End-cooldown guards re-detection of the SAME app's wrap-up
             # blips — a different app right after a stop is a genuinely
             # new meeting. It suppresses only INSTANT starts (decided
@@ -1614,7 +1628,8 @@ class WatchManager:
                             _wlog(f"notify mode: user skipped '{ev.title}'")
                             return
                     with self._lock:
-                        if self._currently_recording is not None:
+                        if (self._currently_recording is not None
+                                or _capture_pid() is not None):
                             return
                     # Presence seen → end-detection armed at birth.
                     self._begin_event_recording(ev, armed=True,
@@ -1684,11 +1699,30 @@ class WatchManager:
                     self._instant_pending = False
                 return
 
-            # Default / Continue / timeout → record. Re-check that we
-            # aren't now blocked by a scheduled recording that started
-            # while the user was deciding.
+            # Default / Continue / timeout → record. The detection is now
+            # up to a notify-timeout old — re-verify the world before
+            # acting on it. Guards: another recording took the slot; the
+            # meeting app is GONE (the call ended while our timer ran —
+            # starting now records post-call silence); the end-cooldown
+            # began after we armed (the stop happened mid-decision, so
+            # the arm-time cooldown check never saw it).
+            fresh = _agent_meeting_active()
             with self._lock:
-                if self._currently_recording is not None:
+                fresh_src = fresh.get("source") or ""
+                stale = not fresh.get("active")
+                cooled = time.time() < self._end_cooldown_until and (
+                    self._end_cooldown_source is None
+                    or not fresh_src
+                    or fresh_src == self._end_cooldown_source
+                )
+                if (self._currently_recording is not None
+                        or _capture_pid() is not None
+                        or stale or cooled):
+                    if stale or cooled:
+                        _wlog("instant start aborted: "
+                              + ("meeting activity gone since detection"
+                                 if stale else
+                                 "inside end-cooldown of the stopped call"))
                     ev.status = EventStatus.EXPIRED
                     self._instant_pending = False
                     return
