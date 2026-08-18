@@ -53,6 +53,7 @@ source "$MK_ROOT/src/lib/ask.sh"
 source "$MK_ROOT/src/lib/summary.sh"
 source "$MK_ROOT/src/lib/names.sh"
 source "$MK_ROOT/src/lib/refine.sh"
+source "$MK_ROOT/src/lib/score.sh"
 source "$MK_ROOT/src/lib/context.sh"
 source "$MK_ROOT/src/lib/index.sh"
 source "$MK_ROOT/src/lib/watch.sh"
@@ -1455,6 +1456,7 @@ case "${1:-}" in
                        title_session_file "$1" ;;
     relabel)           shift 2>/dev/null; cmd_relabel "$@" ;;
     split)             shift 2>/dev/null; cmd_split "$@" ;;
+    score)             shift 2>/dev/null; cmd_audio_score "$@" ;;
     watch-daemon)      # Headless watcher (spawned by Meetink.app; see watch.daemon_main)
                        MEETINK_HOME="$MK_HOME" PYTHONPATH="$MK_ROOT/src" \
                            exec "$MK_PY_VENV/bin/python" -c "import watch; watch.daemon_main()" ;;
