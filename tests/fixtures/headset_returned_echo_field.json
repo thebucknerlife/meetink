@@ -1,0 +1,16 @@
+{
+  "description": "Anonymized decision metadata from the all-headphones field incident with codec-decorrelated returned self",
+  "windows": 268,
+  "route_events": [
+    {"t": 0.0, "kind": "headphones"}
+  ],
+  "regressed_acoustic_result": {
+    "speaker_windows": 103,
+    "device_switches": 48
+  },
+  "expected_result": {
+    "mode": "split",
+    "speaker_windows": 0,
+    "device_switches": 0
+  }
+}

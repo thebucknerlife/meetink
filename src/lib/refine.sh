@@ -334,15 +334,24 @@ _mix_enhanced_m4a() {
         local mic_processor=raw
         [[ "$dmic" != "$pmic" ]] && mic_processor=deepfilternet3-capped-12db
         fm+=(--mic-processor "$mic_processor")
-        [[ "$mix_mode" == "mic" || "$mix_mode" == "split" ]] && fm=(--force-mode "$mix_mode")
-        # Capture journals: route/input metadata is a prior for the render;
-        # health events are retained in the decision manifest.
+        [[ "$mix_mode" == "mic" || "$mix_mode" == "split" ]] && \
+            fm+=(--force-mode "$mix_mode")
+        # A complete one-kind physical route journal is authoritative; mixed
+        # or unknown routes fall back to directional acoustic windows. Health
+        # events are retained in the decision manifest either way.
         local rjson="${mic:h}/route.jsonl"
         [[ -s "$rjson" ]] || rjson="${out%.m4a}.route.jsonl"
         [[ -s "$rjson" ]] && fm+=(--route "$rjson")
         local hjson="${mic:h}/health.jsonl"
         [[ -s "$hjson" ]] || hjson="${out%.m4a}.health.jsonl"
         [[ -s "$hjson" ]] && fm+=(--health "$hjson")
+        # Codec processing can decorrelate returned self enough that waveform
+        # direction is inconclusive. User timing nominates candidate spans;
+        # playback_mix still requires a live direct-mic copy before ducking.
+        if [[ -s "$timing" ]]; then
+            local duck_me=$(me_name_get 2>/dev/null)
+            fm+=(--duck-timing "$timing" --duck-label "${duck_me:-ME}")
+        fi
         fm+=(--decision-out "${out%.m4a}.audio.json")
         _pmix_run --mic16 "$amic" --sys16 "$asys" \
                 --mic "$dmic" --sys "$psys" --rate $par \

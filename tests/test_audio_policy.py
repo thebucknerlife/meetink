@@ -16,7 +16,13 @@ sys.path.insert(0, str(REFINE))
 
 from audio_health import assess_mic_health  # noqa: E402
 from enhance import echo_path_evidence  # noqa: E402
-from playback_mix import analyze_windows  # noqa: E402
+from playback_mix import (  # noqa: E402
+    analyze_windows,
+    authoritative_route_decisions,
+    authoritative_route_mode,
+    duck_envelope_for_chunk,
+    gate_duck_spans_on_mic,
+)
 
 
 RATE = 16000
@@ -90,6 +96,32 @@ class AudioPolicyTests(unittest.TestCase):
         self.assertTrue(all(d["basis"] == "returned-path" for d in decisions))
         self.assertTrue(all(d["render"] == "sum" for d in decisions))
 
+    def test_unambiguous_headphones_override_noisy_acoustics(self) -> None:
+        fixture = json.loads((ROOT / "tests" / "fixtures" /
+                              "headset_returned_echo_field.json").read_text())
+        route = [(float(event["t"]), str(event["kind"]))
+                 for event in fixture["route_events"]]
+        self.assertEqual(fixture["regressed_acoustic_result"], {
+            "speaker_windows": 103, "device_switches": 48})
+        self.assertEqual(authoritative_route_mode(route), "split")
+
+        # The route resolver, not the noisy 103-window acoustic vote, owns the
+        # recipe. One mode covers all 268 field windows: zero switches and no
+        # mic-only windows capable of erasing remote participants.
+        expected = fixture["expected_result"]
+        modes = [authoritative_route_mode(route) == "mic"] * fixture["windows"]
+        self.assertEqual(sum(modes), expected["speaker_windows"])
+        self.assertEqual(sum(a != b for a, b in zip(modes, modes[1:])),
+                         expected["device_switches"])
+
+    def test_route_authority_still_yields_to_dead_mic_window(self) -> None:
+        sys_audio = self.source(seconds=30)
+        mic = self.source(seconds=30, level=0.08)
+        mic[15 * RATE:] = 0
+        decisions = authoritative_route_decisions(mic, sys_audio, "mic")
+        self.assertEqual([d["render"] for d in decisions],
+                         ["mic-only", "sys-passthrough"])
+
     def test_both_echo_directions_are_reported_separately(self) -> None:
         direct_mic = self.source(level=0.18)
         remote = self.source(level=0.12)
@@ -128,6 +160,27 @@ class AudioPolicyTests(unittest.TestCase):
         silent = assess_mic_health(zeros, sys_audio, RATE)
         self.assertFalse(silent["healthy"])
         self.assertEqual(silent["reason"], "digital-silence")
+
+    def test_span_duck_requires_live_mic_and_has_expected_depth(self) -> None:
+        spans = [(1.0, 2.0)]
+        alive = np.full(3 * RATE, 0.02, dtype=np.float32)
+        dead = np.zeros_like(alive)
+        self.assertEqual(gate_duck_spans_on_mic(spans, alive), spans)
+        self.assertEqual(gate_duck_spans_on_mic(spans, dead), [])
+
+        envelope = duck_envelope_for_chunk(spans, 0, 3 * RATE, RATE)
+        self.assertIsNotNone(envelope)
+        self.assertAlmostEqual(float(envelope[int(1.5 * RATE)]), 0.05,
+                               places=5)
+        self.assertAlmostEqual(float(envelope[int(0.5 * RATE)]), 1.0,
+                               places=5)
+
+        # A long candidate span cannot remain authorized after the mic dies.
+        partial = np.zeros(10 * RATE, dtype=np.float32)
+        partial[:2 * RATE] = 0.02
+        authorized = gate_duck_spans_on_mic([(0.0, 10.0)], partial)
+        self.assertTrue(authorized)
+        self.assertLessEqual(authorized[-1][1], 3.1)
 
     def test_dead_mic_render_preserves_sys_bit_for_bit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -188,6 +241,57 @@ class AudioPolicyTests(unittest.TestCase):
             decision = json.loads(manifest.read_text())
             self.assertEqual(decision["windows"][1]["render"],
                              "sys-passthrough")
+
+    def test_cli_headphone_route_and_mic_alive_duck_are_wired(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            mic_path = tmp / "mic.raw"
+            sys_path = tmp / "sys.raw"
+            route_path = tmp / "route.jsonl"
+            timing_path = tmp / "timing.json"
+            plain_out = tmp / "plain.raw"
+            ducked_out = tmp / "ducked.raw"
+            manifest = tmp / "audio.json"
+            mic = (np.clip(self.source(seconds=6, level=0.10), -0.9, 0.9)
+                   * 32767).astype(np.int16)
+            sys_audio = (np.clip(self.source(seconds=6, level=0.10),
+                                 -0.9, 0.9) * 32767).astype(np.int16)
+            mic_path.write_bytes(mic.tobytes())
+            sys_path.write_bytes(sys_audio.tobytes())
+            route_path.write_text('{"t": 0, "kind": "headphones"}\n')
+            timing_path.write_text(json.dumps({"lines": [{
+                "label": "ME",
+                "words": [{"w": "hello", "s": 1.0, "e": 2.0}],
+            }]}))
+            base = [
+                sys.executable, str(REFINE / "playback_mix.py"),
+                "--mic16", str(mic_path), "--sys16", str(sys_path),
+                "--mic", str(mic_path), "--sys", str(sys_path),
+                "--rate", str(RATE), "--route", str(route_path),
+            ]
+            plain = subprocess.run(base + ["--out", str(plain_out)],
+                                   capture_output=True, text=True)
+            ducked = subprocess.run(base + [
+                "--duck-timing", str(timing_path), "--duck-label", "ME",
+                "--decision-out", str(manifest), "--out", str(ducked_out),
+            ], capture_output=True, text=True)
+            self.assertEqual(plain.returncode, 0, plain.stderr)
+            self.assertEqual(ducked.returncode, 0, ducked.stderr)
+
+            before = np.frombuffer(plain_out.read_bytes(), dtype=np.int16)
+            after = np.frombuffer(ducked_out.read_bytes(), dtype=np.int16)
+            np.testing.assert_array_equal(before[:int(0.5 * RATE)],
+                                          after[:int(0.5 * RATE)])
+            self.assertFalse(np.array_equal(
+                before[int(1.2 * RATE):int(1.8 * RATE)],
+                after[int(1.2 * RATE):int(1.8 * RATE)]))
+            decision = json.loads(manifest.read_text())
+            self.assertEqual(decision["render"], "route-authoritative-split")
+            self.assertTrue(all(window["render"] == "sum"
+                                for window in decision["windows"]))
+            self.assertEqual(
+                decision["mic_alive_span_duck"]["authorized_spans"], 1)
+            self.assertIn("mic-alive-span-duck-v2", decision["processors"])
 
 
 if __name__ == "__main__":

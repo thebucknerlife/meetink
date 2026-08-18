@@ -40,21 +40,27 @@ on reprocess, after refine):
 1. Conservative mic denoise (`_denoise_mic`: DeepFilterNet capped at
    −12 dB attenuation; Settings toggle `denoise`, default on). sys is
    never processed — it is what the user heard.
-2. Per-15 s-window **directional path detection** distinguishes causal
-   `sys → mic` local speaker bleed from causal `mic → sys` returned-self
-   echo. Energy ratio and the route/input journal are supporting priors;
-   neither can override strong waveform evidence in the other direction.
-   Windows without evidence inherit neighbors; single-window flips are
-   smoothed; 0.4 s equal-power crossfades at real switches.
+2. The **route journal is authoritative when unambiguous**: one physical
+   kind and no unknown events/switches means headphones → sum or speakers →
+   mic-only for the meeting. This prevents codec/AGC-decorrelated returned
+   self from looking like local bleed and selecting a clean headphone mic
+   that contains none of the remote participants. Mixed/unknown routes use
+   per-15 s-window directional detection (`sys → mic` local bleed versus
+   `mic → sys` returned self), neighbor inheritance, hysteresis, and 0.4 s
+   crossfades.
 3. **Speakers windows → mic-only.** One acoustic capture holds one copy
    of every voice, so echo is structurally impossible. This beat every
    engineered mix in blind A/B, including sys + neurally-cleaned mic on
    correctly aligned timelines.
 4. **Headphones windows → level-matched plain sum.** No bleed exists,
    so the streams are already the separation; one static gain per
-   stream (never an AGC) and soft tanh headroom. The returned-self gate is
-   eligible only when waveform evidence proves a causal `mic → sys` path;
-   it stands down if it would affect >20% of the meeting.
+   stream (never an AGC) and soft tanh headroom. Two returned-self guards
+   cover different evidence regimes: a waveform gate for a causal `mic →
+   sys` path (disabled if it would affect >20% of the meeting), plus the
+   field fallback for codec-decorrelated echo. In that fallback transcript
+   word spans only nominate where to look; each span must independently have
+   a live direct-mic copy before sys is attenuated. A dead mic always wins
+   and preserves sys.
 5. **Mic health is a hard input.** Missing, badly truncated, or almost-all-
    zero mic timelines render sys bit-for-bit. A zero mic window inside an
    otherwise healthy call does the same for that window. Sys-self transcript
@@ -65,8 +71,9 @@ on reprocess, after refine):
 
 Each kept meeting gets `<base>.audio.json`: stem health/coverage, capture
 health events, route and input-device timeline/generations, per-window path
-evidence and render recipe, returned-echo gated seconds, gains, and processor
-names. Raw capture events remain in `<base>.health.jsonl`.
+evidence and render recipe, route authority, waveform-gated seconds,
+mic-authorized span-duck seconds, gains, and processor names. Raw capture
+events remain in `<base>.health.jsonl`.
 
 **Imports** are exempt from all of the above: single stream, separate
 path (`_import_enhanced_m4a`), DFN opt-in only.
@@ -81,13 +88,15 @@ path (`_import_enhanced_m4a`), DFN opt-in only.
    DTLN-aec) assume a near-static delay. DTLN scored 0 dB suppression
    on desynchronized spools and 24 dB on aligned ones — same model,
    same meeting.
-3. **Never let transcript labels control audio.** A diarization mistake
-   must not be able to mute or garble a voice (the "JAMES" incident).
-4. **No blind dynamic processors in the canonical render.** Transcript-
-   driven sidechain ducks, hard gates, and aggressive denoise caused every
-   "robotic / pumping / glass jar" verdict. Static gains and passthrough are
-   the default; the narrow returned-self gate requires directional waveform
-   evidence and has a hard affected-time ceiling.
+3. **A transcript label can nominate evidence; it cannot authorize audio
+   loss.** A diarization mistake must not be able to mute or garble a voice
+   (the "JAMES" incident). Returned-self spans therefore require physical
+   direct-mic energy, and degraded/zero mic windows preserve sys bit-for-bit.
+4. **No blind dynamic processors in the canonical render.** Hard gates and
+   aggressive denoise caused every "robotic / pumping / glass jar" verdict.
+   Static gains and passthrough are the default; the two narrow returned-self
+   guards require either directional waveform evidence or transcript timing
+   plus independent mic-alive evidence.
 5. **The raw stems are sacred.** Denoise/mix/gates operate on temp
    copies; `.mic.wav`/`.sys.wav` stay pristine (sole exception: the
    10+ min trailing-silence trim on forgotten recordings), so every

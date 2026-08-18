@@ -10,14 +10,15 @@ meeting (the user takes headphones on and off mid-call):
                       returned-self gate is allowed only when waveform
                       evidence establishes a causal mic → sys path
 
-Mode evidence is directional: sys → mic is local acoustic speaker bleed;
-mic → sys is the user's voice returning from a far endpoint. Energy ratio
-and the route journal are supporting priors, never substitutes for the
-direction test. Windows without enough evidence inherit their neighbor.
+An unambiguous physical route journal is authoritative: a clean headphone mic
+cannot safely become mic-only no matter what codec-decorrelated correlation
+suggests. Mixed/unknown routes use directional evidence: sys → mic is local
+speaker bleed; mic → sys is returned self. Transcript spans provide a second
+returned-self candidate map, but only direct mic energy authorizes ducking.
 
 Both renders share one set of static per-stream gains so crossfades
 (0.4 s equal-power) never step in loudness. Soft tanh headroom instead
-of a hard clip. No transcript, no labels, no models — numpy only.
+of a hard clip. No learned audio models — numpy only.
 """
 from __future__ import annotations
 
@@ -87,6 +88,64 @@ def route_kind_at(events: list[tuple[float, str]], t: float) -> str | None:
             break
         kind = ek
     return kind if kind in ("headphones", "speakers") else None
+
+
+def authoritative_route_mode(
+        events: list[tuple[float, str]] | None) -> str | None:
+    """Return the render forced by a complete, unambiguous route journal.
+
+    Directional waveform evidence remains useful diagnostics for ambiguous
+    routes, but conferencing codecs can decorrelate a returned-self copy until
+    direction ratios become noise. A journal containing exactly one physical
+    kind is therefore authoritative: it is unsafe to select mic-only on an
+    all-headphones meeting because the mic cannot contain remote participants.
+    Any unknown event or real route switch restores acoustic window analysis.
+    """
+    if not events:
+        return None
+    kinds = {kind for _, kind in events}
+    if kinds == {"headphones"}:
+        return "split"
+    if kinds == {"speakers"}:
+        return "mic"
+    return None
+
+
+def authoritative_route_decisions(mic16: np.ndarray, sys16: np.ndarray,
+                                  mode: str) -> list[dict]:
+    """Expand route authority into windows while preserving mic failures.
+
+    This intentionally performs no echo-direction analysis. The only override
+    is the stronger health invariant: a literal-zero mic window with active
+    sys must preserve sys bit-for-bit even on an all-speakers route.
+    """
+    window = WIN_S * RATE
+    n = min(len(mic16), len(sys16))
+    decisions: list[dict] = []
+    for start in range(0, n, window):
+        end = min(n, start + window)
+        mic = mic16[start:end]
+        sys_ = sys16[start:end]
+        mic_nonzero = float(np.mean(
+            np.abs(mic) >= (1.0 / 32768.0))) if len(mic) else 0.0
+        sys_rms = float(np.sqrt(np.mean(sys_ ** 2))) if len(sys_) else 0.0
+        passthrough = mic_nonzero < 0.001 and sys_rms > 0.001
+        decisions.append({
+            "start_s": start / RATE,
+            "end_s": end / RATE,
+            "route": "speakers" if mode == "mic" else "headphones",
+            "sys_active_blocks": None,
+            "mic_sys_ratio": None,
+            "mic_nonzero_fraction": round(mic_nonzero, 6),
+            "local_sys_to_mic": _path_dict(EchoPathEvidence(False)),
+            "returned_mic_to_sys": _path_dict(EchoPathEvidence(False)),
+            "render": "sys-passthrough" if passthrough else (
+                "mic-only" if mode == "mic" else "sum"),
+            "basis": ("mic-window-digital-silence" if passthrough
+                      else "unambiguous-route-authority"),
+            "weak_local_path": False,
+        })
+    return decisions
 
 
 def detect_modes(mic16: np.ndarray, sys16: np.ndarray,
@@ -217,6 +276,122 @@ def analyze_windows(mic16: np.ndarray, sys16: np.ndarray,
     return decisions
 
 
+def load_duck_spans(timing_path: str, label: str,
+                    pad_lead: float = 0.15, pad_tail: float = 0.7,
+                    gap: float = 1.0) -> list[tuple[float, float]]:
+    """Load user word spans that nominate returned-self echo candidates.
+
+    Transcript timing chooses *where to inspect*, never whether sys is safe to
+    attenuate. ``gate_duck_spans_on_mic`` separately requires a live direct-mic
+    copy for every span, so a dead/truncated mic leaves the only surviving sys
+    copy untouched. The long tail covers conferencing round-trip delay.
+    """
+    try:
+        with open(timing_path) as f:
+            lines = json.load(f)["lines"]
+    except (OSError, ValueError, KeyError):
+        return []
+    words: list[tuple[float, float]] = []
+    want = label.upper()
+    for line in lines:
+        if str(line.get("label", "")).upper() != want:
+            continue
+        for word in line.get("words") or []:
+            start = float(word.get("s", 0.0))
+            end = max(float(word.get("e", start)), start + 0.05)
+            words.append((start, end))
+    words.sort()
+    spans: list[list[float]] = []
+    for start, end in words:
+        if spans and start - spans[-1][1] <= gap:
+            spans[-1][1] = max(spans[-1][1], end)
+        else:
+            spans.append([start, end])
+    return [(max(0.0, start - pad_lead), end + pad_tail)
+            for start, end in spans]
+
+
+def gate_duck_spans_on_mic(spans: list[tuple[float, float]],
+                           mic16: np.ndarray,
+                           floor: float = 0.008) -> list[tuple[float, float]]:
+    """Intersect candidate spans with time-local direct-mic evidence.
+
+    A whole-span RMS (and especially checking only its first few seconds) can
+    authorize ducking long after a mid-call mic death. Work in 100 ms blocks
+    instead. Each ducked block must have live mic within 1 s before or 200 ms
+    after it; that admits the conferencing echo tail and 150 ms lead pad while
+    stopping within about a second of the physical mic disappearing.
+    """
+    block = RATE // 10
+    nblocks = len(mic16) // block
+    if nblocks == 0:
+        return []
+    rms = np.sqrt((mic16[:nblocks * block].reshape(nblocks, block) ** 2)
+                  .mean(axis=1))
+    alive = rms >= floor
+    authorized = np.zeros(nblocks, dtype=bool)
+    for index in range(nblocks):
+        authorized[index] = bool(np.any(
+            alive[max(0, index - 10):min(nblocks, index + 3)]))
+
+    kept: list[tuple[float, float]] = []
+    for start, end in spans:
+        first = max(0, int(np.floor(start * 10)))
+        last = min(nblocks, int(np.ceil(end * 10)))
+        run_start: int | None = None
+        for index in range(first, last + 1):
+            on = index < last and authorized[index]
+            if on and run_start is None:
+                run_start = index
+            elif not on and run_start is not None:
+                kept.append((max(start, run_start / 10.0),
+                             min(end, index / 10.0)))
+                run_start = None
+    return kept
+
+
+def duck_envelope_for_chunk(spans: list[tuple[float, float]], pos: int,
+                            take: int, rate: int,
+                            factor: float = 0.05,
+                            ramp_seconds: float = 0.08) -> np.ndarray | None:
+    """Raised-cosine sys envelope for one playback chunk."""
+    if not spans:
+        return None
+    t0 = pos / rate
+    t1 = (pos + take) / rate
+    envelope = np.ones(take, dtype=np.float32)
+    ramp = max(1, int(ramp_seconds * rate))
+    touched = False
+    for start, end in spans:
+        if end < t0 - ramp_seconds:
+            continue
+        if start > t1 + ramp_seconds:
+            break
+        a = int(start * rate)
+        b = int(end * rate)
+        ca, cb = max(a - pos, 0), min(b - pos, take)
+        if ca < cb:
+            envelope[ca:cb] = factor
+            touched = True
+        # Entry ramp [a-ramp, a): 1 -> factor.
+        ra, rb = max(a - ramp - pos, 0), min(a - pos, take)
+        if ra < rb:
+            t = (np.arange(ra, rb) + pos - (a - ramp)) / ramp
+            shaped = 1.0 - (1 - np.cos(np.pi * t)) / 2 * (1 - factor)
+            envelope[ra:rb] = np.minimum(
+                envelope[ra:rb], shaped.astype(np.float32))
+            touched = True
+        # Exit ramp [b, b+ramp): factor -> 1.
+        ra, rb = max(b - pos, 0), min(b + ramp - pos, take)
+        if ra < rb:
+            t = (np.arange(ra, rb) + pos - b) / ramp
+            shaped = factor + (1 - np.cos(np.pi * t)) / 2 * (1 - factor)
+            envelope[ra:rb] = np.minimum(
+                envelope[ra:rb], shaped.astype(np.float32))
+            touched = True
+    return envelope if touched else None
+
+
 def stream_gain(x: np.ndarray, target: float = 0.07) -> float:
     B = RATE // 10
     nb = len(x) // B
@@ -269,10 +444,14 @@ def main() -> int:
     ap.add_argument("--force-mode", choices=["mic", "split"],
                     help="override detection (mix_mode config)")
     ap.add_argument("--route", help="capture's route.jsonl (OS output-"
-                    "device journal) — prior for the mode decision")
+                    "device journal) — authoritative when unambiguous")
     ap.add_argument("--health", help="capture's health.jsonl event journal")
     ap.add_argument("--mic-processor", default="raw",
                     help="description/version of upstream mic processing")
+    ap.add_argument("--duck-timing", help="timing.json whose user-word "
+                    "spans nominate returned-self echo candidates")
+    ap.add_argument("--duck-label", default="ME",
+                    help="the user's transcript label (e.g. GREG)")
     ap.add_argument("--decision-out", help="write the audio decision manifest")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -289,7 +468,7 @@ def main() -> int:
     health = assess_mic_health(mic16, sys16, RATE)
     manifest = {
         "version": 1,
-        "renderer": {"name": "playback_mix", "policy_version": 2},
+        "renderer": {"name": "playback_mix", "policy_version": 3},
         "analysis_rate": RATE,
         "playback_rate": args.rate,
         "mic_health": health,
@@ -298,6 +477,12 @@ def main() -> int:
         "windows": [],
         "returned_echo": _path_dict(EchoPathEvidence(False)),
         "returned_echo_gated_seconds": 0.0,
+        "mic_alive_span_duck": {
+            "candidate_spans": 0,
+            "authorized_spans": 0,
+            "authorized_seconds": 0.0,
+            "factor": 0.05,
+        },
         "processors": [],
     }
     if not len(sys16):
@@ -312,6 +497,7 @@ def main() -> int:
 
     degraded_sys_passthrough = bool(len(sys16) and not health["healthy"])
     decisions: list[dict] = []
+    route_mode = authoritative_route_mode(route) if not args.force_mode else None
     if degraded_sys_passthrough:
         # The sys stem may contain the only surviving copy of the user. Do
         # not level it, gate it, or combine it with a partial mic timeline.
@@ -327,6 +513,24 @@ def main() -> int:
     elif args.force_mode:
         modes = [args.force_mode == "mic"]
         log(f"mode forced: {'speakers/mic-only' if modes[0] else 'headphones/sum'}")
+        manifest["render"] = f"config-forced-{args.force_mode}"
+    elif route_mode:
+        decisions = authoritative_route_decisions(mic16, sys16, route_mode)
+        modes = [decision["render"] == "mic-only"
+                 for decision in decisions] or [route_mode == "mic"]
+        kind = route[0][1]
+        manifest["render"] = f"route-authoritative-{route_mode}"
+        manifest["windows"] = decisions
+        manifest["route_authority"] = {
+            "kind": kind,
+            "events": len(route),
+            "acoustic_analysis_skipped": True,
+        }
+        log(f"route journal unambiguous ({kind}, {len(route)} event(s), "
+            f"0 switches) — "
+            f"{'speakers/mic-only' if route_mode == 'mic' else 'headphones/sum'} "
+            f"throughout (mic-health overrides remain); acoustic mode "
+            f"decisions skipped")
     else:
         decisions = analyze_windows(mic16, sys16, route)
         modes = [d["render"] == "mic-only" for d in decisions]
@@ -344,13 +548,16 @@ def main() -> int:
 
     if not modes:
         modes = [False]
+    has_sum_windows = (any(decision["render"] == "sum"
+                           for decision in decisions)
+                       if decisions else not all(modes))
 
     log("progress 15 echo-gate")
-    # The gate is legal only after a directional mic→sys path is proven.
-    # Transcript labels and speaker turns never control audio amplitude.
+    # This waveform gate is legal only after a directional mic→sys path is
+    # proven. The separate span fallback below has its own mic authorization.
     gains = None
     returned = EchoPathEvidence(False)
-    if not degraded_sys_passthrough and not all(modes):
+    if not degraded_sys_passthrough and has_sum_windows:
         returned = echo_path_evidence(mic16, sys16,
                                       min_delay_s=0.04, max_delay_s=1.5)
         manifest["returned_echo"] = _path_dict(returned)
@@ -370,7 +577,33 @@ def main() -> int:
                     log(f"returned-self gate armed (waveform path at "
                         f"{returned.delay_ms:.0f} ms)")
         else:
-            log("no directional mic→sys path — sys remains dynamically untouched")
+            log("no directional mic→sys path — waveform gate stood down")
+
+    # Field fallback for codec-decorrelated returned self: transcript timing
+    # nominates candidate windows, but direct mic energy authorizes each one.
+    # Global degraded health and per-window raw-sys passthrough remain stronger
+    # invariants, so the only surviving user copy can never be ducked.
+    duck_spans: list[tuple[float, float]] = []
+    if args.duck_timing and not degraded_sys_passthrough and has_sum_windows:
+        raw_spans = load_duck_spans(args.duck_timing, args.duck_label)
+        duck_spans = gate_duck_spans_on_mic(raw_spans, mic16)
+        manifest["mic_alive_span_duck"] = {
+            "candidate_spans": len(raw_spans),
+            "authorized_spans": len(duck_spans),
+            "authorized_seconds": round(
+                sum(end - start for start, end in duck_spans), 2),
+            "factor": 0.05,
+        }
+        if duck_spans:
+            total = sum(end - start for start, end in duck_spans)
+            manifest["processors"].append("mic-alive-span-duck-v2")
+            log(f"mic-alive sys duck armed: {len(duck_spans)}/"
+                f"{len(raw_spans)} span(s) of {args.duck_label} "
+                f"({total:.0f}s; {len(raw_spans) - len(duck_spans)} "
+                f"skipped, mic silent)")
+        elif raw_spans:
+            log(f"mic-alive sys duck stood down: mic silent across all "
+                f"{len(raw_spans)} candidate span(s)")
 
     log("progress 25 rendering")
     mic_gain = 0.0 if degraded_sys_passthrough else stream_gain(mic16)
@@ -460,6 +693,10 @@ def main() -> int:
                 gidx = np.minimum((np.arange(take) + pos) // B_hi,
                                   len(gains) - 1)
                 s = s * gains[gidx]
+            duck = duck_envelope_for_chunk(
+                duck_spans, pos, take, args.rate)
+            if duck is not None:
+                s = s * duck
             alpha = alpha_for_chunk(pos, take)   # 1 = mic-only, 0 = sum
             mic_track = m * mic_gain             # shared by both renders
             sum_track = mic_track + s * sys_gain
