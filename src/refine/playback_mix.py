@@ -662,6 +662,31 @@ def main() -> int:
             log(f"mic-alive sys duck stood down: mic silent across all "
                 f"{len(raw_spans)} candidate span(s)")
 
+    # Block-level dead-mic passthrough inside mic-only regions: a mic
+    # dying MID-WINDOW (the AirPods handoff wedge) previously rendered
+    # up to a window of silence — the window-granularity passthrough
+    # can't see a sub-window death (field case: the 10 s hole at the
+    # Gov BD Weekly Sync switch, mic died 8 s into a mic-only window).
+    # A digitally-dead mic makes the sum identical to sys, so forcing
+    # the render weight to sum on dead 100 ms blocks IS sys-passthrough
+    # at block resolution. No-op when the mic is alive throughout.
+    mic_alive_env: "np.ndarray | None" = None
+    if not degraded_sys_passthrough and len(mic16):
+        blk = RATE // 10
+        nbl = len(mic16) // blk
+        if nbl:
+            alive = ((np.abs(mic16[:nbl * blk]).reshape(nbl, blk)
+                      >= (1.0 / 32768.0)).mean(axis=1) >= 0.001)
+            if not alive.all():
+                env = np.convolve(alive.astype(np.float32),
+                                  np.ones(3, dtype=np.float32) / 3.0,
+                                  mode="same")
+                mic_alive_env = env
+                dead_s = float((~alive).sum()) / 10.0
+                manifest["processors"].append("block-dead-mic-passthrough-v1")
+                log(f"dead-mic blocks: {dead_s:.0f}s render as sys "
+                    f"regardless of window mode")
+
     log("progress 25 rendering")
     mic_gain = 0.0 if degraded_sys_passthrough else stream_gain(mic16)
     sys_gain = 1.0 if degraded_sys_passthrough else stream_gain(sys16)
@@ -755,6 +780,12 @@ def main() -> int:
             if duck is not None:
                 s = s * duck
             alpha = alpha_for_chunk(pos, take)   # 1 = mic-only, 0 = sum
+            if mic_alive_env is not None:
+                # Dead-mic blocks force the sum weighting; with a zero
+                # mic the sum IS sys — block-level passthrough.
+                bidx = np.minimum((np.arange(take) + pos) * 10 // args.rate,
+                                  len(mic_alive_env) - 1)
+                alpha = alpha * mic_alive_env[bidx]
             mic_track = m * mic_gain             # shared by both renders
             sum_track = mic_track + s * sys_gain
             mixed = alpha * mic_track + (1.0 - alpha) * sum_track

@@ -1757,7 +1757,16 @@ struct LocalSpeechCapture {
         var micWatchdogRef: DispatchSourceTimer? = nil
         var micRebuildQueueRef: DispatchQueue? = nil
         if !simMode {
-        let engine = AVAudioEngine()
+        // `var`, not `let`: after an AirPods HFP format flip, a wedged
+        // engine instance fails engine.start() with -10868 IDENTICALLY
+        // forever — stop()/reset()/reinstall cannot unwedge it (field
+        // case: 155 consecutive restart failures, mic dead for the last
+        // 13 minutes of a call). The recovery path below replaces the
+        // whole instance; every closure captures this var by reference
+        // and sees the fresh engine.
+        var engine = AVAudioEngine()
+        let aecOptIn =
+            (ProcessInfo.processInfo.environment["MEETINK_AEC"] ?? "off") == "on"
 
         // Acoustic echo cancellation — OPT-IN (MEETINK_AEC=on), default off.
         // The idea: without headphones the mic hears the system audio and
@@ -1770,7 +1779,7 @@ struct LocalSpeechCapture {
         // then: headphones give a clean live transcript, and the refine
         // pass's echo suppression scrubs speaker-echo from the transcript
         // that actually gets kept.
-        if (ProcessInfo.processInfo.environment["MEETINK_AEC"] ?? "off") == "on" {
+        if aecOptIn {
             do {
                 try engine.inputNode.setVoiceProcessingEnabled(true)
                 fputs("Mic voice processing (AEC) enabled — EXPERIMENTAL, verify the mic gate shows non-zero rms\n", stderr)
@@ -1924,14 +1933,42 @@ struct LocalSpeechCapture {
                         detail: error.localizedDescription,
                         generation: generation)
                     fputs("Failed to restart mic (trigger=\(reason)): \(error.localizedDescription)\n", stderr)
+                    // The -10868 pathology: the OLD engine instance is
+                    // permanently wedged after a device-format flip; the
+                    // only known unwedge is a FRESH AVAudioEngine. This
+                    // path strictly dominates giving up — the mic is
+                    // already dead.
+                    engine = AVAudioEngine()
+                    micEngineRef = engine
+                    if aecOptIn {
+                        try? engine.inputNode.setVoiceProcessingEnabled(true)
+                    }
+                    do {
+                        try installMicTap()
+                        routeJournal.record(generation: generation)
+                        healthJournal.record(
+                            "mic-resumed",
+                            detail: "\(reason) — fresh engine after wedge",
+                            generation: generation)
+                        fputs("Mic capture resumed on a FRESH engine (trigger=\(reason))\n", stderr)
+                    } catch {
+                        healthJournal.record("mic-restart-failed",
+                            detail: "fresh engine too: \(error.localizedDescription)",
+                            generation: generation)
+                        fputs("Fresh engine also failed (trigger=\(reason)): \(error.localizedDescription)\n", stderr)
+                    }
                 }
             }
         }
 
         // Signal 1: AVAudioEngineConfigurationChange notification.
+        // object: nil, NOT the engine instance — the wedge-recovery path
+        // replaces the engine, and an object-bound observer would go
+        // deaf to the replacement's config changes. This process owns no
+        // other AVAudioEngines, so unfiltered is exact.
         _ = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
-            object: engine,
+            object: nil,
             queue: nil
         ) { _ in
             rebuildMicTap("av-engine-config-change")

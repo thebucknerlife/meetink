@@ -242,6 +242,44 @@ class AudioPolicyTests(unittest.TestCase):
             self.assertEqual(decision["windows"][1]["render"],
                              "sys-passthrough")
 
+    def test_subwindow_mic_death_renders_sys_at_block_level(self) -> None:
+        """The Gov BD field hole: mic dies 8 s INTO a mic-only window and
+        the window-granularity passthrough can't see it — those seconds
+        rendered as silence. Dead 100 ms blocks must render sys."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            seconds = 30
+            sys_audio = np.clip(self.source(seconds=seconds, level=0.10),
+                                -0.9, 0.9)
+            mic = np.clip(self.source(seconds=seconds, level=0.10),
+                          -0.9, 0.9)
+            mic[22 * RATE:] = 0.0          # dies 7 s into the 15-30 window
+            (tmp / "mic.raw").write_bytes(
+                (mic * 32767).astype(np.int16).tobytes())
+            (tmp / "sys.raw").write_bytes(
+                (sys_audio * 32767).astype(np.int16).tobytes())
+            (tmp / "route.jsonl").write_text(
+                '{"t": 0, "kind": "speakers"}\n')   # mic-only authority
+            out = tmp / "mixed.raw"
+            proc = subprocess.run([
+                sys.executable, str(REFINE / "playback_mix.py"),
+                "--mic16", str(tmp / "mic.raw"),
+                "--sys16", str(tmp / "sys.raw"),
+                "--mic", str(tmp / "mic.raw"), "--sys", str(tmp / "sys.raw"),
+                "--rate", str(RATE), "--route", str(tmp / "route.jsonl"),
+                "--out", str(out),
+            ], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            mixed = np.frombuffer(out.read_bytes(),
+                                  dtype=np.int16).astype(np.float32) / 32768.0
+            alive_rms = float(np.sqrt(np.mean(mixed[10 * RATE:20 * RATE] ** 2)))
+            dead_rms = float(np.sqrt(np.mean(mixed[24 * RATE:29 * RATE] ** 2)))
+            # The dead-mic span must carry sys audio, not silence —
+            # comparable in level to the alive mic-only span.
+            self.assertGreater(dead_rms, alive_rms * 0.3,
+                               f"dead-mic span near-silent: {dead_rms:.4f} "
+                               f"vs alive {alive_rms:.4f}")
+
     def test_cli_headphone_route_and_mic_alive_duck_are_wired(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
