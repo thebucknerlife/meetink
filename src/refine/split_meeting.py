@@ -241,9 +241,51 @@ def main() -> int:
             tmp.unlink(missing_ok=True)
 
     # Route journal applies to the whole session — both halves keep it.
-    route = Path(str(base) + ".route.jsonl")
-    if route.is_file():
-        shutil.copy2(route, Path(str(new_base) + ".route.jsonl"))
+    def split_jsonl_sidecar(path: Path, new_path: Path,
+                            synthesize_initial: bool) -> None:
+        """Time-keyed jsonl sidecars (route/health): events before the
+        cut stay with the original, events after move to the new half
+        rebased to its t=0. Route journals also get the STATE at the
+        cut synthesized as the new half's initial event — the new
+        meeting starts already-on-that-device, and an unambiguous
+        journal is authoritative for the render (a verbatim copy would
+        carry pre-cut device kinds into the new half and break both
+        halves' authority)."""
+        if not path.is_file():
+            return
+        events = []
+        for line in path.read_text().splitlines():
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(o, dict) and "t" in o:
+                events.append(o)
+        before = [o for o in events if float(o["t"]) < split_s]
+        after = [o for o in events if float(o["t"]) >= split_s]
+        new_events = []
+        if synthesize_initial and before:
+            init = dict(before[-1])
+            init["t"] = 0.1
+            new_events.append(init)
+        for o in after:
+            o = dict(o)
+            o["t"] = round(float(o["t"]) - split_s, 2)
+            new_events.append(o)
+        path.write_text("".join(json.dumps(o) + "\n" for o in before))
+        if new_events:
+            new_path.write_text(
+                "".join(json.dumps(o) + "\n" for o in new_events))
+
+    split_jsonl_sidecar(Path(str(base) + ".route.jsonl"),
+                        Path(str(new_base) + ".route.jsonl"),
+                        synthesize_initial=True)
+    split_jsonl_sidecar(Path(str(base) + ".health.jsonl"),
+                        Path(str(new_base) + ".health.jsonl"),
+                        synthesize_initial=False)
+    # The render decision manifest describes the PRE-cut m4a — stale for
+    # both halves. Reprocess regenerates it.
+    Path(str(base) + ".audio.json").unlink(missing_ok=True)
 
     # Derived artifacts (.idx, waveform caches) regenerate on demand; the
     # original's summary is now stale by construction — the user can
