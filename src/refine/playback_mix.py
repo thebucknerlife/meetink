@@ -311,6 +311,55 @@ def load_duck_spans(timing_path: str, label: str,
             for start, end in spans]
 
 
+def mic_energy_duck_spans(mic16: np.ndarray,
+                          pad_lead: float = 0.1, pad_tail: float = 0.7,
+                          gap: float = 0.5) -> list[tuple[float, float]]:
+    """Candidate spans from the MIC ITSELF — covers what ASR never wrote.
+
+    Transcript-word candidates miss every untranscribed vocalization:
+    laughs, acks, false starts, overlap the recognizer attributed
+    elsewhere. Field measurement (AE x Tom): 203 s — 21% — of the user's
+    clearly-vocal mic time had no word span, and its returned copy came
+    through unducked as 'uneven' residual echo. With any mic activity,
+    the user is vocalizing and the returned-self window applies; the
+    threshold adapts to the meeting's own mic speech level, and the same
+    mic-alive authorization gate still applies downstream (a dead mic
+    produces no energy, so this source is self-gating by construction).
+    """
+    block = RATE // 10
+    nblocks = len(mic16) // block
+    if nblocks == 0:
+        return []
+    rms = np.sqrt((mic16[:nblocks * block].reshape(nblocks, block) ** 2)
+                  .mean(axis=1))
+    act = rms[rms > 0.003]
+    if len(act) < 20:
+        return []
+    thr = max(0.01, float(np.percentile(act, 75)) * 0.15)
+    on = rms > thr
+    spans: list[list[float]] = []
+    for i in range(nblocks):
+        if not on[i]:
+            continue
+        t0, t1 = i / 10.0, (i + 1) / 10.0
+        if spans and t0 - spans[-1][1] <= gap:
+            spans[-1][1] = t1
+        else:
+            spans.append([t0, t1])
+    return [(max(0.0, s - pad_lead), e + pad_tail) for s, e in spans]
+
+
+def merge_spans(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Sort + coalesce overlapping spans from multiple candidate sources."""
+    out: list[list[float]] = []
+    for s, e in sorted(spans):
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(s, e) for s, e in out]
+
+
 def gate_duck_spans_on_mic(spans: list[tuple[float, float]],
                            mic16: np.ndarray,
                            floor: float = 0.008) -> list[tuple[float, float]]:
@@ -579,16 +628,24 @@ def main() -> int:
         else:
             log("no directional mic→sys path — waveform gate stood down")
 
-    # Field fallback for codec-decorrelated returned self: transcript timing
-    # nominates candidate windows, but direct mic energy authorizes each one.
-    # Global degraded health and per-window raw-sys passthrough remain stronger
-    # invariants, so the only surviving user copy can never be ducked.
+    # Field fallback for codec-decorrelated returned self. TWO candidate
+    # sources nominate returned-self windows — transcript word spans and
+    # the mic's own energy (which covers everything ASR never wrote:
+    # laughs, acks, overlap) — and direct mic energy authorizes each
+    # block. Global degraded health and per-window raw-sys passthrough
+    # remain stronger invariants, so the only surviving user copy can
+    # never be ducked.
     duck_spans: list[tuple[float, float]] = []
-    if args.duck_timing and not degraded_sys_passthrough and has_sum_windows:
-        raw_spans = load_duck_spans(args.duck_timing, args.duck_label)
+    if not degraded_sys_passthrough and has_sum_windows:
+        word_spans = (load_duck_spans(args.duck_timing, args.duck_label)
+                      if args.duck_timing else [])
+        energy_spans = mic_energy_duck_spans(mic16)
+        raw_spans = merge_spans(word_spans + energy_spans)
         duck_spans = gate_duck_spans_on_mic(raw_spans, mic16)
         manifest["mic_alive_span_duck"] = {
-            "candidate_spans": len(raw_spans),
+            "word_candidate_spans": len(word_spans),
+            "energy_candidate_spans": len(energy_spans),
+            "merged_candidate_spans": len(raw_spans),
             "authorized_spans": len(duck_spans),
             "authorized_seconds": round(
                 sum(end - start for start, end in duck_spans), 2),
@@ -596,11 +653,11 @@ def main() -> int:
         }
         if duck_spans:
             total = sum(end - start for start, end in duck_spans)
-            manifest["processors"].append("mic-alive-span-duck-v2")
-            log(f"mic-alive sys duck armed: {len(duck_spans)}/"
-                f"{len(raw_spans)} span(s) of {args.duck_label} "
-                f"({total:.0f}s; {len(raw_spans) - len(duck_spans)} "
-                f"skipped, mic silent)")
+            manifest["processors"].append("mic-alive-span-duck-v3-energy")
+            log(f"mic-alive sys duck armed: {total:.0f}s across "
+                f"{len(duck_spans)} span(s) "
+                f"(words {len(word_spans)} + energy {len(energy_spans)} "
+                f"candidates)")
         elif raw_spans:
             log(f"mic-alive sys duck stood down: mic silent across all "
                 f"{len(raw_spans)} candidate span(s)")

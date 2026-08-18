@@ -263,14 +263,16 @@ class AudioPolicyTests(unittest.TestCase):
                 "label": "ME",
                 "words": [{"w": "hello", "s": 1.0, "e": 2.0}],
             }]}))
+            plain_manifest = tmp / "plain-audio.json"
             base = [
                 sys.executable, str(REFINE / "playback_mix.py"),
                 "--mic16", str(mic_path), "--sys16", str(sys_path),
                 "--mic", str(mic_path), "--sys", str(sys_path),
                 "--rate", str(RATE), "--route", str(route_path),
             ]
-            plain = subprocess.run(base + ["--out", str(plain_out)],
-                                   capture_output=True, text=True)
+            plain = subprocess.run(base + [
+                "--decision-out", str(plain_manifest), "--out", str(plain_out),
+            ], capture_output=True, text=True)
             ducked = subprocess.run(base + [
                 "--duck-timing", str(timing_path), "--duck-label", "ME",
                 "--decision-out", str(manifest), "--out", str(ducked_out),
@@ -278,20 +280,31 @@ class AudioPolicyTests(unittest.TestCase):
             self.assertEqual(plain.returncode, 0, plain.stderr)
             self.assertEqual(ducked.returncode, 0, ducked.stderr)
 
+            # The mic is continuously vocal, so ENERGY candidates cover
+            # the whole clip even with no transcript at all — untranscribed
+            # vocalizations (laughs, acks) must duck the returned copy too
+            # (AE x Tom residual-echo field case). The word span adds no
+            # coverage energy didn't already nominate: identical renders.
             before = np.frombuffer(plain_out.read_bytes(), dtype=np.int16)
             after = np.frombuffer(ducked_out.read_bytes(), dtype=np.int16)
-            np.testing.assert_array_equal(before[:int(0.5 * RATE)],
-                                          after[:int(0.5 * RATE)])
-            self.assertFalse(np.array_equal(
-                before[int(1.2 * RATE):int(1.8 * RATE)],
-                after[int(1.2 * RATE):int(1.8 * RATE)]))
+            np.testing.assert_array_equal(before, after)
+
+            pm = json.loads(plain_manifest.read_text())
+            self.assertEqual(
+                pm["mic_alive_span_duck"]["word_candidate_spans"], 0)
+            self.assertGreater(
+                pm["mic_alive_span_duck"]["energy_candidate_spans"], 0)
+            self.assertGreater(
+                pm["mic_alive_span_duck"]["authorized_seconds"], 1.0)
+
             decision = json.loads(manifest.read_text())
             self.assertEqual(decision["render"], "route-authoritative-split")
             self.assertTrue(all(window["render"] == "sum"
                                 for window in decision["windows"]))
             self.assertEqual(
-                decision["mic_alive_span_duck"]["authorized_spans"], 1)
-            self.assertIn("mic-alive-span-duck-v2", decision["processors"])
+                decision["mic_alive_span_duck"]["word_candidate_spans"], 1)
+            self.assertIn("mic-alive-span-duck-v3-energy",
+                          decision["processors"])
 
 
 if __name__ == "__main__":

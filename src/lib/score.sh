@@ -22,6 +22,12 @@ cmd_audio_score() {
         print -P "${C[red]}error:${C[reset]} no audio at $audio"
         return 1
     fi
+    # Meeting targets bring their capture stems along automatically so
+    # the completeness (content-loss) check always runs.
+    local -a autosrc=()
+    local sbase="${audio%.m4a}"
+    [[ -f "$sbase.mic.wav" ]] && autosrc+=(--vs-source "$sbase.mic.wav")
+    [[ -f "$sbase.sys.wav" ]] && autosrc+=(--vs-source "$sbase.sys.wav")
     # Rewrite --compare's argument through the same resolver.
     local -a rest=()
     while (( $# )); do
@@ -34,5 +40,5 @@ cmd_audio_score() {
         fi
     done
     "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/tools/audio_score.py" \
-        "$audio" "${rest[@]}"
+        "$audio" "${autosrc[@]}" "${rest[@]}"
 }

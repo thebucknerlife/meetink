@@ -69,6 +69,65 @@ def mmss(t: float) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+def activity_fraction(seg: np.ndarray, floor: float) -> float:
+    """Fraction of 100 ms blocks with speech-ish energy."""
+    B = RATE // 10
+    nb = len(seg) // B
+    if nb == 0:
+        return 0.0
+    r = np.sqrt((seg[: nb * B].reshape(nb, B) ** 2).mean(axis=1))
+    return float(np.mean(r > floor))
+
+
+def adaptive_floor(audio: np.ndarray) -> float:
+    """Energy floor separating speech from room tone, from the stream's
+    own loud-block distribution (robust to per-meeting levels)."""
+    B = RATE // 10
+    nb = len(audio) // B
+    if nb == 0:
+        return 0.01
+    r = np.sqrt((audio[: nb * B].reshape(nb, B) ** 2).mean(axis=1))
+    act = r[r > 0.003]
+    if len(act) < 20:
+        return 0.01
+    return max(0.008, float(np.percentile(act, 75)) * 0.15)
+
+
+def completeness_windows(render: np.ndarray, sources: list[np.ndarray],
+                         window_s: int) -> list[dict]:
+    """Content-loss detection: MOS scores what's THERE; this scores what
+    is MISSING. A render window that goes quiet while a source stream
+    had speech is content loss regardless of how 'clean' the silence
+    sounds (calibration case: a regressed mix erased the far side in
+    103 windows and OUTSCORED the correct render on MOS).
+
+    Reference activity per window = the max across sources (mic + sys):
+    speech anywhere in the capture should exist somewhere in the render.
+    """
+    win = window_s * RATE
+    r_floor = adaptive_floor(render)
+    s_floors = [adaptive_floor(s) for s in sources]
+    out: list[dict] = []
+    n = max([len(render)] + [len(s) for s in sources])
+    for start in range(0, n, win):
+        ref_act = 0.0
+        for src, fl in zip(sources, s_floors):
+            seg = src[start:start + win]
+            if len(seg):
+                ref_act = max(ref_act, activity_fraction(seg, fl))
+        ren_act = activity_fraction(render[start:start + win], r_floor)
+        row = {"t": start / RATE,
+               "source_activity": round(ref_act, 3),
+               "render_activity": round(ren_act, 3)}
+        # Loss = the source clearly had speech and the render clearly
+        # doesn't. Thresholds are deliberately loose — this flags gross
+        # erasure, not mixing taste.
+        row["content_loss"] = bool(ref_act >= 0.25
+                                   and ren_act < ref_act * 0.25)
+        out.append(row)
+    return out
+
+
 def score_windows(audio: np.ndarray, window_s: int) -> list[dict]:
     """Per-window DNSMOS + PLCMOS. Near-silent windows are skipped —
     scoring silence produces garbage MOS that poisons aggregates."""
@@ -169,25 +228,52 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("audio")
     ap.add_argument("--compare", help="second render of the same content")
+    ap.add_argument("--vs-source", action="append", default=[],
+                    help="capture stream(s) (mic.wav/sys.wav) for the "
+                    "completeness check — flags render windows that went "
+                    "quiet where a source had speech")
+    ap.add_argument("--no-mos", action="store_true",
+                    help="skip MOS models (fast completeness-only run)")
     ap.add_argument("--window", type=int, default=15)
     ap.add_argument("--json", dest="json_out")
     args = ap.parse_args()
 
     a = decode(args.audio)
-    rows_a = score_windows(a, args.window)
+    rows_a = [] if args.no_mos else score_windows(a, args.window)
     agg_a = aggregate(rows_a)
-    print_report(args.audio, rows_a, agg_a)
+    if not args.no_mos:
+        print_report(args.audio, rows_a, agg_a)
 
     result = {"file": args.audio, "aggregate": agg_a, "windows": rows_a}
+
+    sources = [decode(p) for p in args.vs_source]
+
+    def completeness_for(render: np.ndarray, name: str) -> list[dict]:
+        rows = completeness_windows(render, sources, args.window)
+        lost = [r for r in rows if r["content_loss"]]
+        print(f"\ncompleteness — {os.path.basename(name)}: "
+              f"{len(lost)}/{len(rows)} windows with content loss")
+        for r in sorted(lost, key=lambda x: x["render_activity"])[:6]:
+            print(f"    {mmss(r['t']):>7s}  source active "
+                  f"{r['source_activity']*100:.0f}%  render "
+                  f"{r['render_activity']*100:.0f}%")
+        return rows
+
+    if sources:
+        result["completeness"] = completeness_for(a, args.audio)
+
     if args.compare:
         b = decode(args.compare)
-        rows_b = score_windows(b, args.window)
+        rows_b = [] if args.no_mos else score_windows(b, args.window)
         agg_b = aggregate(rows_b)
-        print_report(args.compare, rows_b, agg_b)
-        print_compare(args.audio, rows_a, args.compare, rows_b)
-        result = {"a": result,
-                  "b": {"file": args.compare, "aggregate": agg_b,
-                        "windows": rows_b}}
+        if not args.no_mos:
+            print_report(args.compare, rows_b, agg_b)
+            print_compare(args.audio, rows_a, args.compare, rows_b)
+        result_b = {"file": args.compare, "aggregate": agg_b,
+                    "windows": rows_b}
+        if sources:
+            result_b["completeness"] = completeness_for(b, args.compare)
+        result = {"a": result, "b": result_b}
     if args.json_out:
         with open(args.json_out, "w") as f:
             json.dump(result, f, indent=2)
