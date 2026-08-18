@@ -2380,8 +2380,10 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 add("Activity…", #selector(showMeetingActivity))
             }
         } else if !lastResolvedPath.isEmpty {
-            // Grouped: exports / pipeline / file / destructive. "…" only
-            // on items with a follow-up step (dialog or panel).
+            // Grouped per Greg's spec: exports / pipeline / file /
+            // meeting-level / destructive. "…" only on items with a
+            // follow-up step (dialog or panel) — Duplicate and Archive
+            // act immediately, so no ellipsis.
             add("Download Transcript…", #selector(downloadTranscript))
             if audioPath != nil {
                 add("Download Audio…", #selector(downloadAudio))
@@ -2407,17 +2409,18 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
                 menu.items.last?.toolTip = "Re-run transcription, diarization "
                     + "and audio enhancement on this meeting's kept audio"
             }
-            menu.addItem(.separator())
-            add("Activity…", #selector(showMeetingActivity))
-            add("Open Folder", #selector(openFolder))
-            add("Duplicate Meeting", #selector(duplicateMeeting))
             // Two back-to-back meetings on one app land in one
             // recording; the cut point is wherever the playhead sits.
             if audioPath != nil, (player?.currentTime ?? 0) > 1 {
                 add("Split at Playhead…", #selector(splitAtPlayhead))
             }
-            add("Archive Meeting", #selector(archiveFromMenu))
+            menu.addItem(.separator())
             add("Rename…", #selector(renameFromMenu))
+            add("Open Folder", #selector(openFolder))
+            menu.addItem(.separator())
+            add("Activity…", #selector(showMeetingActivity))
+            add("Duplicate Meeting", #selector(duplicateMeeting))
+            add("Archive Meeting", #selector(archiveFromMenu))
             menu.addItem(.separator())
             add("Delete Meeting…", #selector(deleteMeeting))
         } else {
@@ -5057,6 +5060,42 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     }
 }
 
+/// Path-based transcript export (meetings-list context menu): raw
+/// transcript with a compact context header. The meeting page's export
+/// adds talk-share lines on top (those need the parsed snapshot).
+func exportTranscriptText(_ path: String) -> String {
+    var lines: [String] = []
+    lines.append("# Meeting: \(meetingDisplayName(path))")
+    var dateLine = "# Date: \(formatMeetingDate(meetingRecordingDate(path)))"
+    if let dur = meetingDuration(path, isLive: false) {
+        dateLine += "  ·  Duration: \(formatDuration(dur))"
+    }
+    lines.append(dateLine)
+    let meta = meetingMeta(path)
+    if let event = meta["event"] as? [String: Any] {
+        if let t = event["title"] as? String, !t.isEmpty {
+            var ev = "# Calendar event: \(t)"
+            if let st = event["start"] as? String, !st.isEmpty { ev += " — \(st)" }
+            lines.append(ev)
+        }
+        if let att = event["attendees"] as? [String], !att.isEmpty {
+            lines.append("# Event attendees (invited — not necessarily who spoke): "
+                + att.joined(separator: ", "))
+        }
+    }
+    let body = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+    return lines.joined(separator: "\n") + "\n\n" + body
+}
+
+/// "<Name>_transcript_M-d.txt" — same naming as the meeting page's
+/// Download Transcript.
+func transcriptDownloadName(_ path: String) -> String {
+    let df = DateFormatter()
+    df.dateFormat = "M-d"
+    return meetingDisplayName(path).replacingOccurrences(of: "/", with: "-")
+        + "_transcript_" + df.string(from: meetingRecordingDate(path)) + ".txt"
+}
+
 // MARK: - Meetings list page
 
 /// Table with Finder-ish affordances: ⌘⌫ deletes the selection, and a
@@ -5206,6 +5245,11 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         table.usesAlternatingRowBackgroundColors = true
         table.allowsMultipleSelection = true
         let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Download Transcript…",
+                                action: #selector(downloadTranscriptsClicked), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Copy All",
+                                action: #selector(copyAllClicked), keyEquivalent: ""))
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Rename…", action: #selector(renameClicked), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Archive", action: #selector(archiveClicked), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Delete", action: #selector(deleteClicked), keyEquivalent: ""))
@@ -5413,9 +5457,68 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.items.first { $0.action == #selector(archiveClicked) }?
             .title = archiveMode ? "Unarchive" : "Archive"
-        // Rename is single-meeting-only.
+        let multi = targetRows().count > 1
+        // Rename and Copy All are single-meeting-only; the download item
+        // flips to a no-dialog bulk write for a multi-selection.
         menu.items.first { $0.action == #selector(renameClicked) }?
-            .isHidden = targetRows().count > 1
+            .isHidden = multi
+        menu.items.first { $0.action == #selector(copyAllClicked) }?
+            .isHidden = multi
+        menu.items.first { $0.action == #selector(downloadTranscriptsClicked) }?
+            .title = multi ? "Download Transcripts to Downloads"
+                           : "Download Transcript…"
+    }
+
+    /// Single selection: save panel (user consent grants the location).
+    /// Multi selection: write one export per meeting straight into
+    /// ~/Downloads, numbered on name collisions, then reveal them in
+    /// Finder as the "it worked" signal.
+    @objc private func downloadTranscriptsClicked() {
+        let paths = targetRows().compactMap { r in
+            r >= 0 && r < files.count ? files[r].path : nil
+        }
+        guard !paths.isEmpty else { return }
+        let fm = FileManager.default
+        if paths.count == 1, let path = paths.first {
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = transcriptDownloadName(path)
+            panel.directoryURL = fm.urls(for: .downloadsDirectory,
+                                         in: .userDomainMask).first
+            panel.begin { response in
+                guard response == .OK, let dest = panel.url else { return }
+                try? exportTranscriptText(path)
+                    .write(to: dest, atomically: true, encoding: .utf8)
+            }
+            return
+        }
+        guard let downloads = fm.urls(for: .downloadsDirectory,
+                                      in: .userDomainMask).first else { return }
+        var written: [URL] = []
+        for path in paths {
+            let base = transcriptDownloadName(path)
+            var dest = downloads.appendingPathComponent(base)
+            var n = 2
+            while fm.fileExists(atPath: dest.path) {
+                dest = downloads.appendingPathComponent(
+                    base.replacingOccurrences(of: ".txt", with: " \(n).txt"))
+                n += 1
+            }
+            if (try? exportTranscriptText(path)
+                .write(to: dest, atomically: true, encoding: .utf8)) != nil {
+                written.append(dest)
+            }
+        }
+        if !written.isEmpty {
+            NSWorkspace.shared.activateFileViewerSelecting(written)
+        }
+    }
+
+    @objc private func copyAllClicked() {
+        guard let row = targetRows().first,
+              row >= 0, row < files.count else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(exportTranscriptText(files[row].path), forType: .string)
     }
 
     /// Rename a meeting: new display name → slug, stamped prefix kept.
