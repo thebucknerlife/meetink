@@ -240,6 +240,28 @@ def main() -> int:
         else:
             tmp.unlink(missing_ok=True)
 
+    # Experimental tap sidecar (bare session-dir name, not <base>-keyed):
+    # cut like the other audio. Its journal is wall-clock-keyed (epoch
+    # "t"), so both halves keep a verbatim copy — no rebasing lies.
+    # Rate-rolled segments (tap-experiment.2.wav …) stay with the
+    # original whole: attributing a mid-call rate change to the right
+    # half isn't worth the complexity for a diagnostic artifact.
+    tap = txt.parent / "tap-experiment.wav"
+    if tap.is_file():
+        new_dir = Path(str(new_base)).parent
+        if ffmpeg("-ss", str(split_s), "-i", str(tap), "-c", "copy",
+                  str(new_dir / tap.name)):
+            tmp = tap.parent / (".splittmp-" + tap.name)
+            if ffmpeg("-t", str(split_s), "-i", str(tap), "-c", "copy",
+                      str(tmp)):
+                tmp.replace(tap)
+            else:
+                tmp.unlink(missing_ok=True)
+        tap_journal = Path(str(tap) + ".tap-journal.jsonl")
+        if tap_journal.is_file():
+            shutil.copy2(tap_journal,
+                         new_dir / tap_journal.name)
+
     # Route journal applies to the whole session — both halves keep it.
     def split_jsonl_sidecar(path: Path, new_path: Path,
                             synthesize_initial: bool) -> None:

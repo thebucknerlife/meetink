@@ -410,12 +410,25 @@ func mWaveformImage(size: CGFloat, barColor: NSColor, tile: NSColor? = nil) -> N
 /// path.
 func applyEventToMeeting(txtPath: String, event e: [String: Any]) -> String {
     let title = (e["title"] as? String) ?? ""
-    let names = ((e["attendees"] as? [[String: String]]) ?? [])
-        .compactMap { $0["name"]?.isEmpty == false ? $0["name"] : $0["email"] }
+    let atts = (e["attendees"] as? [[String: String]]) ?? []
+    // Transcript header keeps bare names — the diarize whitelist derives
+    // profile names from it. meta.json keeps "Name <email>" so the
+    // attendee panel can BOTH display the human name and link the email
+    // (storing name-or-email lost the email for exactly the attendees
+    // who had display names — field case: Diogo listed as nobody).
+    let names = atts.compactMap {
+        $0["name"]?.isEmpty == false ? $0["name"] : $0["email"]
+    }
+    let full = atts.compactMap { a -> String? in
+        let name = a["name"] ?? "", email = a["email"] ?? ""
+        if name.isEmpty { return email.isEmpty ? nil : email }
+        if email.isEmpty { return name }
+        return "\(name) <\(email)>"
+    }
     var path = txtPath
     setMeetingMeta(path, "event", ["title": title,
                                    "start": (e["start"] as? String) ?? "",
-                                   "attendees": names])
+                                   "attendees": full])
     if !title.isEmpty, let newPath = renameMeeting(txtPath: path, displayName: title) {
         path = newPath
     }
@@ -863,17 +876,64 @@ func postprocPath() -> String? {
     return line.isEmpty ? nil : line
 }
 
+/// All live post-processing runs. Concurrent runs are real (meeting B
+/// ends while meeting A still renders); each owns
+/// /tmp/meetink-postproc.d/<session-id>/{pid,state,path}. Falls back to
+/// the legacy singleton triplet so a not-yet-redeployed launcher still
+/// reports its one run. Dead pids (killed runs) are skipped.
+func postprocRuns() -> [(path: String, state: String)] {
+    let fm = FileManager.default
+    var out: [(String, String)] = []
+    let root = "/tmp/meetink-postproc.d"
+    for id in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
+        let d = root + "/" + id
+        guard let pidTxt = try? String(contentsOfFile: d + "/pid",
+                                       encoding: .utf8),
+              let pid = Int32(pidTxt.trimmingCharacters(in: .whitespacesAndNewlines)),
+              kill(pid, 0) == 0,
+              let p = try? String(contentsOfFile: d + "/path",
+                                  encoding: .utf8)
+        else { continue }
+        let path = p.trimmingCharacters(in: .whitespacesAndNewlines)
+        let state = ((try? String(contentsOfFile: d + "/state",
+                                  encoding: .utf8)) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !path.isEmpty { out.append((path, state)) }
+    }
+    if out.isEmpty, let s = postprocState(), let p = postprocPath() {
+        out.append((p, s))
+    }
+    return out.sorted { $0.0 < $1.0 }
+}
+
+/// The run working on THIS meeting (exact path, or same folder — titling
+/// renames the transcript mid-run).
+func postprocRun(for meetingPath: String) -> (path: String, state: String)? {
+    guard !meetingPath.isEmpty else { return nil }
+    let dir = (meetingPath as NSString).deletingLastPathComponent
+    return postprocRuns().first {
+        $0.path == meetingPath
+            || ($0.path as NSString).deletingLastPathComponent == dir
+    }
+}
+
 /// Kill an in-flight post-process when a deletion orphans it. Exact
 /// path comparison misses: the pipeline records its target at START and
 /// titling renames mid-run. Folder-level match catches the rename case;
 /// the target-no-longer-exists check (call AFTER trashing) catches
 /// everything else — whatever the job thinks it's writing, it's gone.
+/// NOTE: postproc-kill stops EVERY run; with a second meeting's run
+/// live this is collateral, but delete-during-two-postprocs is rare and
+/// Reprocess recovers.
 func killPostprocIfOrphaned(deletedPath: String) {
-    guard let pp = postprocPath(), let launcher = launcherPath() else { return }
-    let sameFolder = (pp as NSString).deletingLastPathComponent
-        == (deletedPath as NSString).deletingLastPathComponent
-    let orphaned = !FileManager.default.fileExists(atPath: pp)
-    guard pp == deletedPath || sameFolder || orphaned else { return }
+    guard let launcher = launcherPath() else { return }
+    let dir = (deletedPath as NSString).deletingLastPathComponent
+    let hit = postprocRuns().contains {
+        $0.path == deletedPath
+            || ($0.path as NSString).deletingLastPathComponent == dir
+            || !FileManager.default.fileExists(atPath: $0.path)
+    }
+    guard hit else { return }
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: launcher)
     proc.arguments = ["postproc-kill"]
@@ -1357,11 +1417,7 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     /// Reprocess lives in the … menu; "running" is derived from the
     /// postproc marker files (the run is a detached process now).
     private var reprocessRunning: Bool {
-        guard postprocState() != nil, let target = postprocPath(),
-              !lastResolvedPath.isEmpty else { return false }
-        return target == lastResolvedPath
-            || (target as NSString).deletingLastPathComponent
-               == (lastResolvedPath as NSString).deletingLastPathComponent
+        postprocRun(for: lastResolvedPath) != nil
     }
     private var fetchedEvents: [[String: Any]] = []
     /// Wired by MainWindowController: after Delete, go back to Meetings.
@@ -3985,17 +4041,24 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             }
             return t
         }
+        // Emails link to profiles; a name-only entry (older meta stored
+        // name-or-email and lost the address) still deserves a row —
+        // dropping it made a two-person meeting list only the user.
+        // Calendar resource addresses are not people.
+        func keep(_ s: String) -> Bool {
+            !s.isEmpty && !s.hasSuffix("resource.calendar.google.com")
+        }
         if let ev = meetingMeta(lastResolvedPath)["event"] as? [String: Any],
            let list = ev["attendees"] as? [String] {
-            let emails = list.map(norm).filter { $0.contains("@") }
-            if !emails.isEmpty { return emails }
+            let entries = list.map(norm).filter(keep)
+            if !entries.isEmpty { return entries }
         }
         for line in rawText.components(separatedBy: "\n")
         where line.hasPrefix("# attendees:") {
             return line.dropFirst("# attendees:".count)
                 .components(separatedBy: ",")
                 .map(norm)
-                .filter { $0.contains("@") }
+                .filter(keep)
         }
         return []
     }
@@ -4944,12 +5007,8 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         // Scoped to THIS meeting: another meeting's post-processing must
         // not take over every page (field report: in a new live meeting
         // while an old one processed, the live header said 'processing').
-        if let pp = postprocState(), let target = postprocPath(),
-           !lastResolvedPath.isEmpty,
-           target == lastResolvedPath
-           || (target as NSString).deletingLastPathComponent
-              == (lastResolvedPath as NSString).deletingLastPathComponent {
-            processingField.stringValue = "post-processing… \(pp)"
+        if let run = postprocRun(for: lastResolvedPath) {
+            processingField.stringValue = "post-processing… \(run.state)"
             processingField.textColor = .systemOrange
             processingField.isHidden = false
             statusDot.textColor = .systemOrange
@@ -5557,13 +5616,15 @@ final class MeetingsViewController: NSViewController, NSTableViewDataSource,
         // Per-row status: red live, orange while its post-process runs.
         let liveTarget = (try? fm.destinationOfSymbolicLink(atPath: liveSymlinkPath()))
         let recording = recordingPID() != nil
-        let processing = postprocPath()
+        // Every live run marks its row — concurrent postprocs are real
+        // (field case: a 13 s orphan's badge hid a 32-min meeting's run).
+        let processing = Set(postprocRuns().map { $0.path })
         let playing = playingProvider?()
         let fm2 = FileManager.default
         var stamped: [(String, String, Date, MeetingStatus, TimeInterval?,
                        Int?, Int?, Set<String>)] = out.map {
             let st: MeetingStatus = (recording && $0.0 == liveTarget) ? .live
-                : ($0.0 == processing ? .processing
+                : (processing.contains($0.0) ? .processing
                    : ($0.0 == playing ? .playing : .ended))
             // Durations are cached by mtime; the live row recomputes so it
             // ticks.
@@ -6753,19 +6814,8 @@ final class MeetingActivityWindowController: NSWindowController {
         if isLiveRecording(txtPath: txtPath) {
             out.append("● RECORDING NOW")
         }
-        if let ppPath = try? String(contentsOfFile: "/tmp/meetink-postproc.path",
-                                    encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           ppPath == txtPath
-            || (ppPath as NSString).deletingLastPathComponent == dir,
-           let state = try? String(contentsOfFile: "/tmp/meetink-postproc.state",
-                                   encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           let pidRaw = try? String(contentsOfFile: "/tmp/meetink-postproc.pid",
-                                    encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           let pid = Int32(pidRaw), kill(pid, 0) == 0 {
-            out.append("◐ post-processing: \(state)")
+        if let run = postprocRun(for: txtPath) {
+            out.append("◐ post-processing: \(run.state)")
         }
 
         // Timeline: every activity-log line that references this meeting,
@@ -7055,12 +7105,14 @@ final class ActivityViewController: NSViewController, NSTableViewDataSource, NST
         } else {
             lines.append("○ Not recording")
         }
-        if let pp = postprocState() {
-            let target = postprocPath().map(meetingDisplayName) ?? "?"
-            lines.append("● Post-processing — \(target)")
-            lines.append("    \(pp)")
-        } else {
+        let ppRuns = postprocRuns()
+        if ppRuns.isEmpty {
             lines.append("○ No post-processing")
+        } else {
+            for run in ppRuns {
+                lines.append("● Post-processing — \(meetingDisplayName(run.path))")
+                lines.append("    \(run.state)")
+            }
         }
         for (name, status) in uploadJobsProvider?() ?? [] {
             lines.append("● Upload — \(name): \(status)")

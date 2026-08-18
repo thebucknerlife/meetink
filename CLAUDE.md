@@ -48,7 +48,9 @@ stepping on each other and on live recordings:
 
 - **Gate every deploy on recorder state.** Before the pull OR the build, check
   `meetink status` says "not recording" AND no post-processing is live
-  (`/tmp/meetink-postproc.pid` absent or its PID dead). A mid-postproc pull
+  (`/tmp/meetink-postproc.pid` absent or its PID dead, AND no live-pid run
+  dir under `/tmp/meetink-postproc.d/` — concurrent postprocs each own one;
+  the legacy pidfile mirrors only one of them). A mid-postproc pull
   swaps pipeline scripts between stages (mixed-version run); a mid-recording
   `app build` kills the app-owned watch daemon over a live call. Gate on the
   CHECK RESULT — never chain `status && deploy` and proceed regardless.

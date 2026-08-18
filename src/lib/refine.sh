@@ -17,6 +17,77 @@
 # title_session_file from titling.sh, summary_save from summary.sh,
 # _rewrite-style inode-preserving writes (see diarize.sh for rationale).
 
+# ---------------------------------------------------------------------------
+# Post-processing run registry. Concurrent runs are real (meeting B ends
+# while meeting A still renders — field case: a 13 s orphan's pipeline raced
+# a 32-minute meeting's and the app pinned "processing" on the wrong row).
+# Each run owns /tmp/meetink-postproc.d/<session-id>/{pid,state,path}; the
+# legacy /tmp/meetink-postproc.{pid,state,path} singleton stays mirrored to
+# a live run at claim/handoff so old readers and the multi-agent deploy gate
+# ("postproc.pid absent or dead" = no postproc) keep working.
+typeset -g MK_PP_DIR="" \
+          MK_PP_STATE=/tmp/meetink-postproc.state \
+          MK_PP_PATH=/tmp/meetink-postproc.path
+
+pp_claim() {   # $1 = transcript path this run is processing
+    local id="${${1:t}:r}"
+    MK_PP_DIR="/tmp/meetink-postproc.d/$id"
+    MK_PP_STATE="$MK_PP_DIR/state"
+    MK_PP_PATH="$MK_PP_DIR/path"
+    mkdir -p "$MK_PP_DIR" 2>/dev/null
+    print -- $$   > "$MK_PP_DIR/pid"
+    print -- "$1" > "$MK_PP_PATH"
+    print -- $$   > /tmp/meetink-postproc.pid
+    print -- "$1" > /tmp/meetink-postproc.path
+}
+
+pp_state() {   # $1 = narration line for the app's status surfaces
+    print -- "$1" > "$MK_PP_STATE" 2>/dev/null
+    # Mirror into the legacy slot while we own it (or its owner died).
+    local lp=$(cat /tmp/meetink-postproc.pid 2>/dev/null)
+    if [[ -z "$lp" || "$lp" == "$$" ]] || ! kill -0 "$lp" 2>/dev/null; then
+        print -- $$ > /tmp/meetink-postproc.pid 2>/dev/null
+        [[ -f "$MK_PP_PATH" ]] && \
+            cat "$MK_PP_PATH" > /tmp/meetink-postproc.path 2>/dev/null
+        print -- "$1" > /tmp/meetink-postproc.state 2>/dev/null
+    fi
+    return 0
+}
+
+pp_path_set() {   # $1 = retargeted transcript path (rename followed)
+    print -- "$1" > "$MK_PP_PATH" 2>/dev/null
+    [[ "$(cat /tmp/meetink-postproc.pid 2>/dev/null)" == "$$" ]] && \
+        print -- "$1" > /tmp/meetink-postproc.path 2>/dev/null
+    return 0
+}
+
+pp_done() {   # release this run; hand the legacy slot to a survivor
+    [[ -n "$MK_PP_DIR" ]] && rm -rf "$MK_PP_DIR"
+    MK_PP_DIR=""
+    MK_PP_STATE=/tmp/meetink-postproc.state
+    MK_PP_PATH=/tmp/meetink-postproc.path
+    local d p live=""
+    for d in /tmp/meetink-postproc.d/*(N/om); do
+        p=$(cat "$d/pid" 2>/dev/null)
+        if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
+            [[ -z "$live" ]] && live="$d"
+        else
+            rm -rf "$d"   # dead leftover from a killed run
+        fi
+    done
+    if [[ -n "$live" ]]; then
+        cat "$live/pid"   > /tmp/meetink-postproc.pid   2>/dev/null
+        cat "$live/path"  > /tmp/meetink-postproc.path  2>/dev/null
+        cat "$live/state" > /tmp/meetink-postproc.state 2>/dev/null
+    else
+        rm -f /tmp/meetink-postproc.pid /tmp/meetink-postproc.path \
+              /tmp/meetink-postproc.state
+        rmdir /tmp/meetink-postproc.d 2>/dev/null
+    fi
+    return 0
+}
+
+
 MK_SPOOL_DIR="${MEETINK_SPOOL_DIR:-$MK_HOME/spool}"
 MK_PARAKEET_VENV="$MK_HOME/parakeet-venv"
 
@@ -103,13 +174,12 @@ refine_session() {
     [[ -s "$sys" ]] && args+=(--sys "$sys")
 
     _refine_lock
-    print -- "$actual" > /tmp/meetink-postproc.path
-    print -- $$ > /tmp/meetink-postproc.pid
+    if [[ -n "$MK_PP_DIR" ]]; then pp_path_set "$actual"; else pp_claim "$actual"; fi
     # Stream progress into the postproc state file so the app's status bar
     # can narrate ("post-processing… identifying speakers 43% (step 2/3)").
     # rc comes from pipestatus[1] — the pipeline's last command is the
     # reader loop, which always succeeds.
-    local state=/tmp/meetink-postproc.state
+    local state="$MK_PP_STATE"
     print -- "starting (step 1/3)" > "$state"
     local rc=0
     "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log | \
@@ -127,7 +197,7 @@ refine_session() {
             # Re-assert the target pointer — a raced cleanup can delete it
             # mid-run, blanking the meeting's scoped status (self-heals on
             # the next line).
-            [[ -f /tmp/meetink-postproc.path ]] || print -- "$actual" > /tmp/meetink-postproc.path 2>/dev/null
+            [[ -f "$MK_PP_PATH" ]] || print -- "$actual" > "$MK_PP_PATH" 2>/dev/null
         done
     rc=${pipestatus[1]}
     _refine_unlock
@@ -229,7 +299,7 @@ _denoise_stream() {
         print -- "$in"; return 0
     fi
     print -- "mixing audio — denoising ${what} ~0% (step 3/3)" \
-        > /tmp/meetink-postproc.state 2>/dev/null
+        > "$MK_PP_STATE" 2>/dev/null
     local drc=1
     if ffmpeg -v error -y -f s16le -ar $rate -ac 1 -i "$in" "$td/dn-in-$what.wav" 2>>/tmp/meetink-refine.log; then
         # DFN prints nothing until it finishes, but its realtime factor
@@ -246,7 +316,7 @@ _denoise_stream() {
             dpct=$(( (SECONDS - dt0) * 100 / expect ))
             (( dpct > 95 )) && dpct=95
             print -- "mixing audio — denoising ${what} ~${dpct}% (step 3/3)" \
-                > /tmp/meetink-postproc.state 2>/dev/null
+                > "$MK_PP_STATE" 2>/dev/null
         done
         wait $dpid 2>/dev/null; drc=$?
     fi
@@ -271,7 +341,7 @@ _pmix_run() {
             ("playback-mix: progress "*)
                 local -a w=(${=line})
                 print -- "mixing audio — ${w[4]:-rendering} ${w[3]}% (step 3/3)" \
-                    > /tmp/meetink-postproc.state 2>/dev/null ;;
+                    > "$MK_PP_STATE" 2>/dev/null ;;
         esac
     done
     return ${pipestatus[1]}
@@ -417,7 +487,7 @@ _mix_enhanced_m4a() {
                     --mode cleanmix \
                     --mic16 "$amic" --sys16 "$asys" \
                     --mic "$dmic" --sys "$psys" --rate $par \
-                    --progress-state /tmp/meetink-postproc.state \
+                    --progress-state "$MK_PP_STATE" \
                     --out "$pd/mixed.raw" 2>>/tmp/meetink-refine.log; then
                 local crc=0
                 ffmpeg -v error -y -f s16le -ar $par -ac 1 -i "$pd/mixed.raw" \
@@ -457,7 +527,7 @@ _mix_enhanced_m4a() {
                 --mic16 "$mic" --sys16 "$sys" \
                 --mic "$nmic" --sys "$nsys" --rate $nar \
                 --timing "$timing" --me "$(me_name_get 2>/dev/null || print ME)" \
-                --progress-state /tmp/meetink-postproc.state \
+                --progress-state "$MK_PP_STATE" \
                 --out "$nd/mixed.raw" 2>>/tmp/meetink-refine.log; then
             local nrc=0
             ffmpeg -v error -y -f s16le -ar $nar -ac 1 -i "$nd/mixed.raw" \
@@ -511,7 +581,7 @@ _mix_enhanced_m4a() {
         if "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/enhance.py" \
                 --mic "$mic" --sys "$sys" \
                 --out-mic "$ed/mic.raw" --out-sys "$ed/sys.raw" \
-                --progress-state /tmp/meetink-postproc.state \
+                --progress-state "$MK_PP_STATE" \
                 "${arch[@]}" "${dfnflag[@]}" \
                 2>>/tmp/meetink-refine.log; then
             mic="$ed/mic.raw"
@@ -544,12 +614,27 @@ _mix_enhanced_m4a() {
 postproc_kill() {
     local holder=$(cat /tmp/meetink-refine.lock/pid 2>/dev/null)
     [[ -n "$holder" ]] && kill -9 "$holder" 2>/dev/null || true
+    # Concurrent runs each own a dir — kill every run's shell (checking
+    # the pid still belongs to a meetink process; pids get recycled),
+    # then the worker processes by pattern (those can't be run-scoped).
+    local d p
+    _pp_kill_if_ours() {
+        [[ -n "$1" ]] || return 0
+        ps -p "$1" -o command= 2>/dev/null | grep -q meetink && \
+            kill -9 "$1" 2>/dev/null
+        return 0
+    }
+    for d in /tmp/meetink-postproc.d/*(N/); do
+        _pp_kill_if_ours "$(cat "$d/pid" 2>/dev/null)"
+    done
+    _pp_kill_if_ours "$(cat /tmp/meetink-postproc.pid 2>/dev/null)"
     pkill -9 -f "src/refine/refine.py" 2>/dev/null || true
     pkill -9 -f "src/refine/enhance.py" 2>/dev/null || true
     pkill -9 -f "src/refine/pyannote_diar.py" 2>/dev/null || true
     pkill -9 -f "enhance-venv/bin/deepFilter" 2>/dev/null || true
-    rm -rf /tmp/meetink-refine.lock
-    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
+    rm -rf /tmp/meetink-refine.lock /tmp/meetink-postproc.d
+    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path \
+          /tmp/meetink-postproc.pid
 }
 
 # Listening copy for an IMPORT: single stream, so no echo cancellation
@@ -571,7 +656,7 @@ _import_enhanced_m4a() {
     local dfn_ok=""
     [[ "$(grep '^import_deepfilter=' "$MK_CONFIG_FILE" 2>/dev/null | cut -d= -f2-)" == "on" ]] && dfn_ok=1
     if [[ -n "$dfn_ok" ]] && enhance_enabled && [[ -x "$dfn" ]]; then
-        print -- "enhancing audio — DeepFilterNet (step 3/3)" > /tmp/meetink-postproc.state
+        print -- "enhancing audio — DeepFilterNet (step 3/3)" > "$MK_PP_STATE"
         if ffmpeg -v error -y -i "$input" -vn -ar 48000 -ac 1 "$td/in.wav" 2>>/tmp/meetink-refine.log && \
            "$dfn" "$td/in.wav" -o "$td" >>/tmp/meetink-refine.log 2>&1 && \
            [[ -f "$td/in_DeepFilterNet3.wav" ]] && \
@@ -813,10 +898,9 @@ cmd_reprocess() {
     _refine_lock
     # Same progress narration cmd_stop's refine gets — the app's status
     # bar shows "post-processing… <phase> (step N/3)" while this runs.
-    local state=/tmp/meetink-postproc.state
+    if [[ -n "$MK_PP_DIR" ]]; then pp_path_set "$actual"; else pp_claim "$actual"; fi
+    local state="$MK_PP_STATE"
     print -- "starting (step 1/3)" > "$state"
-    print -- "$actual" > /tmp/meetink-postproc.path
-    print -- $$ > /tmp/meetink-postproc.pid
     local rc=0
     "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" "${args[@]}" 2>/tmp/meetink-refine.log | \
         while IFS= read -r line; do
@@ -833,7 +917,7 @@ cmd_reprocess() {
             # Re-assert the target pointer — a raced cleanup can delete it
             # mid-run, blanking the meeting's scoped status (self-heals on
             # the next line).
-            [[ -f /tmp/meetink-postproc.path ]] || print -- "$actual" > /tmp/meetink-postproc.path 2>/dev/null
+            [[ -f "$MK_PP_PATH" ]] || print -- "$actual" > "$MK_PP_PATH" 2>/dev/null
         done
     rc=${pipestatus[1]}
     _refine_unlock
@@ -858,7 +942,7 @@ cmd_reprocess() {
         # Rebuild the listenable m4a too — reprocess exists to pick up
         # pipeline improvements, and the audio pipeline is part of that.
         if [[ -s "$tmpdir/mic.raw" && -s "$tmpdir/sys.raw" ]]; then
-            print -- "enhancing audio (step 3/3)" > /tmp/meetink-postproc.state
+            print -- "enhancing audio (step 3/3)" > "$MK_PP_STATE"
             _mix_enhanced_m4a "$tmpdir/mic.raw" "$tmpdir/sys.raw" "${base}.m4a" && \
                 print -P "${C[green]}✓${C[reset]} Audio rebuilt: ${C[dim]}${base:t}.m4a (enhanced)${C[reset]}"
         fi
@@ -866,7 +950,7 @@ cmd_reprocess() {
         # guess when one exists) and a summary regenerated from the NEW
         # transcript. A recovered meeting (stranded spools) gets its
         # summary here — the original pipeline died before this step.
-        print -- "generating title and summary (step 3/3)" > /tmp/meetink-postproc.state
+        print -- "generating title and summary (step 3/3)" > "$MK_PP_STATE"
         if typeset -f infer_event_link >/dev/null 2>&1; then
             infer_event_link "$actual"
         fi
@@ -875,12 +959,12 @@ cmd_reprocess() {
         fi
     else
         rm -rf "$tmpdir"
-        rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
+        pp_done
         print -P "${C[red]}error:${C[reset]} reprocess failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
         return 1
     fi
     rm -rf "$tmpdir"
-    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
+    pp_done
     typeset -f mk_notify >/dev/null 2>&1 && \
         mk_notify "Reprocess done" "${${actual:t}:r}"
 }
@@ -931,10 +1015,9 @@ cmd_relabel() {
     local tmp=$(mktemp -t meetink-relabel)
     print -P "${C[bright_yellow]}▸${C[reset]} Relabeling speakers ${C[bold]}${actual:t}${C[reset]} ${C[dim]}(fast — no retranscription)...${C[reset]}"
     _refine_lock
-    local state=/tmp/meetink-postproc.state
+    if [[ -n "$MK_PP_DIR" ]]; then pp_path_set "$actual"; else pp_claim "$actual"; fi
+    local state="$MK_PP_STATE"
     print -- "relabeling speakers (fast)" > "$state"
-    print -- "$actual" > /tmp/meetink-postproc.path
-    print -- $$ > /tmp/meetink-postproc.pid
     local rc=0
     # Stream refine.py's stdout through the state file — the embedding
     # loop emits "refine: progress diarize N" every ~4%, which is the
@@ -958,7 +1041,8 @@ cmd_relabel() {
     else
         print -P "${C[red]}error:${C[reset]} relabel failed ${C[dim]}(see /tmp/meetink-refine.log — full reprocess is the fallback)${C[reset]}"
     fi
-    rm -f "$tmp" /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
+    rm -f "$tmp"
+    pp_done
     (( rc == 0 ))
 }
 
@@ -1008,9 +1092,9 @@ cmd_refine() {
     _refine_lock
     # Same narration files the stop pipeline uses — the Meetings page
     # marks THIS row orange while the import works.
-    local state=/tmp/meetink-postproc.state
+    if [[ -n "$MK_PP_DIR" ]]; then pp_path_set "$out"; else pp_claim "$out"; fi
+    local state="$MK_PP_STATE"
     print -- "starting (step 1/3)" > "$state"
-    print -- "$out" > /tmp/meetink-postproc.path
     local rc=0
     "$MK_PARAKEET_VENV/bin/python" "$MK_ROOT/src/refine/refine.py" \
             --input "$input" --out "$out" 2>/tmp/meetink-refine.log | \
@@ -1028,13 +1112,13 @@ cmd_refine() {
             # Re-assert the target pointer — a raced cleanup can delete it
             # mid-run, blanking the meeting's scoped status (self-heals on
             # the next line).
-            [[ -f /tmp/meetink-postproc.path ]] || print -- "$actual" > /tmp/meetink-postproc.path 2>/dev/null
+            [[ -f "$MK_PP_PATH" ]] || print -- "$actual" > "$MK_PP_PATH" 2>/dev/null
         done
     rc=${pipestatus[1]}
     _refine_unlock
     if (( rc != 0 )); then
         rm -rf "$sess_dir"   # no ghost meeting from a failed import
-        rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
+        pp_done
         print -P "${C[red]}error:${C[reset]} transcription failed ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
         return 1
     fi
@@ -1054,7 +1138,7 @@ cmd_refine() {
     # handed this import's clusters to the sidecar, so confident names
     # both rewrite the transcript AND enroll voices.
     if typeset -f infer_speaker_names >/dev/null 2>&1; then
-        print -- "inferring speaker names (step 2/3)" > /tmp/meetink-postproc.state
+        print -- "inferring speaker names (step 2/3)" > "$MK_PP_STATE"
         infer_speaker_names "$out"
     fi
 
@@ -1073,13 +1157,13 @@ cmd_refine() {
     # The state file too — post-transcription stages ran silently there
     # and Activity showed a stale 'pyannote 100%' for minutes (field
     # report: 'hanging at 100%' while the summary LLM worked).
-    print -- "generating title and summary (step 3/3)" > /tmp/meetink-postproc.state
+    print -- "generating title and summary (step 3/3)" > "$MK_PP_STATE"
     local ino=$(stat -f %i "$out" 2>/dev/null)
     if typeset -f title_session_file >/dev/null 2>&1; then
         title_session_file "$out"
     fi
 
-    rm -f /tmp/meetink-postproc.state /tmp/meetink-postproc.path /tmp/meetink-postproc.pid
+    pp_done
     # Machine-readable final location (titling may have renamed the file).
     # Tracked by INODE, not via live.txt: with two imports in flight the
     # symlink points wherever the later one left it — mv preserves the

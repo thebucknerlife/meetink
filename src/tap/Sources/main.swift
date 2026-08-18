@@ -6,14 +6,22 @@
 // misses (the SCK tap sees each app's render — including the dirty
 // pre-Krisp feed Zoom sends to Krisp's virtual device).
 //
-//   meetink-tap --out /path/to/tap-experiment.wav
+//   meetink-tap --out /path/to/tap-experiment.wav [--keep-alive]
+//
+// v2: NO resampling — v1's "naive resample to 48 kHz" punched ~2M
+// micro-holes into a 32-min capture and lost 0.65% of wall-clock
+// samples (field case: the Diogo meeting sounded glitchy/robotic).
+// Samples are written VERBATIM at the tap's native rate; the WAV header
+// carries that rate. If a device change renegotiates the rate mid-run,
+// the writer rolls to <out>.2.wav etc. rather than converting. Every
+// 60 s a stats line lands in the journal (frames written vs wall-clock
+// expectation, zero fraction) so drift and hole-punching are measurable
+// after the fact instead of guessed at.
 //
 // Runs until SIGINT/SIGTERM. Follows default-output-device changes
 // (teardown + recreate — the wedge-prone moment). Watchdogs the
-// documented zero-buffer failure (tap keeps firing with exact silence):
-// sustained all-zero output while the device claims activity triggers a
-// full tap+aggregate teardown/recreate. Events journal to
-// <out>.tap-journal.jsonl. Nothing in the pipeline reads any of this.
+// documented zero-buffer failure (tap keeps firing with exact silence).
+// Exits when the main capture dies unless --keep-alive (bench runs).
 //
 // If ANYTHING here fails, we log and exit 0 — this sidecar must never
 // make a recording session look unhealthy.
@@ -28,15 +36,18 @@ func log(_ s: String) {
 
 // --- args ---
 var outPath: String? = nil
+var keepAlive = false
 var i = 1
 let argv = CommandLine.arguments
 while i < argv.count {
     if argv[i] == "--out", i + 1 < argv.count {
         outPath = argv[i + 1]; i += 2
+    } else if argv[i] == "--keep-alive" {
+        keepAlive = true; i += 1
     } else { i += 1 }
 }
 guard let outPath else {
-    log("usage: meetink-tap --out <file.wav>")
+    log("usage: meetink-tap --out <file.wav> [--keep-alive]")
     exit(0)
 }
 
@@ -52,21 +63,27 @@ func journal(_ event: String, _ detail: String) {
     log("\(event): \(detail)")
 }
 
-// --- WAV writer: 48 kHz mono s16le, header patched on clean exit ---
+// --- WAV writer: mono s16le at the TAP'S native rate, header patched on
+// clean exit (pre-sized maximal so a kill -9 still leaves it playable) ---
 final class WavWriter {
     private let handle: FileHandle
     private var dataBytes: UInt32 = 0
-    init?(path: String) {
+    let rate: Double
+    let path: String
+    init?(path: String, rate: Double) {
+        self.rate = rate
+        self.path = path
         FileManager.default.createFile(atPath: path, contents: nil)
         guard let h = FileHandle(forWritingAtPath: path) else { return nil }
         handle = h
+        let r = UInt32(rate)
         var header = Data()
         func put(_ s: String) { header.append(s.data(using: .ascii)!) }
         func put32(_ v: UInt32) { var x = v.littleEndian; header.append(Data(bytes: &x, count: 4)) }
         func put16(_ v: UInt16) { var x = v.littleEndian; header.append(Data(bytes: &x, count: 2)) }
         put("RIFF"); put32(0xFFFFFFF0); put("WAVE")   // maximal size: playable even if never patched
         put("fmt "); put32(16); put16(1); put16(1)
-        put32(48000); put32(48000 * 2); put16(2); put16(16)
+        put32(r); put32(r * 2); put16(2); put16(16)
         put("data"); put32(0xFFFFFFC8)
         handle.write(header)
     }
@@ -85,11 +102,6 @@ final class WavWriter {
         handle.write(Data(bytes: &d, count: 4))
         try? handle.close()
     }
-}
-
-guard let wav = WavWriter(path: outPath) else {
-    log("cannot open output — exiting")
-    exit(0)
 }
 
 // --- CoreAudio helpers ---
@@ -136,11 +148,11 @@ final class TapSession {
     private var tapID = AudioObjectID(0)
     private var aggID = AudioObjectID(0)
     private var procID: AudioDeviceIOProcID? = nil
-    private var converterState = 0.0   // fractional resample position
     let device: AudioObjectID
-    private let onAudio: ([Int16], Bool) -> Void
+    private(set) var rate: Double = 48000
+    private let onAudio: ([Int16], Bool, Double) -> Void
 
-    init?(device: AudioObjectID, onAudio: @escaping ([Int16], Bool) -> Void) {
+    init?(device: AudioObjectID, onAudio: @escaping ([Int16], Bool, Double) -> Void) {
         self.device = device
         self.onAudio = onAudio
         guard let uid = deviceUID(device) else { return nil }
@@ -189,46 +201,78 @@ final class TapSession {
         }
         aggID = agg
 
-        // The tap's stream format (sample rate can differ per device).
-        var rate: Double = 48000
+        // The tap's ACTUAL stream format — trusted for rate, layout and
+        // channel count; journaled so a mismatch is diagnosable later.
+        var asbd = AudioStreamBasicDescription()
         var fmtAddr = AudioObjectPropertyAddress(
             mSelector: kAudioTapPropertyFormat,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain)
-        var asbd = AudioStreamBasicDescription()
         var fs = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        if AudioObjectGetPropertyData(tapID, &fmtAddr, 0, nil, &fs, &asbd) == noErr,
-           asbd.mSampleRate > 0 {
-            rate = asbd.mSampleRate
+        guard AudioObjectGetPropertyData(tapID, &fmtAddr, 0, nil, &fs, &asbd) == noErr,
+              asbd.mSampleRate > 0 else {
+            journal("tap-format-failed", "cannot read tap format")
+            AudioHardwareDestroyAggregateDevice(aggID)
+            AudioHardwareDestroyProcessTap(tapID)
+            return nil
         }
-        let srcRate = rate
+        rate = asbd.mSampleRate
+        let deinterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+        let chDesc = deinterleaved ? "deinterleaved" : "interleaved"
+        journal("tap-format",
+                "\(Int(rate)) Hz, \(asbd.mChannelsPerFrame) ch \(chDesc), "
+                + "\(asbd.mBitsPerChannel)-bit, bytes/frame \(asbd.mBytesPerFrame)")
 
+        let srcRate = rate
         var pid: AudioDeviceIOProcID? = nil
         st = AudioDeviceCreateIOProcIDWithBlock(&pid, aggID, nil) {
             _, inInputData, _, _, _ in
+            // v2: samples pass through VERBATIM (Float32 → Int16 only).
+            // Mono mixdown averages across ALL buffers/channels — v1
+            // read only abl.first, which under-reads any layout with
+            // more than one buffer.
             let abl = UnsafeMutableAudioBufferListPointer(
                 UnsafeMutablePointer(mutating: inInputData))
-            guard let buf = abl.first, let data = buf.mData else { return }
-            let n = Int(buf.mDataByteSize) / MemoryLayout<Float32>.size
-            let ch = max(1, Int(buf.mNumberChannels))
-            let floats = data.bindMemory(to: Float32.self, capacity: n)
-            let frames = n / ch
-            if frames == 0 { return }
-            // mono + naive resample to 48k (speech archive; fidelity
-            // needs are modest and drift compensation is on)
-            let ratio = 48000.0 / srcRate
-            let outFrames = Int(Double(frames) * ratio)
-            var out = [Int16](repeating: 0, count: outFrames)
-            var nonzero = false
-            for oi in 0..<outFrames {
-                let si = min(frames - 1, Int(Double(oi) / ratio))
-                var acc: Float32 = 0
-                for c in 0..<ch { acc += floats[si * ch + c] }
-                let v = acc / Float32(ch)
-                if v != 0 { nonzero = true }
-                out[oi] = Int16(max(-32768, min(32767, v * 32767)))
+            let bufs = abl.compactMap { b -> (UnsafeMutablePointer<Float32>, Int, Int)? in
+                guard let d = b.mData, b.mDataByteSize > 0 else { return nil }
+                let n = Int(b.mDataByteSize) / MemoryLayout<Float32>.size
+                let ch = max(1, Int(b.mNumberChannels))
+                return (d.bindMemory(to: Float32.self, capacity: n), n, ch)
             }
-            self.onAudio(out, nonzero)
+            guard !bufs.isEmpty else { return }
+            if deinterleaved {
+                // One buffer per channel, equal frame counts.
+                let frames = bufs.map { $0.1 }.min() ?? 0
+                if frames == 0 { return }
+                var out = [Int16](repeating: 0, count: frames)
+                var nonzero = false
+                let scale = Float32(1) / Float32(bufs.count)
+                for f in 0..<frames {
+                    var acc: Float32 = 0
+                    for (p, _, _) in bufs { acc += p[f] }
+                    let v = acc * scale
+                    if v != 0 { nonzero = true }
+                    out[f] = v.isFinite
+                        ? Int16(max(-32768, min(32767, v * 32767))) : 0
+                }
+                self.onAudio(out, nonzero, srcRate)
+            } else {
+                let (p, n, ch) = bufs[0]
+                let frames = n / ch
+                if frames == 0 { return }
+                var out = [Int16](repeating: 0, count: frames)
+                var nonzero = false
+                let scale = Float32(1) / Float32(ch)
+                for f in 0..<frames {
+                    var acc: Float32 = 0
+                    for c in 0..<ch { acc += p[f * ch + c] }
+                    let v = acc * scale
+                    if v != 0 { nonzero = true }
+                    out[f] = v.isFinite
+                        ? Int16(max(-32768, min(32767, v * 32767))) : 0
+                }
+                self.onAudio(out, nonzero, srcRate)
+            }
         }
         guard st == noErr, let pid else {
             journal("ioproc-create-failed", "status \(st)")
@@ -264,11 +308,42 @@ var lastNonzeroAt = Date()
 var lastAudioAt = Date()
 var running = true
 
-let audioSink: ([Int16], Bool) -> Void = { samples, nonzero in
+// Segment-rolling writer: one WAV per sample rate. A mid-run rate
+// renegotiation (AirPods A2DP <-> call mode) rolls to <out>.2.wav
+// instead of converting — verbatim beats resampled for a diagnostic.
+var wavCur: WavWriter? = nil
+var segIndex = 0
+func writer(for rate: Double) -> WavWriter? {
+    if let w = wavCur, w.rate == rate { return w }
+    wavCur?.finalize()
+    segIndex += 1
+    let path = segIndex == 1 ? outPath
+        : (outPath.hasSuffix(".wav")
+           ? String(outPath.dropLast(4)) + ".\(segIndex).wav"
+           : outPath + ".\(segIndex)")
+    if segIndex > 1 {
+        journal("segment-rolled", "rate now \(Int(rate)) Hz → \((path as NSString).lastPathComponent)")
+    }
+    wavCur = WavWriter(path: path, rate: rate)
+    if wavCur == nil { journal("wav-open-failed", path) }
+    return wavCur
+}
+
+// Per-minute stats so drift/holes are measurable, not guessed.
+var statFrames = 0
+var statZeroSamples = 0
+var statRate: Double = 0
+var statWindowStart = Date()
+
+let audioSink: ([Int16], Bool, Double) -> Void = { samples, nonzero, rate in
     queue.async {
-        wav.append(samples)
+        writer(for: rate)?.append(samples)
         lastAudioAt = Date()
         if nonzero { lastNonzeroAt = Date() }
+        statFrames += samples.count
+        statRate = rate
+        if !nonzero { statZeroSamples += samples.count }
+        else { statZeroSamples += samples.lazy.filter { $0 == 0 }.count }
     }
 }
 
@@ -281,6 +356,9 @@ func startSession() {
     session = TapSession(device: dev, onAudio: audioSink)
     lastNonzeroAt = Date()
     lastAudioAt = Date()
+    statFrames = 0
+    statZeroSamples = 0
+    statWindowStart = Date()
 }
 
 func restartSession(_ reason: String) {
@@ -309,7 +387,9 @@ AudioObjectAddPropertyListenerBlock(
 // Watchdog: the documented zero-buffer wedge — callbacks fire, samples
 // all zero. 30 s of exact silence triggers a full recreate (a quiet
 // meeting moment can last that long; recreation during real silence is
-// harmless). Separately, NO callbacks for 15 s = dead session.
+// harmless). Separately, NO callbacks for 15 s = dead session. Every
+// 60 s: a stats journal line (drift + hole measurement).
+var watchdogTicks = 0
 let watchdog = DispatchSource.makeTimerSource(queue: queue)
 watchdog.schedule(deadline: .now() + 10, repeating: 10)
 watchdog.setEventHandler {
@@ -319,12 +399,27 @@ watchdog.setEventHandler {
         return
     }
     let now = Date()
+    watchdogTicks += 1
+    if watchdogTicks % 6 == 0, statRate > 0 {
+        let elapsed = now.timeIntervalSince(statWindowStart)
+        let expected = Int(elapsed * statRate)
+        let zf = statFrames > 0
+            ? Double(statZeroSamples) / Double(statFrames) : 0
+        journal("stats", "window \(Int(elapsed))s: \(statFrames) frames "
+                + "(expected ~\(expected), drift \(statFrames - expected)), "
+                + "zero-fraction \(String(format: "%.3f", zf))")
+        statFrames = 0
+        statZeroSamples = 0
+        statWindowStart = now
+    }
     if now.timeIntervalSince(lastAudioAt) > 15 {
         restartSession("no-callbacks-15s")
     } else if now.timeIntervalSince(lastNonzeroAt) > 30 {
         restartSession("zero-buffers-30s (wedge suspected)")
     }
-    // Orphan guard: exit when the main capture is gone.
+    // Orphan guard: exit when the main capture is gone (bench runs pass
+    // --keep-alive to skip this).
+    if keepAlive { return }
     if let pidStr = try? String(contentsOfFile: "/tmp/meetink-capture.pid",
                                 encoding: .utf8),
        let p = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -334,7 +429,7 @@ watchdog.setEventHandler {
         journal("capture-gone", "finalizing and exiting")
         running = false
         session?.teardown()
-        wav.finalize()
+        wavCur?.finalize()
         exit(0)
     }
 }
@@ -349,7 +444,7 @@ let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: queue)
 let doShutdown = {
     running = false
     session?.teardown()
-    wav.finalize()
+    wavCur?.finalize()
     journal("tap-finalized", "clean shutdown")
     exit(0)
 }
