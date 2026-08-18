@@ -2575,12 +2575,15 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         if sender.tag == -1 {
             // Unlink: drop the event record; the title and headers stay.
             setMeetingMeta(lastResolvedPath, "event", NSNull())
+            setMeetingMeta(lastResolvedPath, "event_assumed", NSNull())
             refreshIfChanged(force: true)
             return
         }
         guard sender.tag >= 0, sender.tag < fetchedEvents.count else { return }
         let e = fetchedEvents[sender.tag]
         let newPath = applyEventToMeeting(txtPath: lastResolvedPath, event: e)
+        // An explicit pick is no longer an assumption — drop the "*".
+        setMeetingMeta(newPath, "event_assumed", NSNull())
         if fixedPath != nil { fixedPath = newPath }
         refreshIfChanged(force: true)
     }
@@ -5033,13 +5036,21 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             let name = meetingDisplayName(lastResolvedPath)
             if titleField.stringValue != name { titleField.stringValue = name }
         }
-        // Event dropdown label follows the linked event.
+        // Event dropdown label follows the linked event. A "*" marks a
+        // link the app ASSUMED at recording start (event_assumed meta) —
+        // trusted like a manual pick, but flagged so a wrong guess is
+        // noticed and re-picked.
         eventButton.isHidden = lastResolvedPath.isEmpty
         if !lastResolvedPath.isEmpty {
-            let linked = (meetingMeta(lastResolvedPath)["event"]
-                          as? [String: Any])?["title"] as? String
-            let label = (linked?.isEmpty == false) ? linked! : "No Event"
+            let meta = meetingMeta(lastResolvedPath)
+            let linked = (meta["event"] as? [String: Any])?["title"] as? String
+            let assumed = (meta["event_assumed"] as? Bool) == true
+            var label = (linked?.isEmpty == false) ? linked! : "No Event"
+            if linked?.isEmpty == false, assumed { label += " *" }
             if eventButton.title != label { eventButton.title = label }
+            eventButton.toolTip = (assumed && linked?.isEmpty == false)
+                ? "Linked automatically from your calendar — click to change"
+                : "Link this meeting to a calendar event"
         }
         updateSpeakersPanel()
         maybeInferIntroductions()
@@ -8609,6 +8620,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastRecording = recording
             updateStatusIcon(recording: recording)
             rebuildMenu()
+            if recording {
+                // Opportunistic start-time event link (see
+                // maybeAutoLinkRecording). Delayed retries: the watch's
+                // own link and the session files need a moment to land,
+                // and the calendar cache may still be fetching.
+                for delay in [4.0, 9.0, 15.0] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        [weak self] in self?.maybeAutoLinkRecording()
+                    }
+                }
+            }
         }
         if Date().timeIntervalSince(lastEventsFetch) > 300 {
             lastEventsFetch = Date()
@@ -8633,6 +8655,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ?? start.addingTimeInterval(3600)
             return start.addingTimeInterval(-15 * 60) <= now && now <= end
         }
+    }
+
+    /// Opportunistic start-time link: a recording that begins during a
+    /// calendar meeting WITH other participants is assumed to BE that
+    /// meeting (earliest-starting when several overlap). The link
+    /// behaves exactly like a manual pick — naming, whitelist, summary
+    /// all flow from it — but meta "event_assumed" marks it so the
+    /// event picker shows a "*" and a wrong guess is a one-click fix.
+    /// Watch-started recordings already carry their event (header or
+    /// meta) and are skipped.
+    private func maybeAutoLinkRecording() {
+        guard recordingPID() != nil else { return }
+        let live = liveSymlinkPath()
+        guard let dest = try? FileManager.default
+            .destinationOfSymbolicLink(atPath: live) else { return }
+        let path = dest.hasPrefix("/") ? dest
+            : (live as NSString).deletingLastPathComponent + "/" + dest
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        guard (meetingMeta(path)["event"] as? [String: Any]) == nil else { return }
+        // The capture binary writes '# event:' at start for watch-linked
+        // recordings (meta may not carry it until stop) — respect it.
+        if let fh = FileHandle(forReadingAtPath: path),
+           let head = try? fh.read(upToCount: 4096),
+           let s = String(data: head, encoding: .utf8),
+           s.hasPrefix("# event: ") || s.contains("\n# event: ") {
+            return
+        }
+        let candidates = currentAttendeeEvents().sorted {
+            (($0["start"] as? String) ?? "") < (($1["start"] as? String) ?? "")
+        }
+        guard let e = candidates.first else { return }
+        let newPath = applyEventToMeeting(txtPath: path, event: e)
+        setMeetingMeta(newPath, "event_assumed", true)
     }
 
     private func updateStatusIcon(recording: Bool) {

@@ -689,6 +689,17 @@ if not best or not (best_ov >= 600 or (best_ov >= 120 and best_ov >= 0.3 * rec_d
     raise SystemExit(0)
 names = [a.get("name") or a.get("email") or "" for a in (best.get("attendees") or [])]
 names = [n for n in names if n]
+# meta keeps "Name <email>" (display + profile linking both survive);
+# the transcript header keeps bare names (diarize whitelist parses it).
+def _label(a):
+    name = (a.get("name") or "").strip()
+    email = (a.get("email") or "").strip()
+    if not name:
+        return email
+    if not email:
+        return name
+    return f"{name} <{email}>"
+full = [x for x in (_label(a) for a in (best.get("attendees") or [])) if x]
 meta_p = txt[:-4] + ".meta.json"
 meta = {}
 try:
@@ -697,7 +708,9 @@ except Exception:
     pass
 meta["event"] = {"title": best.get("title") or "",
                  "start": best.get("start") or "",
-                 "attendees": names}
+                 "attendees": full}
+# Inferred, not user-picked: the event button shows a "*" for these.
+meta["event_assumed"] = True
 with open(meta_p + ".tmp", "w") as f:
     json.dump(meta, f, sort_keys=True)
 os.replace(meta_p + ".tmp", meta_p)
@@ -710,9 +723,7 @@ if "# attendees: " not in data and names:
 if lines:
     i = data.find("Started:")
     if i >= 0:
-        open(txt, "w").write(data[:i] + "
-".join(lines) + "
-" + data[i:])
+        open(txt, "w").write(data[:i] + "\n".join(lines) + "\n" + data[i:])
 print(best.get("title") or "")
 PYEOF8
 )
