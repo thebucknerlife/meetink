@@ -28,6 +28,7 @@ Raw streams are s16le / 16 kHz / mono, same as the spools.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, dataclass
 import os
 import subprocess
 import sys
@@ -71,30 +72,94 @@ def save_raw(x: np.ndarray, path: str) -> None:
 
 # --- Stage 1: cross echo cancellation ---
 
-def gcc_phat_delay(ref: np.ndarray, sig: np.ndarray, max_delay_s: float = 1.5) -> int:
-    """Bulk delay (samples) of ref's echo inside sig, via GCC-PHAT.
 
-    Uses up to the first ~120 s — enough for a stable peak, cheap on long
-    meetings. Positive result means sig lags ref (the normal case: the
-    echo arrives after the original)."""
+@dataclass(frozen=True)
+class EchoPathEvidence:
+    """Waveform evidence that ``ref`` occurs later inside ``sig``."""
+
+    detected: bool
+    delay_samples: int = -1
+    delay_ms: float = -1.0
+    peak: float = 0.0
+    floor_sigma: float = 0.0
+    peak_sigma: float = 0.0
+    direction_ratio: float = 0.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def echo_path_evidence(ref: np.ndarray, sig: np.ndarray,
+                       min_delay_s: float = 0.004,
+                       max_delay_s: float = 1.5) -> EchoPathEvidence:
+    """Measure a *directional* delayed path from ``ref`` into ``sig``.
+
+    GCC-PHAT correlation itself is symmetric.  Looking only at causal
+    positive lags (the old detector) could therefore call a returned-self
+    ``mic -> sys`` path local speaker bleed.  We compare the strongest
+    positive-lag peak with the opposite direction and require both a clean
+    peak above the correlation floor and a directional margin.
+    """
     n = min(len(ref), len(sig), 120 * RATE)
-    if n < RATE:
-        return 0
-    a, b = ref[:n], sig[:n]
+    min_d = max(1, int(min_delay_s * RATE))
+    max_d = min(int(max_delay_s * RATE), max(1, n - 1))
+    if n < RATE or max_d <= min_d:
+        return EchoPathEvidence(False)
+
+    a = np.asarray(ref[:n], dtype=np.float32)
+    b = np.asarray(sig[:n], dtype=np.float32)
+    # Literal silence has an artificially flat PHAT spectrum. Reject it
+    # before the FFT so health failures never become path evidence.
+    if float(np.sqrt(np.mean(a * a))) < 1e-5 \
+            or float(np.sqrt(np.mean(b * b))) < 1e-5:
+        return EchoPathEvidence(False)
+
     nfft = 1 << int(np.ceil(np.log2(2 * n - 1)))
     A = np.fft.rfft(a, nfft)
     B = np.fft.rfft(b, nfft)
     R = B * np.conj(A)
     R /= np.abs(R) + 1e-9
     cc = np.fft.irfft(R, nfft)
-    max_d = int(max_delay_s * RATE)
-    # Only search causal delays: the echo can't precede its source.
-    window = cc[:max_d]
-    peak = int(np.argmax(np.abs(window)))
-    # Reject a mushy correlation floor — no echo path at all.
-    if np.abs(window[peak]) < 4 * np.std(np.abs(window)):
-        return -1
-    return peak
+
+    positive = np.abs(cc[min_d:max_d + 1])
+    negative = np.abs(cc[-max_d:-min_d + 1])
+    if not len(positive) or not len(negative):
+        return EchoPathEvidence(False)
+    rel = int(np.argmax(positive))
+    peak = float(positive[rel])
+    opposite = float(np.max(negative))
+    # Robust-ish floor excluding the winning point. The 4-sigma condition
+    # preserves the established no-path rejection; direction_ratio is what
+    # separates the two physical echo directions.
+    floor_sigma = float(np.std(np.concatenate([positive, negative])))
+    peak_sigma = peak / max(floor_sigma, 1e-9)
+    direction_ratio = peak / max(opposite, 1e-9)
+    delay = min_d + rel
+    # A dominant directional peak handles the usual one-way case. Two real
+    # echo paths can coexist, in which case neither direction dominates; a
+    # much stronger 20-sigma absolute peak admits both without confusing the
+    # 4-8 sigma maxima produced by unrelated double-talk.
+    detected = peak_sigma >= 20.0 \
+        or (peak_sigma >= 4.0 and direction_ratio >= 1.50)
+    return EchoPathEvidence(
+        detected=bool(detected),
+        delay_samples=delay if detected else -1,
+        delay_ms=round(delay / RATE * 1000.0, 2) if detected else -1.0,
+        peak=round(peak, 7),
+        floor_sigma=round(floor_sigma, 7),
+        peak_sigma=round(peak_sigma, 2),
+        direction_ratio=round(direction_ratio, 3),
+    )
+
+def gcc_phat_delay(ref: np.ndarray, sig: np.ndarray, max_delay_s: float = 1.5) -> int:
+    """Bulk delay (samples) of ref's echo inside sig, via GCC-PHAT.
+
+    Uses up to the first ~120 s — enough for a stable peak, cheap on long
+    meetings. Positive result means sig lags ref (the normal case: the
+    echo arrives after the original)."""
+    ev = echo_path_evidence(ref, sig, min_delay_s=0.0,
+                            max_delay_s=max_delay_s)
+    return ev.delay_samples if ev.detected else -1
 
 
 def fdaf_cancel(ref: np.ndarray, sig: np.ndarray, delay: int,

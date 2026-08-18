@@ -6804,6 +6804,8 @@ final class MeetingActivityWindowController: NSWindowController {
             ("mic spool (wav)", base + ".mic.wav"),
             ("system spool (wav)", base + ".sys.wav"),
             ("output routes", base + ".route.jsonl"),
+            ("capture health", base + ".health.jsonl"),
+            ("audio decisions", base + ".audio.json"),
             ("summary", base + ".summary.md"),
             ("metadata", base + ".meta.json"),
         ]

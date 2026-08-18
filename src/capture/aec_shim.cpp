@@ -21,16 +21,12 @@ struct Aec {
     std::vector<float> farBuf;
     std::vector<float> nearBuf;
     std::deque<float> outBuf;
+    int sampleRate;
 };
 
-}  // namespace
-
-extern "C" {
-
-void *mk_aec_create(int sample_rate) {
-    auto *a = new Aec();
+bool configure(Aec *a, int sample_rate) {
     a->apm = webrtc::AudioProcessingBuilder().Create();
-    if (!a->apm) { delete a; return nullptr; }
+    if (!a->apm) return false;
     webrtc::AudioProcessing::Config cfg;
     cfg.echo_canceller.enabled = true;
     cfg.echo_canceller.mobile_mode = false;
@@ -42,13 +38,34 @@ void *mk_aec_create(int sample_rate) {
     cfg.gain_controller2.enabled = false;
     cfg.high_pass_filter.enabled = false;
     a->apm->ApplyConfig(cfg);
+    a->sampleRate = sample_rate;
     a->stream = webrtc::StreamConfig(sample_rate, 1);
     a->frame = sample_rate / 100;
+    return true;
+}
+
+}  // namespace
+
+extern "C" {
+
+void *mk_aec_create(int sample_rate) {
+    auto *a = new Aec();
+    if (!configure(a, sample_rate)) { delete a; return nullptr; }
     return a;
 }
 
 void mk_aec_destroy(void *handle) {
     delete static_cast<Aec *>(handle);
+}
+
+void mk_aec_reset(void *handle) {
+    auto *a = static_cast<Aec *>(handle);
+    if (!a) return;
+    std::lock_guard<std::mutex> lock(a->mu);
+    a->farBuf.clear();
+    a->nearBuf.clear();
+    a->outBuf.clear();
+    configure(a, a->sampleRate);
 }
 
 void mk_aec_feed_far(void *handle, const float *samples, int count) {

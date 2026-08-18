@@ -40,6 +40,10 @@ import urllib.request
 import wave
 from pathlib import Path
 
+import numpy as np
+
+from audio_health import assess_mic_health, mic_health_summary
+
 # When Meetink.app (launched via `open`, i.e. the launchd environment)
 # invokes us, PATH is the bare system set — no Homebrew — and both our
 # decode step and parakeet-mlx's internal audio loader exec plain
@@ -1063,6 +1067,8 @@ def main() -> int:
                       flush=True)
 
     audio_s = 0.0
+    mic_health: dict | None = None
+    audio_warning: str | None = None
     if args.input:
         raw = decode_to_raw(args.input)
         audio_s = len(raw) / 2 / SAMPLE_RATE
@@ -1086,13 +1092,25 @@ def main() -> int:
     else:
         streams: list[dict] = []
         _t0 = _time.time()
-        if args.mic and Path(args.mic).exists():
-            mic_raw = Path(args.mic).read_bytes()
+        mic_raw = (Path(args.mic).read_bytes()
+                   if args.mic and Path(args.mic).exists() else b"")
+        sys_raw = (Path(args.sys_).read_bytes()
+                   if args.sys_ and Path(args.sys_).exists() else b"")
+        if args.sys_:
+            mic_health = assess_mic_health(
+                np.frombuffer(mic_raw, dtype=np.int16),
+                np.frombuffer(sys_raw, dtype=np.int16), SAMPLE_RATE)
+            if not mic_health["healthy"]:
+                audio_warning = mic_health_summary(mic_health)
+                log(f"WARNING: {audio_warning}; preserving all sys speech "
+                    "because it may be the only copy of the user")
+                print("refine: status microphone degraded — preserving "
+                      "system speech", flush=True)
+        if mic_raw:
             audio_s = max(audio_s, len(mic_raw) / 2 / SAMPLE_RATE)
             streams.append({"raw": mic_raw, "origin": "mic",
                             "segs": transcribe_sentences(model, mic_raw, "mic")})
-        if args.sys_ and Path(args.sys_).exists():
-            sys_raw = Path(args.sys_).read_bytes()
+        if sys_raw:
             audio_s = max(audio_s, len(sys_raw) / 2 / SAMPLE_RATE)
             streams.append({"raw": sys_raw, "origin": "sys",
                             "segs": transcribe_sentences(model, sys_raw, "sys")})
@@ -1155,22 +1173,22 @@ def main() -> int:
             return difflib.SequenceMatcher(None, a, b).ratio() >= 0.75
 
         # Pass 1 — remote echo of the USER. You cannot legitimately be on
-        # your own meeting's system audio: any sys entry that (a) got the
-        # user's label from the joint clusterer, or (b) textually echoes a
-        # nearby mic line spoken by the user, is someone's echoey client
-        # sending your voice back (field case: headphones on, every
+        # your own meeting's system audio, but a label alone is never enough
+        # to erase audio. A sys entry must textually echo a nearby direct-mic
+        # line spoken by the user before it is treated as someone's echoey
+        # client sending the voice back (field case: headphones on, every
         # sentence doubled, phantom 'Speaker 6' speaking only fragments of
         # the user's sentences).
         dropped_self = 0
-        if me_lab:
+        # Hard health invariant: if the mic timeline is missing/truncated/
+        # all-zero, sys may hold the ONLY copy. A label is never sufficient
+        # evidence to erase it in that state.
+        if me_lab and (mic_health is None or mic_health["healthy"]):
             mic_me = [(t, norm(x)) for t, lab, x, o, _tk in entries
                       if o == "mic" and lab == me_lab]
             kept = []
             for t, lab, text, origin, toks in entries:
                 if origin == "sys":
-                    if lab == me_lab:
-                        dropped_self += 1
-                        continue
                     nt = norm(text)
                     if any(abs(mt - t) <= 6.0 and echo_match(nt, mx)
                            for mt, mx in mic_me):
@@ -1178,6 +1196,9 @@ def main() -> int:
                         continue
                 kept.append((t, lab, text, origin, toks))
             entries = kept
+        elif me_lab and mic_health is not None:
+            log("echo suppression: sys-self deletion disabled because the "
+                "mic is degraded")
 
         # Pass 2 — speaker bleed INTO the mic (no headphones): a mic entry
         # that echoes nearby system audio is the room speakers, and the sys
@@ -1293,6 +1314,9 @@ def main() -> int:
                      dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
         lines.append("")
     lines.append(f"# refined: parakeet ({MODEL_ID.split('/')[-1]})")
+    if audio_warning and not any(
+            line.startswith("# audio-warning:") for line in lines):
+        lines.append(f"# audio-warning: {audio_warning}; system speech preserved")
 
     # Interleave truthfulness: a short interjection fully inside a longer
     # different-speaker utterance ("alice 0-10s, bob 4-5s") used to render

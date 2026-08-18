@@ -68,7 +68,7 @@ refine_enabled() {
 refine_clear_spool() {
     rm -f "$MK_SPOOL_DIR"/session-sys.raw "$MK_SPOOL_DIR"/session-mic.raw \
           "$MK_SPOOL_DIR"/session-sys.48k.raw "$MK_SPOOL_DIR"/session-mic.48k.raw \
-          "$MK_SPOOL_DIR"/route.jsonl
+          "$MK_SPOOL_DIR"/route.jsonl "$MK_SPOOL_DIR"/health.jsonl
 }
 
 # Refine the just-stopped session in place. Called from cmd_stop after label
@@ -272,8 +272,8 @@ _pmix_run() {
     return ${pipestatus[1]}
 }
 
-# Mix two raw spools into a listenable m4a: enhance (best-effort), then
-# cross-duck so whoever is speaking is heard from their clean stream.
+# Mix two raw spools into a listenable m4a using directional path evidence
+# and static render recipes. Transcript labels never control amplitude.
 #   $1 = mic.raw  $2 = sys.raw  $3 = out.m4a
 _mix_enhanced_m4a() {
     local mic="$1" sys="$2" out="$3"
@@ -331,21 +331,19 @@ _mix_enhanced_m4a() {
         fi
         local dmic=$(_denoise_mic "$pmic" $par "$pd")
         local -a fm=()
+        local mic_processor=raw
+        [[ "$dmic" != "$pmic" ]] && mic_processor=deepfilternet3-capped-12db
+        fm+=(--mic-processor "$mic_processor")
         [[ "$mix_mode" == "mic" || "$mix_mode" == "split" ]] && fm=(--force-mode "$mix_mode")
-        # OS output-route journal (capture writes route.jsonl next to the
-        # spools; archive keeps it as <base>.route.jsonl for reprocess).
-        # A prior for the speakers/headphones decision — acoustic
-        # evidence still wins wherever it exists.
+        # Capture journals: route/input metadata is a prior for the render;
+        # health events are retained in the decision manifest.
         local rjson="${mic:h}/route.jsonl"
         [[ -s "$rjson" ]] || rjson="${out%.m4a}.route.jsonl"
         [[ -s "$rjson" ]] && fm+=(--route "$rjson")
-        # Far-end echo guard: the user's word spans (timing.json) duck
-        # sys in sum renders, so a participant echoing the meeting back
-        # can't double the user's voice (AE x Tom incident).
-        if [[ -s "$timing" ]]; then
-            local duck_me=$(me_name_get 2>/dev/null)
-            fm+=(--duck-timing "$timing" --duck-label "${duck_me:-ME}")
-        fi
+        local hjson="${mic:h}/health.jsonl"
+        [[ -s "$hjson" ]] || hjson="${out%.m4a}.health.jsonl"
+        [[ -s "$hjson" ]] && fm+=(--health "$hjson")
+        fm+=(--decision-out "${out%.m4a}.audio.json")
         _pmix_run --mic16 "$amic" --sys16 "$asys" \
                 --mic "$dmic" --sys "$psys" --rate $par \
                 "${fm[@]}" \
@@ -617,7 +615,7 @@ audio_archive_session() {
         (( keep_audio || keep_spools )) && \
             print -P "${C[yellow]}⚠${C[reset]} keep audio: ffmpeg not found — skipping"
         rm -f "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw" \
-              "${mic:h}/route.jsonl"
+              "${mic:h}/route.jsonl" "${mic:h}/health.jsonl"
         return 0
     fi
 
@@ -627,6 +625,8 @@ audio_archive_session() {
     # Titling renames <base>.* siblings in lockstep, so it travels.
     [[ -s "${mic:h}/route.jsonl" ]] && \
         cp "${mic:h}/route.jsonl" "${base}.route.jsonl" 2>/dev/null || true
+    [[ -s "${mic:h}/health.jsonl" ]] && \
+        cp "${mic:h}/health.jsonl" "${base}.health.jsonl" 2>/dev/null || true
     local -a raw=(-f s16le -ar 16000 -ac 1)
     if (( keep_audio )); then
         local rc=0
@@ -678,7 +678,7 @@ audio_archive_session() {
     # Spools consumed — tidy so stale audio can't bleed into the next
     # session (refine_clear_spool at the next start is the backstop).
     rm -f "$mic" "$sys" "${mic%.raw}.48k.raw" "${sys%.raw}.48k.raw" \
-          "${mic:h}/route.jsonl"
+          "${mic:h}/route.jsonl" "${mic:h}/health.jsonl"
     return 0
 }
 
@@ -732,10 +732,12 @@ cmd_reprocess() {
             print -P "${C[green]}✓${C[reset]} Recovered stranded session audio ${C[dim]}(a previous post-process died mid-flight)${C[reset]}"
             [[ -s "$sdir/route.jsonl" && ! -s "$base.route.jsonl" ]] && \
                 cp "$sdir/route.jsonl" "$base.route.jsonl" 2>/dev/null
+            [[ -s "$sdir/health.jsonl" && ! -s "$base.health.jsonl" ]] && \
+                cp "$sdir/health.jsonl" "$base.health.jsonl" 2>/dev/null
             # Each raw is deleted only once its lossless wav exists.
             [[ -s "$base.mic.wav" ]] && rm -f "$sdir/session-mic.raw" "$sdir/session-mic.48k.raw"
             [[ -s "$base.sys.wav" ]] && rm -f "$sdir/session-sys.raw" "$sdir/session-sys.48k.raw"
-            rm -f "$sdir/route.jsonl"
+            rm -f "$sdir/route.jsonl" "$sdir/health.jsonl"
         fi
     fi
 

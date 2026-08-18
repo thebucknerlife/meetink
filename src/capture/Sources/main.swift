@@ -91,6 +91,13 @@ func aecProcessNear(_ samples: inout [Float], _ handle: UnsafeMutableRawPointer?
 #endif
 }
 
+func aecReset(_ handle: UnsafeMutableRawPointer?) {
+#if MEETINK_AEC
+    guard let h = handle else { return }
+    mk_aec_reset(h)
+#endif
+}
+
 func int16Data(_ samples: [Float]) -> Data {
     var data = Data(capacity: samples.count * 2)
     for sample in samples {
@@ -160,28 +167,57 @@ final class SpoolWriter: @unchecked Sendable {
             // mountain of silence.
             expectedAt = (epoch > 0 && abs(at - epoch) < 5) ? epoch : at
         }
+        var writeSamples = samples
         if expectedAt >= 0 {
             let gap = at - expectedAt
-            if gap > 0.04 {
-                // Missing audio — hold the timeline with silence.
-                var missing = Int(gap * rate)
+            let correction = Int((gap * rate).rounded())
+            if correction > 0 {
+                // Missing audio — hold the timeline with silence. Apply even
+                // sub-buffer fractional corrections so small clock offsets
+                // cannot accumulate into seconds over a long meeting.
+                var missing = correction
                 let zeros = [Float](repeating: 0, count: min(missing, Int(rate)))
                 while missing > 0 {
                     handle.write(int16Data(Array(zeros.prefix(min(missing, zeros.count)))))
                     missing -= zeros.count
                 }
+                if gap > 0.04 {
+                    fputs("Spool gap: inserted \(correction) sample(s)\n", stderr)
+                }
+            } else if correction < 0 {
+                // An overlap duplicates time and makes this stem run ahead of
+                // wall clock. Trim only the already-covered prefix.
+                let overlap = min(samples.count, -correction)
+                writeSamples = Array(samples.dropFirst(overlap))
+                if gap < -0.04 {
+                    fputs("Spool overlap: trimmed \(overlap) sample(s)\n", stderr)
+                }
             }
-            // gap < -0.04 (overlap) is left alone: timestamps jittering
-            // backwards are device-report noise, and dropping samples
-            // would lose real audio.
         }
-        handle.write(int16Data(samples))
+        handle.write(int16Data(writeSamples))
         if expectedAt >= 0 {
-            expectedAt = max(expectedAt, at) + Double(samples.count) / rate
+            expectedAt = max(expectedAt, at + Double(samples.count) / rate)
         }
     }
 
-    func close() {
+    /// Pad a stamped stream to the shared session end. This makes a stopped
+    /// callback visible as silence instead of a deceptively short file while
+    /// keeping all stems on the same wall-clock duration.
+    func close(at end: Double? = nil) {
+        lock.lock()
+        if let end, let handle, expectedAt >= 0, end > expectedAt {
+            var missing = Int((end - expectedAt) * rate)
+            let zeroCount = min(missing, Int(rate))
+            let zeros = int16Data([Float](repeating: 0, count: zeroCount))
+            while missing > 0 {
+                let take = min(missing, zeroCount)
+                handle.write(take == zeroCount
+                    ? zeros : Data(zeros.prefix(take * 2)))
+                missing -= take
+            }
+            expectedAt = end
+        }
+        lock.unlock()
         try? handle?.close()
     }
 }
@@ -815,7 +851,8 @@ func diarizeSpeaker(wavData: Data, chunkIndex: Int,
     return speakerName
 }
 
-func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
+func transcribe(wavURL: URL, chunkIndex: Int, speaker: String,
+                directMicPresent: Bool = false) {
     let startTime = Date()
     let timestamp = DateFormatter.localizedString(from: startTime, dateStyle: .none, timeStyle: .medium)
 
@@ -993,15 +1030,15 @@ func transcribe(wavURL: URL, chunkIndex: Int, speaker: String) {
         finalSpeaker = speaker
     }
 
-    // Live echo-kill: a SYSTEM-audio voice identified as the user is, by
-    // definition, an echo — you are never remote in your own meeting. This
-    // happens when another participant's client (speakers + mic, room
-    // system) sends the user's voice back. Requires an enrolled profile;
-    // the refine pass catches what this misses.
+    // Live echo-kill is allowed only if this same wall-clock chunk has a
+    // viable direct-mic copy. If the mic dies, system audio can be the only
+    // surviving copy of the user and must never be erased by a label.
     let origin = (speaker == "THEM") ? "sys" : "mic"
-    if origin == "sys" && finalSpeaker == meName {
+    if origin == "sys" && finalSpeaker == meName && directMicPresent {
         fputs("  chunk \(chunkIndex) [echo]: sys voice identified as \(meName) — dropped\n", stderr)
         return
+    } else if origin == "sys" && finalSpeaker == meName {
+        fputs("  chunk \(chunkIndex) [mic-degraded]: preserving sys copy of \(meName)\n", stderr)
     }
 
     transcriptContext.set(speaker, text: text)
@@ -1100,10 +1137,34 @@ func currentOutputRoute() -> (name: String, kind: String) {
     return (deviceName, kind)
 }
 
+func currentInputDeviceName() -> String {
+    var deviceId = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &size, &deviceId) == noErr,
+          deviceId != 0 else { return "unknown" }
+    var name: CFString = "" as CFString
+    var nameSize = UInt32(MemoryLayout<CFString>.size)
+    var nameAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceNameCFString,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    withUnsafeMutablePointer(to: &name) { ptr in
+        _ = AudioObjectGetPropertyData(deviceId, &nameAddr, 0, nil,
+                                       &nameSize, ptr)
+    }
+    return name as String
+}
+
 final class RouteJournal: @unchecked Sendable {
     private let handle: FileHandle?
     private let epoch: Double
     private var lastKey = ""
+    private let lock = NSLock()
 
     init(path: String?, epoch: Double) {
         self.epoch = epoch
@@ -1113,19 +1174,80 @@ final class RouteJournal: @unchecked Sendable {
         } else { handle = nil }
     }
 
-    func record() {
+    func record(generation: Int = 0) {
         guard let handle else { return }
+        lock.lock()
+        defer { lock.unlock() }
         let (name, kind) = currentOutputRoute()
-        guard kind + name != lastKey else { return }
-        lastKey = kind + name
+        let input = currentInputDeviceName()
+        let key = "\(kind)|\(name)|\(input)|\(generation)"
+        guard key != lastKey else { return }
+        lastKey = key
         let t = max(0, hostSeconds() - epoch)
         let line = "{\"t\": \(String(format: "%.1f", t)), " +
             "\"kind\": \"\(kind)\", " +
-            "\"name\": \(jsonEscape(name))}\n"
+            "\"name\": \(jsonEscape(name)), " +
+            "\"input\": \(jsonEscape(input)), " +
+            "\"generation\": \(generation)}\n"
         handle.write(line.data(using: .utf8)!)
     }
 
     func close() { try? handle?.close() }
+}
+
+final class AudioHealthJournal: @unchecked Sendable {
+    private let handle: FileHandle?
+    private let epoch: Double
+    private let lock = NSLock()
+
+    init(path: String?, epoch: Double) {
+        self.epoch = epoch
+        if let path {
+            FileManager.default.createFile(atPath: path, contents: nil)
+            handle = FileHandle(forWritingAtPath: path)
+        } else { handle = nil }
+    }
+
+    func record(_ event: String, detail: String, generation: Int) {
+        guard let handle else { return }
+        let t = max(0, hostSeconds() - epoch)
+        let line = "{\"t\": \(String(format: "%.1f", t)), " +
+            "\"event\": \(jsonEscape(event)), " +
+            "\"detail\": \(jsonEscape(detail)), " +
+            "\"generation\": \(generation)}\n"
+        lock.lock()
+        handle.write(line.data(using: .utf8)!)
+        lock.unlock()
+    }
+
+    func close() { try? handle?.close() }
+}
+
+final class CaptureGeneration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    private var active = true
+
+    func current() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+
+    func advanceIfActive() -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        guard active else { return nil }
+        value += 1
+        return value
+    }
+
+    func isActive() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return active
+    }
+
+    func stop() {
+        lock.lock(); active = false; lock.unlock()
+    }
 }
 
 func jsonEscape(_ s: String) -> String {
@@ -1477,6 +1599,8 @@ struct LocalSpeechCapture {
         var spoolMic = SpoolWriter(path: nil)
         var spool48Sys = SpoolWriter(path: nil)
         var spool48Mic = SpoolWriter(path: nil)
+        let sessionEpoch = hostSeconds()
+        let micGeneration = CaptureGeneration()
         if let dir = spoolDir {
             try? FileManager.default.createDirectory(
                 atPath: dir, withIntermediateDirectories: true)
@@ -1484,16 +1608,15 @@ struct LocalSpeechCapture {
             // the same wall-clock instant and stay aligned through gaps
             // (real mode stamps every append with the buffer's host
             // time; sim mode keeps the legacy chunk-loop writes).
-            let epoch = hostSeconds()
             spoolSys = SpoolWriter(path: "\(dir)/session-sys.raw",
-                                   rate: sampleRate, epoch: epoch)
+                                   rate: sampleRate, epoch: sessionEpoch)
             spoolMic = SpoolWriter(path: "\(dir)/session-mic.raw",
-                                   rate: sampleRate, epoch: epoch)
+                                   rate: sampleRate, epoch: sessionEpoch)
             if spool48Enabled {
                 spool48Sys = SpoolWriter(path: "\(dir)/session-sys.48k.raw",
-                                         rate: archiveRate, epoch: epoch)
+                                         rate: archiveRate, epoch: sessionEpoch)
                 spool48Mic = SpoolWriter(path: "\(dir)/session-mic.48k.raw",
-                                         rate: archiveRate, epoch: epoch)
+                                         rate: archiveRate, epoch: sessionEpoch)
             }
             fputs("Spooling session audio to \(dir) (wall-clock timelines"
                   + (spool48Enabled ? " + 48 kHz archive" : "") + ")\n", stderr)
@@ -1503,8 +1626,14 @@ struct LocalSpeechCapture {
         // speakers/headphones decision. Initial state + every change.
         let routeJournal = RouteJournal(
             path: spoolDir.map { "\($0)/route.jsonl" },
-            epoch: hostSeconds())
-        routeJournal.record()
+            epoch: sessionEpoch)
+        let healthJournal = AudioHealthJournal(
+            path: spoolDir.map { "\($0)/health.jsonl" },
+            epoch: sessionEpoch)
+        routeJournal.record(generation: micGeneration.current())
+        healthJournal.record("capture-started", detail: "mic monitoring active",
+                             generation: micGeneration.current())
+        let routeJournalQueue = DispatchQueue(label: "meetink.route-journal")
         if !simMode {
             var routeAddr = AudioObjectPropertyAddress(
                 mSelector: kAudioHardwarePropertyDefaultOutputDevice,
@@ -1512,11 +1641,17 @@ struct LocalSpeechCapture {
                 mElement: kAudioObjectPropertyElementMain)
             _ = AudioObjectAddPropertyListenerBlock(
                 AudioObjectID(kAudioObjectSystemObject), &routeAddr,
-                DispatchQueue(label: "meetink.route-journal")) { _, _ in
+                routeJournalQueue) { _, _ in
+                    guard micGeneration.isActive() else { return }
                     // Settle delay: the new device's data source reads
                     // stale immediately after a switch.
                     Thread.sleep(forTimeInterval: 0.5)
-                    routeJournal.record()
+                    guard micGeneration.isActive() else { return }
+                    aecReset(aecHandle)
+                    routeJournal.record(generation: micGeneration.current())
+                    healthJournal.record("output-route-changed",
+                        detail: "AEC state reset",
+                        generation: micGeneration.current())
                 }
         }
 
@@ -1620,6 +1755,7 @@ struct LocalSpeechCapture {
         // same AudioBuffer directly, so no mic hardware, no permissions.)
         var micEngineRef: AVAudioEngine? = nil
         var micWatchdogRef: DispatchSourceTimer? = nil
+        var micRebuildQueueRef: DispatchQueue? = nil
         if !simMode {
         let engine = AVAudioEngine()
 
@@ -1645,15 +1781,28 @@ struct LocalSpeechCapture {
 
         let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
 
-        // Shared heartbeat state. The tap closure updates the timestamp on
-        // every delivered buffer; the watchdog reads it on a 5 s tick. NSLock
-        // because both can run on arbitrary queues.
+        // Shared heartbeat state. Callback liveness and meaningful samples
+        // are separate: some failed devices keep delivering buffers full of
+        // literal zeroes, which used to fool the watchdog indefinitely.
         let micHeartbeatLock = NSLock()
-        var lastMicSampleAt: TimeInterval = Date().timeIntervalSince1970
+        var lastMicCallbackAt: TimeInterval = Date().timeIntervalSince1970
+        var lastMicSignalAt: TimeInterval = lastMicCallbackAt
         let micStallThresholdSeconds: TimeInterval = 15.0
-        let updateMicHeartbeat: () -> Void = {
+        let resetMicHeartbeat: () -> Void = {
             micHeartbeatLock.lock()
-            lastMicSampleAt = Date().timeIntervalSince1970
+            let now = Date().timeIntervalSince1970
+            lastMicCallbackAt = now
+            lastMicSignalAt = now
+            micHeartbeatLock.unlock()
+        }
+        let updateMicHeartbeat: ([Float]) -> Void = { samples in
+            let now = Date().timeIntervalSince1970
+            // Real microphone noise is comfortably above this. It excludes
+            // AEC priming zeroes and a wedged device's zero callbacks.
+            let hasSignal = samples.contains { abs($0) > 0.000001 }
+            micHeartbeatLock.lock()
+            lastMicCallbackAt = now
+            if hasSignal { lastMicSignalAt = now }
             micHeartbeatLock.unlock()
         }
 
@@ -1705,12 +1854,12 @@ struct LocalSpeechCapture {
                 }
                 if status == .haveData, let floatData = outBuffer.floatChannelData {
                     var samples = Array(UnsafeBufferPointer(start: floatData[0], count: Int(outBuffer.frameLength)))
+                    updateMicHeartbeat(samples)
                     // Subtract the speaker bleed (sys is the reference)
                     // before the gate/whisper/spool ever see it.
                     aecProcessNear(&samples, aecHandle)
                     spoolMic.append(samples, at: at)
                     audioBuffer.appendMic(samples)
-                    updateMicHeartbeat()
                 }
                 if spool48Enabled {
                     if converter48InputFormat != inFormat {
@@ -1740,7 +1889,7 @@ struct LocalSpeechCapture {
             try engine.start()
             // Reset the heartbeat on install so the watchdog gives the new
             // engine a full window to produce its first sample.
-            updateMicHeartbeat()
+            resetMicHeartbeat()
         }
 
         try installMicTap()
@@ -1751,16 +1900,29 @@ struct LocalSpeechCapture {
         // queue / CoreAudio HAL queue / watchdog timer) doesn't block on the
         // tap dance.
         let micRebuildQueue = DispatchQueue(label: "meetink.mic-rebuild")
+        micRebuildQueueRef = micRebuildQueue
         let rebuildMicTap: (String) -> Void = { reason in
             micRebuildQueue.async {
+                guard let generation = micGeneration.advanceIfActive() else {
+                    return
+                }
+                healthJournal.record("mic-rebuild", detail: reason,
+                                     generation: generation)
                 fputs("[\(reason)] rebuilding mic tap...\n", stderr)
+                aecReset(aecHandle)
                 engine.stop()
                 engine.inputNode.removeTap(onBus: 0)
                 engine.reset()
                 do {
                     try installMicTap()
+                    routeJournal.record(generation: generation)
+                    healthJournal.record("mic-resumed", detail: reason,
+                                         generation: generation)
                     fputs("Mic capture resumed (trigger=\(reason))\n", stderr)
                 } catch {
+                    healthJournal.record("mic-restart-failed",
+                        detail: error.localizedDescription,
+                        generation: generation)
                     fputs("Failed to restart mic (trigger=\(reason)): \(error.localizedDescription)\n", stderr)
                 }
             }
@@ -1798,31 +1960,32 @@ struct LocalSpeechCapture {
             fputs("Warning: CoreAudio HAL listener install failed (status=\(halStatus)); falling back to AVAudioEngine + heartbeat only\n", stderr)
         }
 
-        // Signal 3: heartbeat watchdog. Polls every 5 s. If the engine
-        // reports running but no mic samples have landed in the last
-        // micStallThresholdSeconds, force a rebuild. Catches silent-drop
-        // patterns (BT disconnect that doesn't trigger either of the
-        // notifications above).
+        // Signal 3: heartbeat watchdog. Engine stopped, callback stopped,
+        // and zero-valued callbacks are all failures and force a rebuild.
         let micWatchdogTimer = DispatchSource.makeTimerSource(queue: micRebuildQueue)
         micWatchdogTimer.schedule(deadline: .now() + 5.0, repeating: 5.0, leeway: .seconds(1))
         micWatchdogTimer.setEventHandler {
-            guard engine.isRunning else { return }
+            guard micGeneration.isActive() else { return }
             let now = Date().timeIntervalSince1970
             micHeartbeatLock.lock()
-            let elapsed = now - lastMicSampleAt
+            let callbackElapsed = now - lastMicCallbackAt
+            let signalElapsed = now - lastMicSignalAt
             micHeartbeatLock.unlock()
-            if elapsed > micStallThresholdSeconds {
-                fputs("Mic stall detected: \(String(format: "%.1f", elapsed))s since last sample (threshold=\(Int(micStallThresholdSeconds))s)\n", stderr)
-                // Direct call here is safe — we're already on the rebuild queue.
-                engine.stop()
-                engine.inputNode.removeTap(onBus: 0)
-                engine.reset()
-                do {
-                    try installMicTap()
-                    fputs("Mic capture resumed (trigger=heartbeat-stall)\n", stderr)
-                } catch {
-                    fputs("Failed to restart mic after heartbeat stall: \(error.localizedDescription)\n", stderr)
-                }
+            let reason: String?
+            if !engine.isRunning {
+                reason = "engine-stopped"
+            } else if callbackElapsed > micStallThresholdSeconds {
+                reason = "callback-stall-\(String(format: "%.1f", callbackElapsed))s"
+            } else if signalElapsed > micStallThresholdSeconds {
+                reason = "digital-silence-\(String(format: "%.1f", signalElapsed))s"
+            } else {
+                reason = nil
+            }
+            if let reason {
+                fputs("WARNING: microphone unhealthy (\(reason)); attempting recovery\n", stderr)
+                healthJournal.record("mic-unhealthy", detail: reason,
+                                     generation: micGeneration.current())
+                rebuildMicTap("heartbeat-\(reason)")
             }
         }
         micWatchdogTimer.resume()
@@ -1864,12 +2027,15 @@ struct LocalSpeechCapture {
 
                 if let sysSamples = chunks.system {
                     let sent = hasAudio(sysSamples)
+                    let directMicPresent = chunks.mic.map { hasAudio($0) } ?? false
                     logGate("sys", sysSamples, sent: sent)
                     if sent {
                         let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_\(idx)_them.wav")
                         try writeWAV(samples: sysSamples, to: wavURL)
                         DispatchQueue.global().async {
-                            transcribe(wavURL: wavURL, chunkIndex: idx, speaker: "THEM")
+                            transcribe(wavURL: wavURL, chunkIndex: idx,
+                                       speaker: "THEM",
+                                       directMicPresent: directMicPresent)
                         }
                     }
                 }
@@ -1889,7 +2055,11 @@ struct LocalSpeechCapture {
         }
 
         // --- Shutdown ---
+        micGeneration.stop()
         micWatchdogRef?.cancel()
+        // Drain any rebuild already admitted before closing journals/spools.
+        micRebuildQueueRef?.sync {}
+        routeJournalQueue.sync {}
         micEngineRef?.stop()
         micEngineRef?.inputNode.removeTap(onBus: 0)
         if let scStream {
@@ -1908,16 +2078,22 @@ struct LocalSpeechCapture {
             if let s = remaining.system { spoolSys.append(s) }
             if let m = remaining.mic { spoolMic.append(m) }
         }
-        spoolSys.close()
-        spoolMic.close()
-        spool48Sys.close()
-        spool48Mic.close()
+        let sessionEnd = hostSeconds()
+        spoolSys.close(at: sessionEnd)
+        spoolMic.close(at: sessionEnd)
+        spool48Sys.close(at: sessionEnd)
+        spool48Mic.close(at: sessionEnd)
         routeJournal.close()
+        healthJournal.record("capture-ended", detail: "normal shutdown",
+                             generation: micGeneration.current())
+        healthJournal.close()
         let idx = audioBuffer.chunkIndex
         if let sysSamples = remaining.system, hasAudio(sysSamples) {
+            let directMicPresent = remaining.mic.map { hasAudio($0) } ?? false
             let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_final_them.wav")
             try writeWAV(samples: sysSamples, to: wavURL)
-            transcribe(wavURL: wavURL, chunkIndex: idx, speaker: "THEM")
+            transcribe(wavURL: wavURL, chunkIndex: idx, speaker: "THEM",
+                       directMicPresent: directMicPresent)
         }
         if let micSamples = remaining.mic, hasAudio(micSamples) {
             let wavURL = URL(fileURLWithPath: "\(chunkDir)/chunk_final_me.wav")

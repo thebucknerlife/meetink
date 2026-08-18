@@ -96,7 +96,17 @@ tail -f /tmp/meetink-whisper.log
 tail -f /tmp/meetink-capture.log
 ```
 
-There is **no test suite** and no linter config. The Package.swift exists for tooling/IDE support, but the launcher builds with `swiftc` directly (not `swift build`) so it can pin the SDK and target.
+There is a focused deterministic audio-policy suite (directionality, routes,
+double-talk, and mic failure). Run it with the same NumPy-bearing environment
+as refine:
+
+```sh
+~/.meetink/parakeet-venv/bin/python -m unittest discover -s tests -v
+```
+
+There is no general linter config. The Package.swift exists for tooling/IDE
+support, but the launcher builds with `swiftc` directly (not `swift build`) so
+it can pin the SDK and target.
 
 ## Things that bite
 

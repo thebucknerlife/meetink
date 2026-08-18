@@ -18,6 +18,8 @@ extern "C" {
 /* One canceller instance at the given rate (mono float32 samples). */
 void *mk_aec_create(int sample_rate);
 void  mk_aec_destroy(void *handle);
+/* Clear learned delay/filter state after an input/output route change. */
+void  mk_aec_reset(void *handle);
 
 /* Far-end (speaker/sys) audio. Any count; buffered into 10 ms frames. */
 void  mk_aec_feed_far(void *handle, const float *samples, int count);
