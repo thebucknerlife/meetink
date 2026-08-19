@@ -237,10 +237,37 @@ final class TapSession {
         var rs = UInt32(MemoryLayout<Double>.size)
         if AudioObjectGetPropertyData(aggID, &rateAddr, 0, nil, &rs, &aggRate) == noErr,
            aggRate > 0, aggRate != rate {
-            journal("tap-rate-override",
-                    "tap format claims \(Int(rate)) Hz but the aggregate "
-                    + "runs \(Int(aggRate)) Hz — trusting the aggregate")
-            rate = aggRate
+            // Clock mismatch (AirPods call mode: device/aggregate 24 kHz,
+            // tap stream 48 kHz) makes the tap→aggregate drift
+            // compensator resample 2:1 — and it drops one IO cycle every
+            // ring-buffer wrap: a ~20 ms zero gap every 0.68 s
+            // (= 32768 frames at 48 kHz; field case: rhythmic 'womp'
+            // under Ross's speech). Pin the aggregate to the tap's rate
+            // so the tap path copies verbatim; the HAL resamples the
+            // device feed instead, which is the boring well-tested path.
+            var want = rate
+            let st2 = AudioObjectSetPropertyData(
+                aggID, &rateAddr, 0, nil,
+                UInt32(MemoryLayout<Double>.size), &want)
+            if st2 == noErr {
+                journal("agg-rate-pinned",
+                        "aggregate \(Int(aggRate)) → \(Int(want)) Hz to "
+                        + "match the tap stream")
+                // Re-read: the HAL may quantize or refuse silently.
+                var check: Double = 0
+                if AudioObjectGetPropertyData(aggID, &rateAddr, 0, nil,
+                                              &rs, &check) == noErr,
+                   check > 0 { aggRate = check }
+            } else {
+                journal("agg-rate-pin-failed",
+                        "status \(st2) — keeping \(Int(aggRate)) Hz")
+            }
+            if aggRate != rate {
+                journal("tap-rate-override",
+                        "tap format claims \(Int(rate)) Hz but the aggregate "
+                        + "runs \(Int(aggRate)) Hz — trusting the aggregate")
+                rate = aggRate
+            }
         }
 
         let srcRate = rate
