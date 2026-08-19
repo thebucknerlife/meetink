@@ -223,6 +223,26 @@ final class TapSession {
                 "\(Int(rate)) Hz, \(asbd.mChannelsPerFrame) ch \(chDesc), "
                 + "\(asbd.mBitsPerChannel)-bit, bytes/frame \(asbd.mBytesPerFrame)")
 
+        // The IOProc delivers in the AGGREGATE's clock, not at the tap
+        // format's claim. With AirPods renegotiated to 24 kHz call mode
+        // the tap format still said 48000 while delivery ran at exactly
+        // half — a 24k stream in a 48k-labeled WAV plays helium-pitched
+        // (field case: the Ross call). The aggregate's nominal rate IS
+        // the delivery rate; trust it over the tap format.
+        var aggRate: Double = 0
+        var rateAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var rs = UInt32(MemoryLayout<Double>.size)
+        if AudioObjectGetPropertyData(aggID, &rateAddr, 0, nil, &rs, &aggRate) == noErr,
+           aggRate > 0, aggRate != rate {
+            journal("tap-rate-override",
+                    "tap format claims \(Int(rate)) Hz but the aggregate "
+                    + "runs \(Int(aggRate)) Hz — trusting the aggregate")
+            rate = aggRate
+        }
+
         let srcRate = rate
         var pid: AudioDeviceIOProcID? = nil
         st = AudioDeviceCreateIOProcIDWithBlock(&pid, aggID, nil) {
@@ -335,9 +355,14 @@ var statZeroSamples = 0
 var statRate: Double = 0
 var statWindowStart = Date()
 
+// Measured-rate override: when the stats watchdog catches delivery
+// running at a different rate than every property claimed, it re-labels
+// the stream here (rolls a segment at the measured rate).
+var forcedRate: Double? = nil
+
 let audioSink: ([Int16], Bool, Double) -> Void = { samples, nonzero, rate in
     queue.async {
-        writer(for: rate)?.append(samples)
+        writer(for: forcedRate ?? rate)?.append(samples)
         lastAudioAt = Date()
         if nonzero { lastNonzeroAt = Date() }
         statFrames += samples.count
@@ -359,6 +384,7 @@ func startSession() {
     statFrames = 0
     statZeroSamples = 0
     statWindowStart = Date()
+    forcedRate = nil   // a fresh session re-derives its own rate
 }
 
 func restartSession(_ reason: String) {
@@ -408,6 +434,25 @@ watchdog.setEventHandler {
         journal("stats", "window \(Int(elapsed))s: \(statFrames) frames "
                 + "(expected ~\(expected), drift \(statFrames - expected)), "
                 + "zero-fraction \(String(format: "%.3f", zf))")
+        // Delivery rate is MEASURED, not believed: if a full window ran
+        // >5% off the writer's rate, re-label at the nearest standard
+        // rate (a wrong label plays pitch-shifted; a rolled segment
+        // just plays right). Catches anything the property lies missed.
+        if elapsed > 30, statFrames > 0 {
+            let measured = Double(statFrames) / elapsed
+            let current = forcedRate ?? statRate
+            if current > 0, abs(measured - current) / current > 0.05 {
+                let standards: [Double] = [8000, 16000, 22050, 24000,
+                                           32000, 44100, 48000, 88200, 96000]
+                let snapped = standards.min {
+                    abs($0 - measured) < abs($1 - measured)
+                } ?? measured
+                journal("rate-mismatch",
+                        "measured \(Int(measured)) Hz vs writer "
+                        + "\(Int(current)) Hz — rolling segment at \(Int(snapped)) Hz")
+                forcedRate = snapped
+            }
+        }
         statFrames = 0
         statZeroSamples = 0
         statWindowStart = now
