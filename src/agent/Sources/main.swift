@@ -523,6 +523,67 @@ func runningConferencingApp() -> String? {
     conferencingProcessStates().first { $0.matched != nil }?.label
 }
 
+// Per-process audio-input attribution (macOS 14.4+; HAL metadata — no
+// audio content, no TCC prompt). The only reliable signal for callers
+// whose main process runs 24/7: a Slack huddle is invisible to the
+// process scan (field case: the watch killed a live huddle twice,
+// leaving a 17-second recording), but "Slack holds a live input
+// stream" is unambiguous — and it drops the moment the huddle ends.
+// Allowlist by bundle id so our own processes and browsers (covered by
+// the tab scan) can never self-detect. Unlike the device-level mic
+// check, this stays meaningful WHILE meetink records: attribution is
+// per-process.
+let kAudioInputCallers: [String: String] = [
+    "com.tinyspeck.slackmacgap": "slack",
+    "com.hnc.discord": "discord",
+    "com.apple.facetime": "facetime",
+]
+
+func audioInputCallers() -> [String] {
+    guard #available(macOS 14.4, *) else { return [] }
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+        &size) == noErr, size > 0 else { return [] }
+    var objs = [AudioObjectID](
+        repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+        &size, &objs) == noErr else { return [] }
+    var found: [String] = []
+    for obj in objs {
+        var running: UInt32 = 0
+        var rSize = UInt32(MemoryLayout<UInt32>.size)
+        var rAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyIsRunningInput,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(obj, &rAddr, 0, nil, &rSize,
+                                         &running) == noErr,
+              running != 0 else { continue }
+        var bid: CFString? = nil
+        var bSize = UInt32(MemoryLayout<CFString?>.size)
+        var bAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyBundleID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let st = withUnsafeMutablePointer(to: &bid) { ptr in
+            AudioObjectGetPropertyData(obj, &bAddr, 0, nil, &bSize, ptr)
+        }
+        guard st == noErr,
+              let b = (bid as String?)?.lowercased(), !b.isEmpty
+        else { continue }
+        if let label = kAudioInputCallers[b], !found.contains(label) {
+            found.append(label)
+        }
+    }
+    return found
+}
+
 // Camera-in-use check via AVCaptureDevice. Returns true if *any* video
 // device is being used by another process — the strongest signal we
 // have for "video call active". Falls cleanly when the user has video
@@ -731,6 +792,24 @@ func cmdMeetingActive(args: [String]) -> Int32 {
     if procCounted, let p = firstProc {
         sources.append("process:\(p)")
         primary = primary ?? p
+    }
+
+    // App-attributed live audio input: standalone evidence — holding an
+    // input stream is call-specific, unlike an idle 24/7 process. This
+    // is what sees Slack huddles.
+    let inputApps = audioInputCallers()
+    for label in inputApps {
+        checks.append(["label": "\(label) live audio input",
+                       "state": true,
+                       "detail": "app holds a live input stream (in a call)"])
+        sources.append("input:\(label)")
+        primary = primary ?? label
+    }
+    if inputApps.isEmpty {
+        checks.append(["label": "app-attributed audio input",
+                       "state": false,
+                       "detail": "no watched app (slack/discord/facetime) "
+                           + "holds an input stream"])
     }
 
     if camera {
