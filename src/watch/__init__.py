@@ -498,11 +498,20 @@ def _stop_recording_subprocess() -> None:
     # whole pipeline (field incident: the Eddie meeting lost its refine,
     # audio and summary to an app relaunch). Own session + log file, and
     # the pipeline no longer cares whether we're alive.
+    #
+    # NON-BLOCKING, and it must stay that way: subprocess.run() here
+    # froze the caller for the postproc's whole duration — the tick
+    # thread calls this on end-detection, so after a long meeting the
+    # watch went DEAF for ~15 minutes: no presence matching, no
+    # fallback, no conflict checks (field case: the Adriana call joined
+    # 16 min late during the Dan postproc was never recorded, and the
+    # wake-up then matched the NEXT event's window, mislabeling its
+    # tail). Capture itself dies seconds in; only the pipeline runs on.
     with open("/tmp/meetink-watch-stop.log", "ab") as log:
         log.write(f"--- watch stop @ {datetime.now()}\n".encode())
         log.flush()
-        subprocess.run([str(LAUNCHER), "stop"], check=False,
-                       stdout=log, stderr=log, start_new_session=True)
+        subprocess.Popen([str(LAUNCHER), "stop"],
+                         stdout=log, stderr=log, start_new_session=True)
 
 
 # ---------------------------------------------------------------------------
