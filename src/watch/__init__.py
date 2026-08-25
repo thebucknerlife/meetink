@@ -1396,7 +1396,14 @@ class WatchManager:
             _wlog("switch: capture did not exit — aborting new start")
             return
         time.sleep(2)   # let cmd_stop finish consolidating/retargeting
-        self._begin_event_recording(ev, armed=True)
+        # armed=False: the auto-switch fires on calendar timing + a
+        # presence GAP — by construction it has NOT seen the new call
+        # yet (field case: ONCD — Greg sat in the waiting room, the
+        # switch started the recording, and armed-at-birth end-detection
+        # killed it 17 s later on 'inactive' polls while the call was
+        # still forming). Arm on first SEEN presence instead; if the app
+        # is never visible the silence/4 h guards still bound it.
+        self._begin_event_recording(ev, armed=False)
 
     # -- adopted recordings (started manually, not by the watch) -----------
 

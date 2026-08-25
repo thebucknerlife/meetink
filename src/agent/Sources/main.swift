@@ -666,11 +666,18 @@ let kBrowserMeetingPatterns: [(label: String, patterns: [String])] = [
     ("meet",   ["meet\\.google\\.com/[a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4}",
                 "meet\\.google\\.com/_meet/[a-z]{3,4}-[a-z]{3,5}-[a-z]{3,4}",
                 "meet\\.google\\.com/lookup/"]),
-    ("zoom",   ["zoom\\.us/j/[0-9]", "zoom\\.us/wc/[0-9]"]),
+    // zoomgov.com is Zoom for Government — same room-URL shapes.
+    ("zoom",   ["zoom\\.us/j/[0-9]", "zoom\\.us/wc/[0-9]",
+                "zoomgov\\.com/j/[0-9]", "zoomgov\\.com/wc/[0-9]"]),
     // Teams meeting URLs go through /l/meetup-join/ or /_#/conv/.
+    // Government tenants (GCC-High/DoD) live on teams.microsoft.us —
+    // the substring match also covers dod./gov. subdomains (field
+    // case: an ONCD call was invisible to presence detection).
     ("teams",  ["teams\\.microsoft\\.com/l/meetup-join/",
                 "teams\\.microsoft\\.com/_#/conv/",
-                "teams\\.live\\.com/meet/"]),
+                "teams\\.live\\.com/meet/",
+                "teams\\.microsoft\\.us/l/meetup-join/",
+                "teams\\.microsoft\\.us/_#/conv/"]),
     // Webex's join URL uses /meet/ for personal rooms, /j.php?MTID= for
     // scheduled meetings, /wbxmjs/ for the web app session.
     ("webex",  ["webex\\.com/meet/",
