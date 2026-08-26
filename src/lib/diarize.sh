@@ -1277,10 +1277,52 @@ profile_assign() {
             print -P "  ${C[yellow]}⚠${C[reset]}  ${C[dim]}${rejected} of $(( ${added:-0} + ${rejected:-0} )) cluster samples dropped as outliers (didn't match the profile's voice)${C[reset]}"
         fi
     elif print -- "$resp" | grep -q '"no_cluster"'; then
-        # No voice data under that label (older session, or the sidecar
-        # restarted since). Still fix the transcript — renaming the lines
-        # is usually what the user is after; enrollment just can't happen.
-        print -P "${C[yellow]}⚠${C[reset]} No voice data for ${C[bold]}${old_label}${C[reset]} in this session ${C[dim]}— renaming transcript lines only (no profile update)${C[reset]}"
+        # No voice data under that label — the transcript can show
+        # letters the server has since merged away, or the speech rode
+        # as THEM without a cluster. Mid-call the user's intent is
+        # "this voice = <name>" (field ask: naming a new person halfway
+        # through a call should IMPROVE live diarization, not dead-end).
+        # Evidence-based fallback while recording: exactly one live
+        # unidentified cluster with real speech behind it → that IS the
+        # voice; several → list them with ready-to-run commands.
+        local fell_back="" fb_letter=""
+        if _is_running 2>/dev/null; then
+            local -a fb_letters
+            fb_letters=($(curl -s "http://127.0.0.1:$MK_DIARIZE_PORT/session/clusters" 2>/dev/null \
+                | python3 -c '
+import json, sys
+try:
+    for c in json.load(sys.stdin).get("clusters", []):
+        if int(c.get("samples", 0)) >= 5:
+            print(c["letter"])
+except Exception:
+    pass' 2>/dev/null))
+            if (( ${#fb_letters[@]} == 1 )); then
+                fb_letter="${fb_letters[1]}"
+                local resp2=$(curl -s -X POST \
+                    "http://127.0.0.1:$MK_DIARIZE_PORT/session/assign?cluster=$(_mk_urlq "$fb_letter")&name=$(_mk_urlq "$name")")
+                if _resp_ok "$resp2"; then
+                    local s2=$(print -- "$resp2" | sed -nE 's/.*"samples":[[:space:]]*([0-9]+).*/\1/p')
+                    print -P "${C[green]}✓${C[reset]} No voice data under ${C[bold]}${old_label}${C[reset]} — assigned the session's only unidentified voice ${C[dim]}(Speaker ${fb_letter}, ${s2} samples)${C[reset]} to ${C[bold]}$name${C[reset]}"
+                    resp="$resp2"   # sibling-fold handling below applies
+                    fell_back=1
+                fi
+            elif (( ${#fb_letters[@]} > 1 )); then
+                print -P "${C[yellow]}⚠${C[reset]} No voice data for ${C[bold]}${old_label}${C[reset]} ${C[dim]}— pick the right live voice:${C[reset]}"
+                local fbl
+                for fbl in "${fb_letters[@]}"; do
+                    print -P "    ${C[dim]}/profile assign ${fbl} ${name}${C[reset]}"
+                done
+            fi
+        fi
+        [[ -z "$fell_back" ]] && \
+            print -P "${C[yellow]}⚠${C[reset]} No voice data for ${C[bold]}${old_label}${C[reset]} in this session ${C[dim]}— renaming transcript lines only (no profile update)${C[reset]}"
+        # The fallback cluster's own lines carry its letter — rewrite
+        # them too so the visible transcript matches the enrollment.
+        if [[ -n "$fell_back" && -e "$MK_TRANSCRIPT" ]]; then
+            _rewrite_transcript_label "$MK_TRANSCRIPT" "Speaker ${fb_letter}" "$up_name" && \
+                print -P "${C[green]}✓${C[reset]} Renamed ${C[dim]}Speaker ${fb_letter}${C[reset]} → ${C[bold]}${up_name}${C[reset]} in the live transcript"
+        fi
     else
         print -P "${C[red]}error:${C[reset]} $resp"
         return 1
