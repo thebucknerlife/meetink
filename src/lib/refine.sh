@@ -222,10 +222,35 @@ refine_session() {
         # names / titling never ran — field-debugged from the launcher log).
         local raw_name="${actual%.txt}.live-raw.txt"
         print -P "${C[green]}✓${C[reset]} Refined: ${n} lines ${C[dim]}(raw kept: ${raw_name:t})${C[reset]}"
+        _quality_gate "$actual"
     else
         rm -f "$tmp"
         print -P "${C[yellow]}⚠${C[reset]} Refine failed — keeping the live transcript ${C[dim]}(see /tmp/meetink-refine.log)${C[reset]}"
     fi
+}
+
+# Post-refine transcript quality gate — FLAG, never block (recall over
+# precision: audio is sacred, labels are fixable). Empty output = clean.
+# Surfaces: refine log, one notification, activity line. Field case: a
+# 1:1 shipped with 'Speaker 2' at 98% and nothing said a word.
+_quality_gate() {
+    local t="$1"
+    [[ -f "$t" && -x "$MK_PARAKEET_VENV/bin/python" \
+       && -f "$MK_ROOT/src/refine/quality_gate.py" ]] || return 0
+    local warns
+    warns=$("$MK_PARAKEET_VENV/bin/python" \
+        "$MK_ROOT/src/refine/quality_gate.py" "$t" 2>/dev/null)
+    [[ -n "$warns" ]] || return 0
+    print -r -- "quality gate (${t:t}):" >> /tmp/meetink-refine.log
+    print -r -- "$warns" >> /tmp/meetink-refine.log
+    local first="${warns%%$'\n'*}"
+    first="${first#quality: }"
+    print -P "${C[yellow]}⚠${C[reset]}  transcript quality: ${first}"
+    typeset -f mk_notify >/dev/null 2>&1 && \
+        mk_notify "Transcript quality" "$first"
+    typeset -f mk_activity >/dev/null 2>&1 && \
+        mk_activity "quality warning — ${${t:t}%.txt}: ${first}"
+    return 0
 }
 
 # Trim a huge silent tail off the session spools (forgotten recordings).
@@ -938,6 +963,7 @@ cmd_reprocess() {
         [[ -f "$tmpdir/out.txt.timing.json" ]] && mv "$tmpdir/out.txt.timing.json" "${base}.timing.json"
         local n=$(grep -cE '^\[[0-9:]{8}\]' "$actual")
         print -P "${C[green]}✓${C[reset]} Reprocessed: ${n} lines ${C[dim]}(previous kept: ${base:t}.pre-reprocess.txt)${C[reset]}"
+        _quality_gate "$actual"
         typeset -f mk_activity >/dev/null && mk_activity "reprocessed — ${${actual:t}:r}"
         # Rebuild the listenable m4a too — reprocess exists to pick up
         # pipeline improvements, and the audio pipeline is part of that.

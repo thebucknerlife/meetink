@@ -282,6 +282,84 @@ PYANNOTE_VENV = os.environ.get(
     os.path.expanduser("~/.meetink/pyannote-venv"))
 
 
+def parse_route_spans(journal_path: str,
+                      kind: str = "headphones") -> list[tuple[float, float]]:
+    """Session-relative time spans during which the output route was
+    `kind`, from the capture's route journal. Each event's kind holds
+    until the next event; the last holds to end-of-session. The journal
+    is the same authority the audio mixer trusts."""
+    try:
+        events = []
+        for line in Path(journal_path).read_text(errors="replace").splitlines():
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(o, dict) and "t" in o and "kind" in o:
+                events.append((float(o["t"]), str(o["kind"])))
+    except OSError:
+        return []
+    events.sort()
+    spans: list[tuple[float, float]] = []
+    for i, (t0, k) in enumerate(events):
+        t1 = events[i + 1][0] if i + 1 < len(events) else 1e12
+        if k == kind:
+            if spans and abs(spans[-1][1] - t0) < 0.01:
+                spans[-1] = (spans[-1][0], t1)
+            else:
+                spans.append((t0, t1))
+    return spans
+
+
+def parse_attendee_first_names(txt_path: str) -> tuple[list[str], str | None]:
+    """Attendee FIRST names (uppercased) from the transcript's
+    `# attendees:` header, plus the `# user:` label. "Name <email>"
+    reduces to the name's first token; a bare email to its local part's
+    first chunk ("greg@ae.studio" -> GREG)."""
+    user: str | None = None
+    names: list[str] = []
+    try:
+        for line in Path(txt_path).read_text(errors="replace").splitlines():
+            if line.startswith("# user:"):
+                user = line.split(":", 1)[1].strip().upper() or None
+            elif line.startswith("# attendees:"):
+                for ent in line.split(":", 1)[1].split(","):
+                    ent = ent.strip()
+                    if not ent:
+                        continue
+                    name = ent.split("<", 1)[0].strip()
+                    if not name and "<" in ent:
+                        name = ent.split("<", 1)[1].split(">", 1)[0].strip()
+                    if "@" in name:
+                        name = re.split(r"[@.]", name)[0]
+                    parts = name.split()
+                    if parts:
+                        names.append(parts[0].upper())
+            if re.match(r"^\[\d{2}:\d{2}:\d{2}\] ", line):
+                break
+    except OSError:
+        pass
+    return names, user
+
+
+def solo_remote_attendee(txt_path: str, me_label: str | None) -> str | None:
+    """The single non-user attendee's first name for a 1:1, else None.
+    A degenerate parse (initial-only email local parts like
+    r@rossingram.com -> "R") returns None — never rename a cluster to a
+    label a human wouldn't recognize as a name."""
+    names, user = parse_attendee_first_names(txt_path)
+    me_up = (me_label or "").strip().upper()
+    others: list[str] = []
+    for n in names:
+        if n and n != me_up and n != (user or ""):
+            if n not in others:
+                others.append(n)
+    if len(others) != 1:
+        return None
+    cand = others[0]
+    return cand if len(cand) >= 2 and cand.isalpha() else None
+
+
 def pyannote_diarize_import(raw: bytes, segs: list[dict],
                             port: int) -> list[dict] | None:
     """Premium diarization for IMPORTS: pyannote 3.1 does the WHO-SPOKE-
@@ -447,7 +525,9 @@ def pyannote_diarize_import(raw: bytes, segs: list[dict],
 
 def offline_diarize_multi(streams: list[dict], port: int,
                           me_label: str | None = None,
-                          priors: list[tuple[float, float, str]] | None = None) -> list[dict] | None:
+                          priors: list[tuple[float, float, str]] | None = None,
+                          hp_spans: list[tuple[float, float]] | None = None,
+                          solo_remote: str | None = None) -> list[dict] | None:
     """Joint offline diarization over one or more streams.
 
     streams: [{"raw": bytes, "segs": [...], "origin": "mic"|"sys"|"import"}]
@@ -567,6 +647,12 @@ def offline_diarize_multi(streams: list[dict], port: int,
 
     def mic_seconds(g: list[int]) -> float:
         return origin_seconds(g, "mic")
+
+    def _in_hp(t0: float, t1: float) -> bool:
+        if not hp_spans:
+            return False
+        mid = 0.5 * (t0 + t1)
+        return any(a <= mid < b for a, b in hp_spans)
 
     # 3a. User-blessed priors first: on a reprocess, a cluster whose
     # windows spend most of their time inside spans the user already
@@ -719,6 +805,53 @@ def offline_diarize_multi(streams: list[dict], port: int,
         else:
             speaker_n += 1
             labels.append(f"Speaker {speaker_n}")
+
+    # 1:1 CALENDAR MAPPING (Sol review): a 1:1 has exactly one remote
+    # human; when exactly one substantial cluster ended up unnamed
+    # ("Speaker N") it is that attendee. Escape hatches: several unnamed
+    # substantial clusters (unexpected guest — leave them), or the
+    # attendee's name already claimed by a profile-matched cluster.
+    # Origin gate: the cluster must be sys-majority when stems exist
+    # (never hand the calendar name to a mic-side voice); single-stream
+    # relabel/import has no origins to check.
+    if solo_remote:
+        target = solo_remote.strip().upper()
+        have_origins = any(st["origin"] in ("mic", "sys") for st in streams)
+
+        def _sys_majority(g: list[int]) -> bool:
+            total = sum(windows[k][3] - windows[k][2] for k in g)
+            return total > 0 and origin_seconds(g, "sys") > 0.5 * total
+
+        cand = [gi for gi, l in enumerate(labels)
+                if l.startswith("Speaker ") and gi in substantial
+                and (not have_origins or _sys_majority(groups[gi]))]
+        # "Claimed" blocks the mapping only when the claiming cluster is
+        # COMPARABLE in size to the candidate — a shard that matched the
+        # DIOGO profile but holds a fraction of the speech must not leave
+        # the 48%-of-the-meeting voice as 'Speaker 1' (field case; and
+        # the QA rerun found a duration-substantial-but-word-invisible
+        # claimant slipping through a boolean version of this rule).
+        # Renaming the big cluster to the same name just unifies them.
+        def _dur(g: list[int]) -> float:
+            return sum(windows[k][3] - windows[k][2] for k in g)
+
+        if len(cand) == 1:
+            cand_dur = _dur(groups[cand[0]])
+            claim_dur = max((_dur(groups[gi])
+                             for gi in range(len(labels))
+                             if labels[gi] == target), default=0.0)
+            if claim_dur >= 0.3 * cand_dur:
+                log(f"1:1 mapping skipped: {target} already claimed by a "
+                    f"comparable cluster ({claim_dur:.0f}s vs "
+                    f"candidate {cand_dur:.0f}s)")
+            else:
+                log(f"1:1 mapping: {labels[cand[0]]} -> {target} "
+                    f"(sole remote cluster; calendar attendee)")
+                labels[cand[0]] = target
+        else:
+            log(f"1:1 mapping skipped: {len(cand)} unnamed substantial "
+                f"remote cluster(s) (calendar says {target})")
+
     for gi, tj in fold_into.items():
         labels[gi] = labels[tj]
     if fold_into:
@@ -818,6 +951,64 @@ def offline_diarize_multi(streams: list[dict], port: int,
             log(f"exemplar anchoring: {len(exemplars)} corrected voices "
                 f"({', '.join(labs)}) re-attributed {anchored}/{len(E)} windows")
 
+    # ROUTE-ORIGIN ANCHORING (Sol review): during unambiguous-headphones
+    # spans the mic hears exactly one person — the user. No embedding
+    # vote may overrule channel topology: every mic-origin window whose
+    # midpoint sits in a headphones span IS the user. This makes a
+    # Ross-class collapse (one fused cluster owning 98% of the meeting,
+    # the user's mic speech included) impossible. Speaker/unknown spans
+    # keep the joint-clustering behavior — there the mic legitimately
+    # carries other voices (room guests, speaker echo). Placed BEFORE
+    # AFTER exemplar anchoring: exemplars derived from a COLLAPSED
+    # prior transcript re-painted 91% of a QA meeting's windows and
+    # undid the anchor. Channel topology is physical ground truth —
+    # it runs last. (A user's correction of a mic-side window to a
+    # different name is the one thing this overrides; an in-person
+    # guest on the user's mic under headphones is relabel territory.)
+    if me_name and hp_spans:
+        me_forced = 0
+        for k, (si, _i, t0, t1) in enumerate(windows):
+            if streams[si]["origin"] == "mic" and _in_hp(t0, t1) \
+                    and win_label.get(k) != me_name:
+                win_label[k] = me_name
+                me_forced += 1
+        if me_forced:
+            log(f"route anchor: {me_forced} mic window(s) in headphone "
+                f"spans pinned to {me_name}")
+        # INVERSE anchor: sys audio in headphone spans is NEVER the user
+        # (their voice only returns as codec echo, which the text-level
+        # echo pass removes). Without this, a fused cluster that matched
+        # the user's profile handed the user's name to the remote side —
+        # the Ross QA reprocess flipped 'Speaker 2 98%' into 'GREG 97%',
+        # equally wrong. Reassign such windows to the nearest non-user
+        # voice, else to one shared remote bucket (which the 1:1 mapping
+        # can then name).
+        non_me_cents = [(l2, cents[gi2]) for gi2, l2 in enumerate(labels)
+                        if l2 and l2 != me_name]
+        remote_bucket = f"Speaker {speaker_n + 1}"
+        bucket_used = False
+        sys_moved = 0
+        for k, (si, _i, t0, t1) in enumerate(windows):
+            if streams[si]["origin"] == "sys" and _in_hp(t0, t1) \
+                    and win_label.get(k) == me_name:
+                best_l, best_s = None, 0.0
+                for l2, c2 in non_me_cents:
+                    s2 = float(E[k] @ c2)
+                    if s2 > best_s:
+                        best_l, best_s = l2, s2
+                if best_l is not None and best_s >= 0.35:
+                    win_label[k] = best_l
+                else:
+                    win_label[k] = remote_bucket
+                    bucket_used = True
+                sys_moved += 1
+        if sys_moved:
+            log(f"route anchor: {sys_moved} sys window(s) in headphone "
+                f"spans moved off {me_name}"
+                + (f" (new bucket {remote_bucket})" if bucket_used else ""))
+        if bucket_used:
+            speaker_n += 1
+
     # 4. Per-segment vote (duration-weighted) + single-change splits.
     out: list[dict] = []
     by_seg: dict[tuple[int, int], list] = {}
@@ -878,7 +1069,12 @@ def offline_diarize_multi(streams: list[dict], port: int,
             wins = sorted(by_seg.get((si, i), []))
             if not wins:
                 lab = default_label
-                if lab == "THEM":
+                # Window-less mic snippets in headphone spans are the
+                # user by the same channel-topology argument as above.
+                if origin == "mic" and me_name \
+                        and _in_hp(seg["start"], seg["end"]):
+                    lab = me_name
+                elif lab == "THEM":
                     r = rescue_short(stream["raw"], seg["start"], seg["end"])
                     if r is not None:
                         lab = r
@@ -988,7 +1184,8 @@ def relabel_main(args) -> int:
     labeled = offline_diarize_multi(
         [{"raw": raw, "segs": segs, "origin": "import"}],
         args.diarize_port, me_label=args.me,
-        priors=parse_label_priors(str(txt)))
+        priors=parse_label_priors(str(txt)),
+        solo_remote=solo_remote_attendee(str(txt), args.me))
     if labeled is None:
         log("diarize sidecar unreachable — relabel needs it")
         return 1
@@ -1119,10 +1316,19 @@ def main() -> int:
         # assumed to be only the user — in-person guests, speakerphone
         # calls and hybrid meetings all label correctly, anchored by the
         # user's enrolled profile (or the dominant mic voice as fallback).
+        # The route journal (headphone spans) and the calendar's sole
+        # remote attendee feed the origin anchor and 1:1 mapping.
+        hp_spans: list[tuple[float, float]] = []
+        solo: str | None = None
+        if args.header_from:
+            hp_spans = parse_route_spans(
+                re.sub(r"\.txt$", ".route.jsonl", args.header_from))
+            solo = solo_remote_attendee(args.header_from, args.me)
         _t0 = _time.time()
         labeled = offline_diarize_multi(
             streams, args.diarize_port, me_label=args.me,
-            priors=parse_label_priors(args.prior) if args.prior else None)
+            priors=parse_label_priors(args.prior) if args.prior else None,
+            hp_spans=hp_spans, solo_remote=solo)
         perf_mark("diarize", _t0)
         if labeled is not None:
             for seg in labeled:
@@ -1298,6 +1504,11 @@ def main() -> int:
         for hl in src_lines:
             if re.match(r"^\[\d{2}:\d{2}:\d{2}\] ", hl) or hl.startswith("---"):
                 break
+            # These are re-added fresh below — copying the old ones
+            # stacked duplicate '# refined:' headers on every reprocess
+            # (Sol review caught the doubling in two transcripts).
+            if hl.startswith("# refined:") or hl.startswith("# audio-warning:"):
+                continue
             lines.append(hl)
         # The Ended footer lives at the BOTTOM — preserve it or the app's
         # header timer has no stop time and ticks forever.
@@ -1378,6 +1589,90 @@ def main() -> int:
                 f"contained interjection container(s)")
         entries = split_out
         entries.sort(key=lambda e: e[0])
+
+    # TURN CAPS (Sol review): a 400-word container is unreadable and
+    # un-navigable. Split oversize entries at natural token gaps into
+    # roughly 30 s parts (hard cut at 50 s). Only token-timed entries
+    # split — text without timing stays whole rather than get cut
+    # blind mid-thought.
+    _capped: list = []
+    _n_split = 0
+    for e in entries:
+        toks = e[4] or []
+        words = len(e[2].split())
+        span = (float(toks[-1].get("end", e[0]))
+                - float(toks[0].get("start", e[0]))) if toks else 0.0
+        if not toks or (words <= 120 and span <= 45.0):
+            _capped.append(e)
+            continue
+        parts: list[list] = []
+        cur: list = []
+        cur_start = float(toks[0].get("start", e[0]))
+        last_end = cur_start
+        for tk in toks:
+            ts = float(tk.get("start", last_end))
+            gap = ts - last_end
+            dur = last_end - cur_start
+            if cur and ((dur >= 30.0 and gap >= 0.5) or dur >= 50.0):
+                parts.append(cur)
+                cur = []
+                cur_start = ts
+            cur.append(tk)
+            last_end = float(tk.get("end", ts))
+        if cur:
+            parts.append(cur)
+        if len(parts) <= 1:
+            _capped.append(e)
+            continue
+        _n_split += 1
+        for part in parts:
+            ptext = "".join(tk.get("text") or "" for tk in part).strip()
+            if ptext:
+                _capped.append((float(part[0].get("start", e[0])), e[1],
+                                ptext, e[3], part))
+    if _n_split:
+        log(f"turn caps: split {_n_split} oversize line(s)")
+    entries = _capped
+    entries.sort(key=lambda e: e[0])
+
+    # SAME-VOICE duplicate suppression (Sol review): a fused run-on
+    # container and its clean per-sentence twins carry the same words
+    # twice (field case: two GREG lines at the same stamp, one
+    # unpunctuated). Runs AFTER interleave/turn-cap splitting so both
+    # copies exist as comparable, similarly-timed pieces — before the
+    # split, a container's twins sat minutes from its start and escaped
+    # any near-in-time window. Keep the richer copy; the 40-char floor
+    # protects genuine short repetition ("yeah. yeah.").
+    import difflib as _difflib
+
+    def _norm_dup(t: str) -> str:
+        return re.sub(r"[^a-z0-9 ]", "", t.lower()).strip()
+
+    _dup_drop: set[int] = set()
+    for i in range(len(entries)):
+        if i in _dup_drop:
+            continue
+        ti, li = entries[i][0], entries[i][1]
+        xi = _norm_dup(entries[i][2])
+        if len(xi) < 40:
+            continue
+        for j in range(i + 1, len(entries)):
+            if entries[j][0] - ti > 10.0:
+                break
+            if j in _dup_drop or entries[j][1] != li:
+                continue
+            xj = _norm_dup(entries[j][2])
+            if len(xj) < 40:
+                continue
+            if xi in xj or xj in xi or \
+                    _difflib.SequenceMatcher(None, xi, xj).ratio() >= 0.8:
+                _dup_drop.add(i if len(xi) < len(xj) else j)
+                if i in _dup_drop:
+                    break
+    if _dup_drop:
+        log(f"duplicate suppression: dropped {len(_dup_drop)} "
+            f"near-identical same-speaker line(s)")
+        entries = [e for k2, e in enumerate(entries) if k2 not in _dup_drop]
 
     timing_lines: list[dict] = []
     for start_s, label, text, _origin, toks in entries:
