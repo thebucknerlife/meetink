@@ -1321,8 +1321,19 @@ def main() -> int:
         hp_spans: list[tuple[float, float]] = []
         solo: str | None = None
         if args.header_from:
-            hp_spans = parse_route_spans(
-                re.sub(r"\.txt$", ".route.jsonl", args.header_from))
+            # LIVE stops: the capture writes the BARE route.jsonl in the
+            # session dir; the stamped <base>.route.jsonl only appears in
+            # the archive step, which runs AFTER refine. Looking only for
+            # the stamped file meant the anchor silently never fired on
+            # live stops (field case: the Adriana echo regression) while
+            # QA reprocesses — post-archive — passed. Same duality the
+            # mixer's shell handles: bare first, stamped fallback.
+            hdir = str(Path(args.header_from).parent)
+            for rj in (hdir + "/route.jsonl",
+                       re.sub(r"\.txt$", ".route.jsonl", args.header_from)):
+                hp_spans = parse_route_spans(rj)
+                if hp_spans:
+                    break
             solo = solo_remote_attendee(args.header_from, args.me)
         _t0 = _time.time()
         labeled = offline_diarize_multi(
