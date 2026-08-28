@@ -1703,7 +1703,35 @@ struct LocalSpeechCapture {
         config.height = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
-        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+        // Exclude audio-PROCESSOR apps whose output duplicates another
+        // app's audio. With Krisp in the chain, Zoom renders the raw
+        // meeting to the "krisp speaker" virtual device and Krisp
+        // renders the cleaned copy to the real output — SCK's
+        // all-applications audio capture summed BOTH, ~106 ms apart
+        // (Krisp's processing latency), manufacturing a bad echo on
+        // every Krisp-routed call (field case: Adriana/Jenn; verified
+        // by twin cross-correlation peaks 0.75 @ 0 ms and 0.72 @ -106 ms
+        // against the post-Krisp device tap). A processor app never
+        // ORIGINATES audio, so excluding it can never lose content —
+        // only the duplicate. Env-overridable, comma-separated,
+        // case-insensitive substring match on bundle id or name.
+        let excludePat = (ProcessInfo.processInfo
+            .environment["MEETINK_SYS_EXCLUDE_APPS"] ?? "krisp")
+            .lowercased().split(separator: ",").map {
+                $0.trimmingCharacters(in: .whitespaces)
+            }.filter { !$0.isEmpty }
+        let excludedApps = content.applications.filter { app in
+            excludePat.contains { pat in
+                app.bundleIdentifier.lowercased().contains(pat)
+                    || app.applicationName.lowercased().contains(pat)
+            }
+        }
+        if !excludedApps.isEmpty {
+            fputs("sys capture excluding duplicate-render apps: "
+                  + excludedApps.map { $0.applicationName }
+                      .joined(separator: ", ") + "\n", stderr)
+        }
+        let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
         let delegate = CaptureDelegate(buffer: audioBuffer,
                                        archiveSpool: spool48Enabled ? spool48Sys : nil,
                                        spool16: spoolDir != nil ? spoolSys : nil)
