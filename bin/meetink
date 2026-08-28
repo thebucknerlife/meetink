@@ -313,6 +313,29 @@ build_tap() {
     print -P "${C[green]}✓${C[reset]} Built: $MK_HOME/bin/meetink-tap"
 }
 
+# Experimental per-application capture sidecar (diagnostic): the system
+# mix plus one stream per audio app, each to its own WAV in the session
+# folder. Spawns only when appcap_experiment=on in config — it writes
+# ~330 MB/hour per stream. Separate binary on purpose, like the tap: a
+# sidecar failure must never touch the real recording.
+build_appcap() {
+    print -P "${C[bright_yellow]}▸${C[reset]} Building meetink-appcap (experimental per-app capture)..."
+    local sdk
+    sdk=$(find_sdk) || { print -P "${C[red]}error:${C[reset]} no SDK"; return 1 }
+    swiftc -O -o "$MK_HOME/bin/meetink-appcap" \
+        "$MK_ROOT/src/appcap/Sources/main.swift" \
+        -framework Foundation -framework ScreenCaptureKit -framework CoreMedia \
+        -target arm64-apple-macosx14.0 -sdk "$sdk" || {
+        print -P "${C[red]}error:${C[reset]} appcap build failed"
+        return 1
+    }
+    if command -v codesign >/dev/null 2>&1; then
+        codesign --force --sign "$(mk_codesign_identity)" "$MK_HOME/bin/meetink-appcap" || \
+            print -P "${C[yellow]}⚠${C[reset]} appcap codesign failed"
+    fi
+    print -P "${C[green]}✓${C[reset]} Built: $MK_HOME/bin/meetink-appcap"
+}
+
 build_agent() {
     print -P "${C[bright_yellow]}▸${C[reset]} Building meetink-agent (calendar + notifications)..."
     if ! command -v swiftc >/dev/null 2>&1; then
@@ -1109,6 +1132,17 @@ cmd_start() {
           print -- $! > /tmp/meetink-tap.pid ) 2>/dev/null || true
     fi
 
+    # Experimental per-app capture (diagnostic; OPT-IN — it writes
+    # ~330 MB/hour per stream): the historical all-apps mix plus one
+    # stream per audio app, for topology comparison. Same best-effort
+    # isolation as the tap; self-exits when capture dies.
+    if [[ "$(grep '^appcap_experiment=' "$MK_CONFIG_FILE" 2>/dev/null | cut -d= -f2-)" == "on" \
+          && -x "$MK_HOME/bin/meetink-appcap" ]]; then
+        ( "$MK_HOME/bin/meetink-appcap" --out-dir "$session_dir" \
+            >> /tmp/meetink-appcap.log 2>&1 &
+          print -- $! > /tmp/meetink-appcap.pid ) 2>/dev/null || true
+    fi
+
     mk_notify "Recording started" "${session_stamp} — live transcript is filling in"
     # Pre-warm the local /ask model in the background: load it into
     # Metal and prime the prompt cache with the stable context (docs +
@@ -1207,6 +1241,10 @@ cmd_stop() {
     fi
     rm -f "$PID_FILE"
     # Experimental tap sidecar: clean SIGINT finalizes its WAV header.
+    if [[ -f /tmp/meetink-appcap.pid ]]; then
+        kill -INT "$(cat /tmp/meetink-appcap.pid)" 2>/dev/null || true
+        rm -f /tmp/meetink-appcap.pid
+    fi
     if [[ -f /tmp/meetink-tap.pid ]]; then
         kill -INT "$(cat /tmp/meetink-tap.pid)" 2>/dev/null || true
         rm -f /tmp/meetink-tap.pid
@@ -1323,6 +1361,10 @@ cmd_discard() {
     rm -f "$PID_FILE"
     # Tap sidecar dies with the discard (WAV header pre-sized: playable
     # even without a clean finalize; the folder is deleted anyway).
+    if [[ -f /tmp/meetink-appcap.pid ]]; then
+        kill "$(cat /tmp/meetink-appcap.pid)" 2>/dev/null || true
+        rm -f /tmp/meetink-appcap.pid
+    fi
     if [[ -f /tmp/meetink-tap.pid ]]; then
         kill "$(cat /tmp/meetink-tap.pid)" 2>/dev/null || true
         rm -f /tmp/meetink-tap.pid
@@ -1516,6 +1558,7 @@ case "${1:-}" in
     app|viewer)        shift 2>/dev/null; cmd_app "$@" ;;
     _build_agent)      build_agent ;;
     _build_tap)        build_tap ;;
+    _build_appcap)     build_appcap ;;
     _build_capture)    build_capture ;;
     aec)               case "$2" in
                            install)  cmd_aec_install ;;
