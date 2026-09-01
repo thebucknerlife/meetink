@@ -1067,24 +1067,40 @@ class WatchManager:
             ev.fallback_asked = True
 
         def worker():
+            # default is a SENTINEL: a timed-out banner must be
+            # distinguishable from an explicit Skip (the adopted nudge
+            # learned this first). Marking timeouts SKIPPED armed the
+            # skipped-covering veto and blocked every later start while
+            # the user sat in the meeting unrecorded (field cases: the
+            # American Airlines call, the Curveglass debrief).
             response = _agent_notify(
                 title=f"“{ev.title}” has started",
                 body="No meeting app detected — recording anyway?",
                 actions=["Start recording", "Skip"],
-                default="Skip",
+                default="(timeout)",
                 timeout=600,
                 linger=20,
                 group=_event_group("fallback", ev),
             )
-            if "start" not in (response or "").lower():
-                _wlog(f"fallback declined/ignored for '{ev.title}'")
+            low = (response or "").lower()
+            if "start" in low:
+                with self._lock:
+                    if self._currently_recording is not None or _capture_pid():
+                        return
+                self._begin_event_recording(ev, armed=False)
+                return
+            if "skip" in low:
+                _wlog(f"fallback declined for '{ev.title}' — respecting")
                 with self._lock:
                     ev.status = EventStatus.SKIPPED
                 return
+            # Unanswered is NOT a decision. DEFERRED: never re-asked
+            # (fallback_asked stays set), but presence may still start
+            # it if the call becomes visible later.
+            _wlog(f"fallback unanswered for '{ev.title}' — deferred "
+                  f"(presence can still start it)")
             with self._lock:
-                if self._currently_recording is not None or _capture_pid():
-                    return
-            self._begin_event_recording(ev, armed=False)
+                ev.status = EventStatus.DEFERRED
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1463,6 +1479,31 @@ class WatchManager:
     def _adopted_auto_stop(self, pid: int) -> None:
         if _capture_pid() != pid:
             return
+        # Rule 2 caveat (recall over precision): "the meeting app went
+        # away" is contradicted by LIVE SPEECH. The app that vanished can
+        # be the PREVIOUS call's leftover tab closing minutes into a
+        # manual recording of an invisible-platform call (field case:
+        # the American Airlines meeting, killed 2 minutes in while the
+        # user talked on). While the transcript is still growing, watch
+        # instead of stopping: app back -> stand down; 5 minutes of
+        # silence -> stop for real.
+        if _transcript_idle_seconds() < 120:
+            _wlog(f"adopted recording (pid {pid}): meeting app gone but "
+                  f"speech is LIVE — watching instead of stopping")
+            for _ in range(120):
+                time.sleep(30)
+                if _capture_pid() != pid:
+                    return
+                with self._lock:
+                    if self._last_meeting_active.get("active"):
+                        _wlog(f"adopted recording (pid {pid}): meeting "
+                              f"app back — standing down")
+                        self._adopted_nudged = False
+                        return
+                if _transcript_idle_seconds() >= 300:
+                    _wlog(f"adopted recording (pid {pid}): speech went "
+                          f"quiet with no meeting app — stopping now")
+                    break
         # Same wrap-up-blip protection as watch-started stops (the Eddie
         # ghost: adopted stop, camera lingered, instant start 45 s later).
         with self._lock:
@@ -1598,8 +1639,11 @@ class WatchManager:
             ]
             if any(e.status == EventStatus.SKIPPED for e in covering):
                 return
+            # DEFERRED = an unanswered fallback ask; presence arriving
+            # later IS the answer the banner never got.
             startable = [e for e in covering if e.status in
-                         (EventStatus.PENDING, EventStatus.NOTIFIED)]
+                         (EventStatus.PENDING, EventStatus.NOTIFIED,
+                          EventStatus.DEFERRED)]
             if startable:
                 startable.sort(key=lambda e: (-e.score(), e.start))
                 matched_event = startable[0]
