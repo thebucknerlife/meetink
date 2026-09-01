@@ -679,6 +679,46 @@ class WatchManager:
             target.status = EventStatus.SKIPPED
             return target.title
 
+    def safe_to_restart(self) -> bool:
+        """A quiet moment where exit-and-respawn loses nothing: no
+        capture (ours, adopted, or anyone's), no live postproc, no ask
+        in flight, no meeting activity visible, and no attendee-event
+        starting within the next 15 minutes. The daemon knows all of
+        this — which is why self-refresh beats any cron."""
+        if _capture_pid() is not None:
+            return False
+        pp = Path("/tmp/meetink-postproc.pid")
+        if pp.is_file():
+            try:
+                os.kill(int(pp.read_text().strip()), 0)
+                return False
+            except (ValueError, OSError):
+                pass
+        ppd = Path("/tmp/meetink-postproc.d")
+        if ppd.is_dir():
+            for sub in ppd.iterdir():
+                try:
+                    os.kill(int((sub / "pid").read_text().strip()), 0)
+                    return False
+                except (ValueError, OSError):
+                    continue
+        now = _now()
+        with self._lock:
+            if self._currently_recording is not None \
+                    or self._adopted_pid is not None \
+                    or self._instant_pending:
+                return False
+            if self._last_meeting_active.get("active"):
+                return False
+            for e in self._events.values():
+                if e.status in (EventStatus.PENDING, EventStatus.NOTIFIED,
+                                EventStatus.DEFERRED) \
+                        and len(e.attendees) >= 2 \
+                        and now - timedelta(minutes=2) <= e.start \
+                        <= now + timedelta(minutes=15):
+                    return False
+        return True
+
     # -- main loop ----------------------------------------------------------
 
     def _loop(self) -> None:
@@ -1856,6 +1896,29 @@ def daemon_main() -> int:
     mgr = WatchManager.get()
     mgr.start()
     print(f"[watch-daemon] running (owner pid {owner or 'none'})", file=sys.stderr)
+
+    # Self-refresh: deploys edit this package on disk while the running
+    # daemon keeps pre-deploy code — recall-critical fixes sat inert for
+    # up to 12 days waiting on a manual respawn. Check the source
+    # fingerprint once a minute; when it changes, exit at a provably
+    # quiet moment (safe_to_restart: idle, no postproc, nothing on the
+    # calendar for 15 min, ≥10 min uptime so a bad deploy can't
+    # crash-loop) and the app's reconciler respawns us on fresh code in
+    # seconds. Nothing changed on disk = no restart, ever — stability
+    # is the default, freshness only when there is something to gain.
+    def _src_fingerprint() -> str:
+        parts = []
+        for p in sorted(Path(__file__).parent.glob("*.py")):
+            try:
+                st = p.stat()
+                parts.append(f"{p.name}:{st.st_mtime_ns}:{st.st_size}")
+            except OSError:
+                continue
+        return "|".join(parts)
+
+    boot_fp = _src_fingerprint()
+    boot_t = time.time()
+    ticks = 0
     try:
         while True:
             time.sleep(10)
@@ -1865,6 +1928,14 @@ def daemon_main() -> int:
                 except ProcessLookupError:
                     print("[watch-daemon] owner gone — exiting", file=sys.stderr)
                     break
+            ticks += 1
+            if ticks % 6 == 0 and time.time() - boot_t > 600 \
+                    and _src_fingerprint() != boot_fp \
+                    and mgr.safe_to_restart():
+                print("[watch-daemon] source changed on disk — exiting at "
+                      "a quiet moment to pick it up (reconciler respawns)",
+                      file=sys.stderr)
+                break
     finally:
         mgr.stop()
         try:
