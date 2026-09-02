@@ -527,7 +527,7 @@ def offline_diarize_multi(streams: list[dict], port: int,
                           me_label: str | None = None,
                           priors: list[tuple[float, float, str]] | None = None,
                           hp_spans: list[tuple[float, float]] | None = None,
-                          solo_remote: str | None = None) -> list[dict] | None:
+                          attendees: list[str] | None = None) -> list[dict] | None:
     """Joint offline diarization over one or more streams.
 
     streams: [{"raw": bytes, "segs": [...], "origin": "mic"|"sys"|"import"}]
@@ -682,6 +682,8 @@ def offline_diarize_multi(streams: list[dict], port: int,
 
     # 3b. Cluster -> name via enrolled profiles (same gate ladder /identify
     # uses), then resolve the user's cluster, then Speaker N the rest.
+    attendee_set = {a for a in (attendees or []) if a}
+    me_up_gate = (me_label or "").strip().upper()
     for gi, c in enumerate(cents):
         if names[gi] is not None:
             continue
@@ -697,6 +699,19 @@ def offline_diarize_multi(streams: list[dict], port: int,
             ok = best_sim >= single_floor
         elif ok:
             ok = (best_sim - runner) >= margin
+        # STRANGER BAR (calendar-aware skepticism): a profile match for
+        # someone NOT on the invite must clear a higher bar. With 50+
+        # profiles at a lax open-set threshold, grazes happen (field
+        # case: a polluted PETER BELK profile naming voices in calls he
+        # was never in). Uninvited people DO join — a strong match still
+        # passes — but a weak graze doesn't get a name for free.
+        if ok and attendee_set and best_name:
+            first = re.split(r"[@\s.]", best_name.strip())[0].upper()
+            if first not in attendee_set and first != me_up_gate:
+                if best_sim < threshold + 0.12 or (best_sim - runner) < 2 * margin:
+                    log(f"stranger bar: {best_name} ({best_sim:.2f}) "
+                        f"rejected — not on the invite, below the bar")
+                    ok = False
         if ok:
             names[gi] = best_name.upper()
 
@@ -806,16 +821,33 @@ def offline_diarize_multi(streams: list[dict], port: int,
             speaker_n += 1
             labels.append(f"Speaker {speaker_n}")
 
-    # 1:1 CALENDAR MAPPING (Sol review): a 1:1 has exactly one remote
-    # human; when exactly one substantial cluster ended up unnamed
-    # ("Speaker N") it is that attendee. Escape hatches: several unnamed
-    # substantial clusters (unexpected guest — leave them), or the
-    # attendee's name already claimed by a profile-matched cluster.
-    # Origin gate: the cluster must be sys-majority when stems exist
-    # (never hand the calendar name to a mic-side voice); single-stream
-    # relabel/import has no origins to check.
-    if solo_remote:
-        target = solo_remote.strip().upper()
+    # CALENDAR MAPPING (Sol review, generalized): when exactly ONE
+    # invited attendee is still unaccounted for among the named voices
+    # AND exactly one substantial cluster ended up unnamed ("Speaker N"),
+    # they are the same person — in a 1:1 or a five-person call alike
+    # (field case: "fairly obvious Speaker N but it's someone on the
+    # call"). Escape hatches: several unaccounted attendees, several
+    # unnamed substantial clusters, or a comparable-sized cluster
+    # already claiming the name. Origin gate: the cluster must be
+    # sys-majority when stems exist (never hand a calendar name to a
+    # mic-side voice); single-stream relabel/import has no origins.
+    mapped_target: str | None = None
+    target: str | None = None
+    if attendees:
+        named_firsts = {l.split()[0].upper() for l in labels
+                        if l and l != "THEM" and not l.startswith("Speaker ")}
+        me_up2 = me_name or me_up_gate
+        unacc: list[str] = []
+        for a in attendees:
+            if a and a != me_up2 and len(a) >= 2 and a.isalpha() \
+                    and a not in named_firsts and a not in unacc:
+                unacc.append(a)
+        if len(unacc) == 1:
+            target = unacc[0]
+        elif len(unacc) > 1:
+            log(f"calendar mapping skipped: {len(unacc)} unaccounted "
+                f"attendee(s) ({', '.join(unacc)})")
+    if target:
         have_origins = any(st["origin"] in ("mic", "sys") for st in streams)
 
         def _sys_majority(g: list[int]) -> bool:
@@ -841,16 +873,17 @@ def offline_diarize_multi(streams: list[dict], port: int,
                              for gi in range(len(labels))
                              if labels[gi] == target), default=0.0)
             if claim_dur >= 0.3 * cand_dur:
-                log(f"1:1 mapping skipped: {target} already claimed by a "
-                    f"comparable cluster ({claim_dur:.0f}s vs "
+                log(f"calendar mapping skipped: {target} already claimed "
+                    f"by a comparable cluster ({claim_dur:.0f}s vs "
                     f"candidate {cand_dur:.0f}s)")
             else:
-                log(f"1:1 mapping: {labels[cand[0]]} -> {target} "
-                    f"(sole remote cluster; calendar attendee)")
+                log(f"calendar mapping: {labels[cand[0]]} -> {target} "
+                    f"(sole unnamed cluster; sole unaccounted attendee)")
                 labels[cand[0]] = target
+                mapped_target = target
         else:
-            log(f"1:1 mapping skipped: {len(cand)} unnamed substantial "
-                f"remote cluster(s) (calendar says {target})")
+            log(f"calendar mapping skipped: {len(cand)} unnamed "
+                f"substantial cluster(s) (calendar says {target})")
 
     for gi, tj in fold_into.items():
         labels[gi] = labels[tj]
@@ -1009,6 +1042,20 @@ def offline_diarize_multi(streams: list[dict], port: int,
         if bucket_used:
             speaker_n += 1
 
+    # With the sole unaccounted remote voice just named, a sys-origin
+    # window that fell to THEM can only be that person — the same
+    # topology argument as the anchor. Kills the scattered one-word
+    # 'THEM: Yeah.' lines in 1:1s (field: 32 THEM lines / 8 meetings,
+    # median one word).
+    if mapped_target:
+        _swept = 0
+        for k, (si, _i, t0, t1) in enumerate(windows):
+            if streams[si]["origin"] == "sys" and win_label.get(k) == "THEM":
+                win_label[k] = mapped_target
+                _swept += 1
+        if _swept:
+            log(f"calendar mapping: {_swept} THEM window(s) -> {mapped_target}")
+
     # 4. Per-segment vote (duration-weighted) + single-change splits.
     out: list[dict] = []
     by_seg: dict[tuple[int, int], list] = {}
@@ -1079,6 +1126,10 @@ def offline_diarize_multi(streams: list[dict], port: int,
                     if r is not None:
                         lab = r
                         seg_rescued += 1
+                    elif mapped_target is not None and origin == "sys":
+                        # Sole-remote topology: an unidentified sys
+                        # snippet is the mapped attendee, not THEM.
+                        lab = mapped_target
                 out.append({**seg, "label": lab, "origin": origin})
                 continue
             runs: list = []
@@ -1185,7 +1236,7 @@ def relabel_main(args) -> int:
         [{"raw": raw, "segs": segs, "origin": "import"}],
         args.diarize_port, me_label=args.me,
         priors=parse_label_priors(str(txt)),
-        solo_remote=solo_remote_attendee(str(txt), args.me))
+        attendees=parse_attendee_first_names(str(txt))[0])
     if labeled is None:
         log("diarize sidecar unreachable — relabel needs it")
         return 1
@@ -1319,7 +1370,7 @@ def main() -> int:
         # The route journal (headphone spans) and the calendar's sole
         # remote attendee feed the origin anchor and 1:1 mapping.
         hp_spans: list[tuple[float, float]] = []
-        solo: str | None = None
+        att_names: list[str] = []
         if args.header_from:
             # LIVE stops: the capture writes the BARE route.jsonl in the
             # session dir; the stamped <base>.route.jsonl only appears in
@@ -1334,12 +1385,12 @@ def main() -> int:
                 hp_spans = parse_route_spans(rj)
                 if hp_spans:
                     break
-            solo = solo_remote_attendee(args.header_from, args.me)
+            att_names, _hdr_user = parse_attendee_first_names(args.header_from)
         _t0 = _time.time()
         labeled = offline_diarize_multi(
             streams, args.diarize_port, me_label=args.me,
             priors=parse_label_priors(args.prior) if args.prior else None,
-            hp_spans=hp_spans, solo_remote=solo)
+            hp_spans=hp_spans, attendees=att_names)
         perf_mark("diarize", _t0)
         if labeled is not None:
             for seg in labeled:

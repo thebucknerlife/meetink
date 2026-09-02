@@ -993,6 +993,29 @@ def _add_samples_bulk(
             )
     else:
         rejected_count = 0
+        if name not in profiles and new.shape[0] >= 6:
+            # FIRST enrollment has no existing centroids to check
+            # against, so a fused multi-voice cluster used to become a
+            # polluted profile wholesale (field case: 'Peter Belk' was
+            # born holding three different people's voices — one of them
+            # another regular attendee at 0.991 similarity — and then
+            # named that voice in unrelated calls for days). Keep only
+            # the dominant self-coherent subset: anchor on the sample
+            # with the most neighbors above the outlier floor and keep
+            # that neighborhood; the off-voice minority is dropped.
+            self_sims = new @ new.T
+            neigh = (self_sims >= PROFILE_OUTLIER_FLOOR).sum(axis=1)
+            anchor = int(np.argmax(neigh))
+            keep = self_sims[anchor] >= PROFILE_OUTLIER_FLOOR
+            if int(keep.sum()) < new.shape[0]:
+                rejected_count = int((~keep).sum())
+                accepted_mask = keep
+                print(
+                    f"first-enrollment purity: {name} kept "
+                    f"{int(keep.sum())}/{new.shape[0]} coherent samples "
+                    f"(source={source})",
+                    file=sys.stderr,
+                )
 
     accepted = new[accepted_mask]
     added = int(accepted.shape[0])
