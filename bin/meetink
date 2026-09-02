@@ -1279,6 +1279,14 @@ cmd_stop() {
         trim_trailing_silence "$stop_target"
     fi
 
+    # Playable-audio-first: a quick raw mix lands as <base>.m4a within
+    # seconds so the just-ended meeting can be listened to immediately;
+    # the post-refine archive replaces it with the quality render.
+    _stop_retarget
+    if typeset -f render_preview_m4a >/dev/null 2>&1; then
+        render_preview_m4a "$stop_target"
+    fi
+
     # Re-transcribe the whole session with full acoustic context (parakeet)
     # and replace the transcript content in place. Runs BEFORE name
     # inference so names are inferred from the better text, and refine's

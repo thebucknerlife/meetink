@@ -3665,6 +3665,20 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
             ? NSEdgeInsets(top: 4, left: 12, bottom: 4, right: 12) : NSEdgeInsets()
         for v in playerBar.arrangedSubviews { v.isHidden = (audioPath == nil) }
         noAudioLabel.isHidden = !(archived && audioPath == nil)
+        if !noAudioLabel.isHidden {
+            // "No audio" is only true once the pipeline is done and
+            // nothing landed. Mid-postproc (or with session raws still
+            // present) the honest message is "coming right up" — the
+            // preview render usually makes this window seconds long.
+            let sessDir = (lastResolvedPath as NSString).deletingLastPathComponent
+            let pending = postprocRun(for: lastResolvedPath) != nil
+                || FileManager.default.fileExists(atPath: sessDir + "/session-mic.raw")
+                || FileManager.default.fileExists(atPath: sessDir + "/session-sys.raw")
+            let want = pending
+                ? "Audio is processing — it will be playable here shortly."
+                : "No audio available — enable “Keep audio recording” in Settings"
+            if noAudioLabel.stringValue != want { noAudioLabel.stringValue = want }
+        }
         // The title shows for EVERY open meeting — live and empty ones
         // included. It was gated on `archived`, which (a) hid the title
         // for the whole call and (b) meant a title landing while the

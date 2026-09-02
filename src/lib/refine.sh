@@ -751,6 +751,57 @@ cmd_pyannote_install() {
 # Called from cmd_stop BEFORE refine_session (refine deletes the raw spools
 # on success). Best-effort — never blocks the stop pipeline. Titling later
 # renames these in lockstep with the transcript (same-basename rule).
+# Playable-audio-first (field ask): a plain mic+sys mix lands as
+# <base>.m4a within seconds of the stop so the meeting is listenable
+# immediately, while refine and the transcript-gated QUALITY mix run
+# for minutes — audio_archive_session later overwrites this file with
+# the real render (same overwrite contract reprocess has always used).
+# Best-effort by design: any failure leaves the world exactly as if
+# this step didn't exist. Reads the spools without consuming them.
+render_preview_m4a() {
+    local actual="$1"
+    [[ -L "$actual" ]] && actual=$(readlink "$actual" 2>/dev/null)
+    [[ -f "$actual" ]] || return 0
+    mk_config_bool keep_audio || return 0
+    command -v ffmpeg >/dev/null 2>&1 || return 0
+    local mic="${actual:h}/session-mic.raw"
+    local sys="${actual:h}/session-sys.raw"
+    if [[ ! -s "$mic" && ! -s "$sys" ]]; then
+        mic="$MK_SPOOL_DIR/session-mic.raw"
+        sys="$MK_SPOOL_DIR/session-sys.raw"
+    fi
+    [[ -s "$mic" || -s "$sys" ]] || return 0
+    typeset -f pp_state >/dev/null 2>&1 && pp_state "rendering preview audio"
+    local rate=16000 m="$mic" s="$sys"
+    local out="${actual%.txt}.m4a" tmp="${actual%.txt}.m4a.previewtmp"
+    local rc=0
+    if [[ -s "$mic" && -s "$sys" ]]; then
+        if [[ -s "${mic%.raw}.48k.raw" && -s "${sys%.raw}.48k.raw" ]]; then
+            rate=48000; m="${mic%.raw}.48k.raw"; s="${sys%.raw}.48k.raw"
+        fi
+        ffmpeg -v error -y \
+            -f s16le -ar $rate -ac 1 -i "$m" \
+            -f s16le -ar $rate -ac 1 -i "$s" \
+            -filter_complex "amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95" \
+            -c:a aac -b:a 96k -f ipod "$tmp" 2>>/tmp/meetink-refine.log || rc=1
+    else
+        local only="$mic"
+        [[ -s "$sys" ]] && only="$sys"
+        if [[ -s "${only%.raw}.48k.raw" ]]; then
+            rate=48000; only="${only%.raw}.48k.raw"
+        fi
+        ffmpeg -v error -y -f s16le -ar $rate -ac 1 -i "$only" \
+            -c:a aac -b:a 96k -f ipod "$tmp" 2>>/tmp/meetink-refine.log || rc=1
+    fi
+    if (( rc == 0 )) && [[ -s "$tmp" ]]; then
+        mv -f "$tmp" "$out"
+        print -P "${C[green]}✓${C[reset]} Preview audio ready ${C[dim]}(quality render will replace it)${C[reset]}"
+    else
+        rm -f "$tmp"
+    fi
+    return 0
+}
+
 audio_archive_session() {
     local actual="$1"
     [[ -L "$actual" ]] && actual=$(readlink "$actual" 2>/dev/null)
