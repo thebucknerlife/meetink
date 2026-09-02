@@ -246,8 +246,13 @@ _quality_gate() {
     local first="${warns%%$'\n'*}"
     first="${first#quality: }"
     print -P "${C[yellow]}⚠${C[reset]}  transcript quality: ${first}"
-    typeset -f mk_notify >/dev/null 2>&1 && \
-        mk_notify "Transcript quality" "$first"
+    # PROBLEMS persist (Greg's rule): unlike lifecycle notices this one
+    # posts with its own identity and no --expire, so it rests in
+    # Notification Center until dismissed — and can't be replaced by
+    # the next "Recording started".
+    local qagent="$MK_HOME/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
+    [[ -x "$qagent" ]] && ( "$qagent" notify --title "Transcript quality" \
+        --body "$first" --timeout 5 >/dev/null 2>&1 & ) 2>/dev/null
     typeset -f mk_activity >/dev/null 2>&1 && \
         mk_activity "quality warning — ${${t:t}%.txt}: ${first}"
     return 0
