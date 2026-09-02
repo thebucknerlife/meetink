@@ -85,7 +85,12 @@ mk_config_bool() {
 mk_notify() {
     local agent="$MK_HOME/bin/MeetinkAgent.app/Contents/MacOS/meetink-agent"
     [[ -x "$agent" ]] || return 0
-    "$agent" notify --title "$1" --body "$2" >/dev/null 2>&1 &
+    # One shared identity + expiry: lifecycle notices (started → stopped
+    # → ready) REPLACE each other instead of stacking, and the survivor
+    # clears itself from Notification Center after ~90 s (field report:
+    # three of them sitting on screen 15 minutes later).
+    "$agent" notify --title "$1" --body "$2" \
+        --group lifecycle --timeout 90 --expire >/dev/null 2>&1 &
     disown 2>/dev/null || true
 }
 

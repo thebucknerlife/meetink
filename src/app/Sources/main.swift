@@ -3642,9 +3642,17 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
         if available && (audioPath != candidate || stamp != audioStamp) {
             audioPath = candidate
             audioStamp = stamp
+            // Seamless upgrade: when the quality render replaces the
+            // preview mid-listen, carry the position over and keep
+            // playing instead of going silent.
+            let resumeAt = (player?.isPlaying == true) ? player?.currentTime : nil
             player?.stop()
             player = try? AVAudioPlayer(contentsOf: URL(fileURLWithPath: candidate))
             player?.prepareToPlay()
+            if let t = resumeAt, let p = player, t < p.duration {
+                p.currentTime = t
+                p.play()
+            }
             loadWaveform(path: candidate, stamp: stamp)
             buildLineOffsets(base: base)
             if let pending = pendingSampleSpeaker {
@@ -5007,6 +5015,12 @@ final class TranscriptViewController: NSViewController, NSTextViewDelegate,
     }
 
     private func updateHeader() {
+        // Poll-path audio check: the quality render replaces the m4a
+        // MINUTES after the last transcript write, so render() never
+        // re-runs for it — the player kept serving the preview (or
+        // nothing) until the meeting was reopened (field bug). The
+        // stamp gate inside makes this a single stat() per poll.
+        updatePlayerAvailability()
         let recording = recordingPID() != nil && fixedPath == nil
         statusDot.textColor = recording ? .systemRed : .tertiaryLabelColor
 

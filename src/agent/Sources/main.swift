@@ -275,6 +275,7 @@ func cmdNotify(args: [String]) -> Int32 {
     var lingerSecs: Double = 0
     var defaultAction = ""
     var group = ""
+    var expire = false
 
     var i = 0
     while i < args.count {
@@ -301,6 +302,8 @@ func cmdNotify(args: [String]) -> Int32 {
             if i + 1 < args.count { defaultAction = args[i + 1]; i += 2 } else { i += 1 }
         case "--group":
             if i + 1 < args.count { group = args[i + 1]; i += 2 } else { i += 1 }
+        case "--expire":
+            expire = true; i += 1
         default:
             i += 1
         }
@@ -453,7 +456,12 @@ func cmdNotify(args: [String]) -> Int32 {
     // timeout 1 s) is the opposite: removing it here yanked the banner
     // off screen almost immediately, so let it live out its natural
     // banner life and rest in Notification Center.
-    if actions.contains(where: { $0.lowercased() != "ok" }) || delegate.clicked != nil {
+    // --expire additionally clears informational notices at process
+    // exit (after their full --timeout on screen / in Notification
+    // Center) — lifecycle banners used to rest there forever and stack
+    // three-deep per meeting.
+    if expire || actions.contains(where: { $0.lowercased() != "ok" })
+        || delegate.clicked != nil {
         center.removeDeliveredNotifications(withIdentifiers: [identifier])
         center.removePendingNotificationRequests(withIdentifiers: [identifier])
     }
