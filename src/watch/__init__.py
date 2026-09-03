@@ -468,6 +468,47 @@ def _start_recording_subprocess(env_extras: dict[str, str]) -> bool:
     return True
 
 
+def _me_speech_idle_seconds() -> float:
+    """Seconds since the USER last spoke, from the live transcript's
+    tail (mic-side lines: the configured me_name, or ME). Any-speech
+    idle held app-gone recordings hostage to post-call sys noise —
+    echoes and system sounds transcribe too, and only the user's own
+    mic proves a meeting is genuinely still happening (field case: the
+    Adriana stop dragged 5-10 min past the end). Falls back to
+    any-speech idle when no user line exists in the tail."""
+    me = "ME"
+    try:
+        cfg = Path(os.environ.get("MEETINK_HOME",
+                                  os.path.expanduser("~/.meetink"))) / "config"
+        for line in cfg.read_text(errors="replace").splitlines():
+            if line.startswith("me_name="):
+                me = line.split("=", 1)[1].strip().upper() or "ME"
+                break
+    except OSError:
+        pass
+    try:
+        base = os.environ.get("MEETINK_TRANSCRIPTS_DIR",
+                              os.path.expanduser("~/Documents/meetink"))
+        target = os.path.realpath(os.path.join(base, "live.txt"))
+        tail = open(target, "rb").read()[-16384:].decode("utf-8", "replace")
+    except OSError:
+        return 0.0
+    last_me = None
+    for m in re.finditer(r"^\[(\d{2}):(\d{2}):(\d{2})\] ([^:]+): ", tail,
+                         re.M):
+        lab = m.group(4).strip().upper()
+        if lab in (me, "ME"):
+            last_me = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if last_me is None:
+        return _transcript_idle_seconds()
+    now = datetime.now()
+    then = now.replace(hour=last_me[0], minute=last_me[1],
+                       second=last_me[2], microsecond=0)
+    if then > now:   # midnight wrap
+        then -= timedelta(days=1)
+    return max(0.0, (now - then).total_seconds())
+
+
 def _transcript_idle_seconds() -> float:
     """Seconds since the live transcript last grew — a cheap 'is anyone
     speaking' signal (appends happen within seconds of speech)."""
@@ -1527,11 +1568,11 @@ class WatchManager:
         # user talked on). While the transcript is still growing, watch
         # instead of stopping: app back -> stand down; 5 minutes of
         # silence -> stop for real.
-        if _transcript_idle_seconds() < 120:
+        if _me_speech_idle_seconds() < 120:
             _wlog(f"adopted recording (pid {pid}): meeting app gone but "
-                  f"speech is LIVE — watching instead of stopping")
+                  f"the user spoke recently — watching instead of stopping")
             for _ in range(120):
-                time.sleep(30)
+                time.sleep(15)
                 if _capture_pid() != pid:
                     return
                 with self._lock:
@@ -1540,9 +1581,9 @@ class WatchManager:
                               f"app back — standing down")
                         self._adopted_nudged = False
                         return
-                if _transcript_idle_seconds() >= 300:
-                    _wlog(f"adopted recording (pid {pid}): speech went "
-                          f"quiet with no meeting app — stopping now")
+                if _me_speech_idle_seconds() >= 180:
+                    _wlog(f"adopted recording (pid {pid}): user quiet "
+                          f"{180}s with no meeting app — stopping now")
                     break
         # Same wrap-up-blip protection as watch-started stops (the Eddie
         # ghost: adopted stop, camera lingered, instant start 45 s later).
