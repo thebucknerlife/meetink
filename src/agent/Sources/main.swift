@@ -474,6 +474,7 @@ func cmdNotify(args: [String]) -> Int32 {
 
 import AVFoundation
 import CoreAudio
+import AppKit
 
 // Process-name patterns that indicate an active video-call client.
 // Patterns must be specific enough to avoid matching always-running
@@ -697,47 +698,61 @@ let kBrowserMeetingPatterns: [(label: String, patterns: [String])] = [
     ("around", ["around\\.co/r/", "around\\.co/meet/"]),
 ]
 
-func browserMeetingActive() -> String? {
-    let script = """
-    set out to ""
-    repeat with appName in {"Google Chrome", "Safari", "Arc", "Brave Browser", "Microsoft Edge"}
-      try
-        tell application appName
-          if it is running then
-            repeat with w in (every window)
-              try
-                set tabList to (every tab of w)
-                repeat with t in tabList
-                  set u to URL of t
-                  set out to out & u & "\\n"
-                end repeat
-              on error
-                -- Safari uses `current tab` not `tabs`. Try that.
-                try
-                  set u to URL of (current tab of w)
-                  set out to out & u & "\\n"
-                end try
-              end try
-            end repeat
-          end if
+func browserMeetingActive() -> (label: String?, error: String?) {
+    // Per-browser scripts with LITERAL app names. The old single script
+    // told a VARIABLE app name, which left `tab`/`URL` terminology to
+    // late resolution — and it stopped compiling entirely ("Expected
+    // class name but found property"), silently blinding presence to
+    // every browser meeting (field: two afternoons of unrecorded
+    // Meet calls). Literal names compile against each app's own
+    // dictionary; only RUNNING browsers are scripted (a `tell` to a
+    // closed app would LAUNCH it); each browser's failure is recorded
+    // and surfaced instead of swallowed.
+    let browsers = ["Google Chrome", "Safari", "Arc",
+                    "Brave Browser", "Microsoft Edge"]
+    let running = Set(NSWorkspace.shared.runningApplications
+        .compactMap { $0.localizedName })
+    var urls = ""
+    var errs: [String] = []
+    for b in browsers where running.contains(b) {
+        let script = """
+        tell application "\(b)"
+          set out to ""
+          repeat with w in windows
+            try
+              repeat with t in tabs of w
+                set out to out & (URL of t) & linefeed
+              end repeat
+            end try
+          end repeat
+          return out
         end tell
-      end try
-    end repeat
-    return out
-    """
-    var error: NSDictionary?
-    guard let scriptObj = NSAppleScript(source: script) else { return nil }
-    let result = scriptObj.executeAndReturnError(&error)
-    if error != nil { return nil }
-    guard let s = result.stringValue?.lowercased() else { return nil }
+        """
+        var error: NSDictionary?
+        guard let so = NSAppleScript(source: script) else {
+            errs.append("\(b): script init failed")
+            continue
+        }
+        let res = so.executeAndReturnError(&error)
+        if let error {
+            let msg = (error["NSAppleScriptErrorBriefMessage"] as? String)
+                ?? (error["NSAppleScriptErrorMessage"] as? String)
+                ?? "error \(error["NSAppleScriptErrorNumber"] ?? "?")"
+            errs.append("\(b): \(msg)")
+            continue
+        }
+        urls += (res.stringValue ?? "") + "\n"
+    }
+    let s = urls.lowercased()
+    let errStr = errs.isEmpty ? nil : errs.joined(separator: "; ")
     for (label, patterns) in kBrowserMeetingPatterns {
         for p in patterns {
             if s.range(of: p, options: .regularExpression) != nil {
-                return label
+                return (label, errStr)
             }
         }
     }
-    return nil
+    return (nil, errStr)
 }
 
 func cmdMeetingActive(args: [String]) -> Int32 {
@@ -832,11 +847,12 @@ func cmdMeetingActive(args: [String]) -> Int32 {
         primary = primary ?? "video"
     }
 
-    let tab = browserMeetingActive()
+    let (tab, tabErr) = browserMeetingActive()
     checks.append(["label": "browser meeting tab",
                    "state": tab != nil,
                    "detail": tab.map { "room URL open (\($0))" }
-                       ?? "no meeting-room tab"])
+                       ?? (tabErr.map { "scan FAILED: \($0)" }
+                           ?? "no meeting-room tab")])
     if let b = tab {
         sources.append("browser:\(b)")
         primary = primary ?? b
@@ -860,6 +876,7 @@ func cmdMeetingActive(args: [String]) -> Int32 {
         "source":  primary ?? NSNull(),
         "signals": sources,
         "checks":  checks,
+        "browser_error": tabErr ?? NSNull(),
     ]
     print(jsonString(out))
     return 0

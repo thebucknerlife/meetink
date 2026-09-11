@@ -1147,13 +1147,54 @@ class WatchManager:
             ev = candidates[0]
             ev.fallback_asked = True
 
+        # Forensics: when presence sees nothing at event time, say WHY
+        # in the log — a broken browser scan (TCC/automation) and a
+        # genuinely app-less phone meeting used to be indistinguishable
+        # (field: two afternoons of invisible meetings).
+        with self._lock:
+            snap = dict(self._last_meeting_active)
+        berr = snap.get("browser_error")
+        _wlog(f"fallback for '{ev.title}': no presence"
+              + (f" — browser scan ERROR: {berr}" if berr else ""))
+
         def worker():
-            # default is a SENTINEL: a timed-out banner must be
-            # distinguishable from an explicit Skip (the adopted nudge
-            # learned this first). Marking timeouts SKIPPED armed the
-            # skipped-covering veto and blocked every later start while
-            # the user sat in the meeting unrecorded (field cases: the
-            # American Airlines call, the Curveglass debrief).
+            if _watch_mode() == "auto":
+                # Recall over precision: the opt-in banner was the last
+                # opt-in left in auto mode, and every unanswered one was
+                # an unrecorded meeting (field: three in one afternoon —
+                # phone/speakerphone attendance is invisible to
+                # presence). Record the ROOM by default; Skip opts out.
+                # A wrong start is bounded: calendar end + 10 min, the
+                # silence trim, and the user-speech rule.
+                response = _agent_notify(
+                    title=f"“{ev.title}” has started",
+                    body="No meeting app visible — recording the room "
+                         "in 60 s. Skip to ignore.",
+                    actions=["Skip"],
+                    default="Record",
+                    timeout=60,
+                    linger=20,
+                    group=_event_group("fallback", ev),
+                )
+                if "skip" in (response or "").lower():
+                    _wlog(f"fallback declined for '{ev.title}' — respecting")
+                    with self._lock:
+                        ev.status = EventStatus.SKIPPED
+                    return
+                with self._lock:
+                    if self._currently_recording is not None or _capture_pid():
+                        return
+                _wlog(f"fallback auto-recording '{ev.title}' "
+                      f"(no meeting app visible — room capture)")
+                self._begin_event_recording(ev, armed=False)
+                return
+            # Notify mode keeps the explicit ask. default is a SENTINEL:
+            # a timed-out banner must be distinguishable from an explicit
+            # Skip (the adopted nudge learned this first). Marking
+            # timeouts SKIPPED armed the skipped-covering veto and
+            # blocked every later start while the user sat in the
+            # meeting unrecorded (field cases: the American Airlines
+            # call, the Curveglass debrief).
             response = _agent_notify(
                 title=f"“{ev.title}” has started",
                 body="No meeting app detected — recording anyway?",
@@ -1306,6 +1347,13 @@ class WatchManager:
                 rid = self._currently_recording
                 ev = self._events.get(rid) if rid else None
                 if ev is None or (now - ev.end).total_seconds() < 600:
+                    return
+                # Live user speech overrides the calendar boundary — a
+                # phone/speakerphone meeting running long is exactly the
+                # recording this unarmed path exists for (recall over
+                # precision: dead air costs minutes, a cut costs the
+                # meeting's end).
+                if _me_speech_idle_seconds() < 120:
                     return
                 recording_id = rid
                 _wlog(f"stopping '{ev.title}': never saw a meeting app and "
