@@ -691,13 +691,20 @@ _import_enhanced_m4a() {
            "$dfn" "$td/in.wav" -o "$td" >>/tmp/meetink-refine.log 2>&1 && \
            [[ -f "$td/in_DeepFilterNet3.wav" ]] && \
            ffmpeg -v error -y -i "$td/in_DeepFilterNet3.wav" -af loudnorm=I=-18 \
-               -c:a aac -b:a 128k "$out" 2>>/tmp/meetink-refine.log; then
+               -ar 48000 -c:a aac -b:a 128k "$out" 2>>/tmp/meetink-refine.log; then
             rc=0
         fi
     fi
     if (( rc != 0 )); then
+        # -ar 48000 is LOAD-BEARING: single-pass loudnorm upsamples to
+        # 192 kHz internally and without an explicit rate the encoder
+        # wrote 96 kHz AAC — an oddball rate whose PLAYBACK decode path
+        # desynced tens of seconds from the (correct) timing sidecar
+        # (field case: an imported voice memo's click-to-play landed
+        # 20-60 s early while every offline decode of the same file was
+        # sample-accurate).
         ffmpeg -v error -y -i "$input" -vn -af loudnorm=I=-18 \
-            -c:a aac -b:a 128k "$out" 2>>/tmp/meetink-refine.log || rc=$?
+            -ar 48000 -c:a aac -b:a 128k "$out" 2>>/tmp/meetink-refine.log || rc=$?
         [[ -f "$out" ]] && rc=0
     fi
     rm -rf "$td"
