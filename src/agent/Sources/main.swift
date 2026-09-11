@@ -542,10 +542,23 @@ func runningConferencingApp() -> String? {
 // the tab scan) can never self-detect. Unlike the device-level mic
 // check, this stays meaningful WHILE meetink records: attribution is
 // per-process.
-let kAudioInputCallers: [String: String] = [
-    "com.tinyspeck.slackmacgap": "slack",
-    "com.hnc.discord": "discord",
-    "com.apple.facetime": "facetime",
+// Matched by SUBSTRING against the lowercased bundle id — the process
+// actually holding the input stream is often a HELPER
+// (com.google.Chrome.helper), not the main bundle. Browsers are here
+// because a browser holding a live MIC stream is a call in progress —
+// the URL scan cannot see the modern Teams web app (a persistent /v2/
+// SPA whose URL never changes on leave; field audit: ZERO Teams
+// presence matches in the entire log history), but the mic stream is
+// call-specific and drops the moment the call ends.
+let kAudioInputCallers: [(pattern: String, label: String)] = [
+    ("com.tinyspeck.slackmacgap", "slack"),
+    ("com.hnc.discord", "discord"),
+    ("com.apple.facetime", "facetime"),
+    ("com.google.chrome", "chrome"),
+    ("com.apple.safari", "safari"),
+    ("company.thebrowser.browser", "arc"),
+    ("com.brave.browser", "brave"),
+    ("com.microsoft.edgemac", "edge"),
 ]
 
 func audioInputCallers() -> [String] {
@@ -586,8 +599,9 @@ func audioInputCallers() -> [String] {
         guard st == noErr,
               let b = (bid as String?)?.lowercased(), !b.isEmpty
         else { continue }
-        if let label = kAudioInputCallers[b], !found.contains(label) {
-            found.append(label)
+        if let hit = kAudioInputCallers.first(where: { b.contains($0.pattern) }),
+           !found.contains(hit.label) {
+            found.append(hit.label)
         }
     }
     return found
@@ -838,8 +852,8 @@ func cmdMeetingActive(args: [String]) -> Int32 {
     if inputApps.isEmpty {
         checks.append(["label": "app-attributed audio input",
                        "state": false,
-                       "detail": "no watched app (slack/discord/facetime) "
-                           + "holds an input stream"])
+                       "detail": "no watched app (slack/discord/facetime/"
+                           + "browsers) holds an input stream"])
     }
 
     if camera {
