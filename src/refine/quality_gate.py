@@ -13,6 +13,7 @@ Usage: quality_gate.py <transcript.txt>
 from __future__ import annotations
 
 import difflib
+import json
 import re
 import sys
 from pathlib import Path
@@ -131,6 +132,29 @@ def main() -> int:
     # 5. Stacked refine headers (reprocess hygiene).
     if sum(1 for l in header if l.startswith("# refined:")) > 1:
         warnings.append("stacked '# refined:' headers")
+
+    # 6. System-audio outages the capture recorded in its health journal
+    # (sys stream died or failed to start; capture continues mic-only and
+    # rebuilds every 20 s, so remote audio may be missing for a stretch).
+    try:
+        events = []
+        health = Path(sys.argv[1]).parent / "health.jsonl"
+        for ln in health.read_text(errors="replace").splitlines():
+            try:
+                events.append(json.loads(ln))
+            except ValueError:
+                pass
+        downs = sum(1 for e in events if e.get("event")
+                    in ("sys-capture-died", "sys-capture-failed"))
+        ups = sum(1 for e in events if e.get("event") == "sys-capture-resumed")
+        if downs:
+            tail = ("recovered" if ups >= downs
+                    else "NOT recovered by meeting end")
+            warnings.append(
+                f"system audio went down {downs} time(s) ({tail}) — "
+                f"remote side may be missing for a stretch")
+    except OSError:
+        pass
 
     for w in warnings:
         print(f"quality: {w}")

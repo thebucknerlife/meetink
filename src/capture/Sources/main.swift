@@ -122,6 +122,46 @@ func hostSeconds() -> Double {
         / Double(info.denom) / 1_000_000_000.0
 }
 
+/// Await an operation with a hard deadline: .success/.failure when it
+/// finishes in time, nil on timeout — the stuck task is abandoned, not
+/// cancelled (cancellation doesn't reach a wedged SCK continuation).
+/// Exists because SCStream.startCapture() can hang FOREVER when replayd
+/// drops the stream connection: every recording for a full day was a
+/// zero-byte zombie (field case 2026-09-10) because that one await sat
+/// ahead of mic setup, the watchdogs, and the chunk loop. Nothing from
+/// the capture stack may ever be awaited unbounded.
+/// First-caller-wins latch for awaitBounded's continuation (exactly one
+/// of the racing tasks may resume it).
+final class ResumeGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if fired { return false }
+        fired = true
+        return true
+    }
+}
+
+func awaitBounded<T: Sendable>(_ seconds: Double,
+                               _ op: @escaping @Sendable () async throws -> T)
+        async -> Result<T, any Error>? {
+    let gate = ResumeGate()
+    return await withCheckedContinuation { cont in
+        Task.detached {
+            let result: Result<T, any Error>
+            do { result = .success(try await op()) }
+            catch { result = .failure(error) }
+            if gate.claim() { cont.resume(returning: result) }
+        }
+        Task.detached {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            if gate.claim() { cont.resume(returning: nil) }
+        }
+    }
+}
+
 final class SpoolWriter: @unchecked Sendable {
     private let handle: FileHandle?
     private let rate: Double
@@ -1277,9 +1317,68 @@ func resampleLinear(_ samples: [Float], from inputRate: Double,
     }
 }
 
+/// Lock-protected holder for the live SCK stream + delegate. This is the
+/// strong reference that keeps both alive (SCStream does NOT retain its
+/// delegate — see the setup comment), across mid-flight restarts, until
+/// shutdown takes them.
+final class SysCaptureSlot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stream: SCStream?
+    private var delegate: CaptureDelegate?
+    private var up = false
+
+    func isUp() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return up
+    }
+
+    func markDown() {
+        lock.lock()
+        up = false
+        lock.unlock()
+    }
+
+    func set(stream: SCStream, delegate: CaptureDelegate) {
+        lock.lock()
+        self.stream = stream
+        self.delegate = delegate
+        up = true
+        lock.unlock()
+    }
+
+    func take() -> (SCStream, CaptureDelegate)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let s = stream, let d = delegate else { return nil }
+        stream = nil
+        delegate = nil
+        up = false
+        return (s, d)
+    }
+}
+
 class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
     let buffer: AudioBuffer
     let targetFormat: AVAudioFormat
+    /// Fires when SCK kills the stream mid-flight (never on a normal
+    /// stopCapture). Called on SCK's own queue; set before startCapture.
+    var onStopped: (@Sendable (any Error) -> Void)?
+    // An abandoned delegate (its startCapture timed out and a replacement
+    // is coming) must go silent: if the zombie stream ever wakes up it
+    // would double-feed the shared spools next to the live stream.
+    private let stateLock = NSLock()
+    private var _abandoned = false
+    func abandon() {
+        stateLock.lock()
+        _abandoned = true
+        stateLock.unlock()
+    }
+    private var isAbandoned: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _abandoned
+    }
     /// 48 kHz sys archive spool; nil when archive spooling is off.
     let archiveSpool: SpoolWriter?
     /// 16 kHz sys spool — written HERE (with the buffer's host time)
@@ -1303,7 +1402,7 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio else { return }
+        guard type == .audio, !isAbandoned else { return }
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
 
         let length = CMBlockBufferGetDataLength(blockBuffer)
@@ -1406,7 +1505,9 @@ class CaptureDelegate: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
+        guard !isAbandoned else { return }
         fputs("Screen capture stopped: \(error)\n", stderr)
+        onStopped?(error)
     }
 }
 
@@ -1581,13 +1682,6 @@ struct LocalSpeechCapture {
                            rate: simRate, buffer: audioBuffer)
         }
 
-        // --- System audio via ScreenCaptureKit ---
-        // BOTH references must outlive this block. SCStream does NOT
-        // strongly retain its delegate/stream-output — when the sim-mode
-        // refactor moved `let delegate` to block scope, the delegate
-        // deallocated at the closing brace and SCK kept "capturing" into a
-        // dead object: startCapture() succeeds, zero errors, zero samples,
-        // 0-byte sys spool (field-debugged mid-Zoom-call 2026-08-04).
         // --- Spool writers (no-ops when MEETINK_SPOOL_DIR is unset) ---
         // Created before the capture sources: the SCK delegate and mic tap
         // write the 48 kHz archive spools directly from their callbacks
@@ -1671,37 +1765,27 @@ struct LocalSpeechCapture {
         }
 #endif
 
-        var scStream: SCStream? = nil
-        var scDelegate: CaptureDelegate? = nil
+        // --- System audio via ScreenCaptureKit ---
+        // The slot is the strong reference that keeps stream + delegate
+        // alive: SCStream does NOT retain either — when the sim-mode
+        // refactor moved `let delegate` to block scope, the delegate
+        // deallocated at the closing brace and SCK kept "capturing" into a
+        // dead object: startCapture() succeeds, zero errors, zero samples,
+        // 0-byte sys spool (field-debugged mid-Zoom-call 2026-08-04).
+        let sysSlot = SysCaptureSlot()
         if !simMode {
         fputs("Requesting screen capture permission...\n", stderr)
 
-        let content: SCShareableContent
+        // TCC probe up front: permission denial is the one failure only
+        // the user can fix, so it keeps the loud early exit.
         do {
-            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         } catch {
             fputs("\nError: Screen recording permission denied.\n", stderr)
             fputs("Fix: System Settings > Privacy & Security > Screen & System Audio Recording\n", stderr)
             fputs("       → Enable your terminal app\n", stderr)
             Foundation.exit(1)
         }
-
-        guard let display = content.displays.first else {
-            fputs("Error: no display found\n", stderr)
-            Foundation.exit(1)
-        }
-
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true
-        // Archive spooling wants the full-bandwidth stream; the delegate
-        // downsamples to 16 kHz for whisper. With archiving off SCK
-        // delivers 16 kHz directly — byte-identical to the old behavior.
-        config.sampleRate = spool48Enabled ? Int(archiveRate) : Int(sampleRate)
-        config.channelCount = 1
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
         // Exclude audio-PROCESSOR apps whose output duplicates another
         // app's audio. With Krisp in the chain, Zoom renders the raw
@@ -1720,35 +1804,119 @@ struct LocalSpeechCapture {
             .lowercased().split(separator: ",").map {
                 $0.trimmingCharacters(in: .whitespaces)
             }.filter { !$0.isEmpty }
-        let excludedApps = content.applications.filter { app in
-            excludePat.contains { pat in
-                app.bundleIdentifier.lowercased().contains(pat)
-                    || app.applicationName.lowercased().contains(pat)
+
+        // The spool writers are `var`s (assigned once, above); snapshot
+        // them into lets so the @Sendable attempt closure can capture.
+        let sysSpool16: SpoolWriter? = spoolDir != nil ? spoolSys : nil
+        let sysSpool48: SpoolWriter? = spool48Enabled ? spool48Sys : nil
+
+        // One full (re)build per attempt: fresh shareable content, fresh
+        // excluded-app references, fresh stream. Reusing a filter across
+        // restarts would hold stale SCRunningApplication refs — an
+        // excluded app that relaunched mid-outage would stop matching.
+        let startSysCapture: @Sendable () async -> Bool = {
+            let content: SCShareableContent
+            do {
+                content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            } catch {
+                fputs("sys capture: shareable content failed: \(error.localizedDescription)\n", stderr)
+                return false
+            }
+            guard let display = content.displays.first else {
+                fputs("sys capture: no display found\n", stderr)
+                return false
+            }
+
+            let config = SCStreamConfiguration()
+            config.capturesAudio = true
+            config.excludesCurrentProcessAudio = true
+            // Archive spooling wants the full-bandwidth stream; the delegate
+            // downsamples to 16 kHz for whisper. With archiving off SCK
+            // delivers 16 kHz directly — byte-identical to the old behavior.
+            config.sampleRate = spool48Enabled ? Int(archiveRate) : Int(sampleRate)
+            config.channelCount = 1
+            config.width = 2
+            config.height = 2
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+
+            let excludedApps = content.applications.filter { app in
+                excludePat.contains { pat in
+                    app.bundleIdentifier.lowercased().contains(pat)
+                        || app.applicationName.lowercased().contains(pat)
+                }
+            }
+            if !excludedApps.isEmpty {
+                fputs("sys capture excluding duplicate-render apps: "
+                      + excludedApps.map { $0.applicationName }
+                          .joined(separator: ", ") + "\n", stderr)
+            }
+            let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
+            let delegate = CaptureDelegate(buffer: audioBuffer,
+                                           archiveSpool: sysSpool48,
+                                           spool16: sysSpool16)
+            delegate.onStopped = { error in
+                // Normal shutdown never lands here: micGeneration stops
+                // before stopCapture is called.
+                guard micGeneration.isActive() else { return }
+                sysSlot.markDown()
+                healthJournal.record("sys-capture-died", detail: "\(error)",
+                                     generation: micGeneration.current())
+                fputs("SYSTEM AUDIO DOWN (\(error.localizedDescription)) — mic still recording; rebuilding every 20 s\n", stderr)
+            }
+            let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
+            do {
+                try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: DispatchQueue(label: "system-audio"))
+            } catch {
+                fputs("sys capture: addStreamOutput failed: \(error.localizedDescription)\n", stderr)
+                return false
+            }
+            switch await awaitBounded(15, { try await stream.startCapture() }) {
+            case .some(.success):
+                sysSlot.set(stream: stream, delegate: delegate)
+                return true
+            case .some(.failure(let error)):
+                fputs("sys capture: startCapture failed: \(error.localizedDescription)\n", stderr)
+                return false
+            case .none:
+                // A wedged replayd never resolves this await. Walk away —
+                // neutered delegate, best-effort stop — and strand the
+                // stuck task instead of the whole pipeline.
+                fputs("sys capture: startCapture hung >15 s — abandoned\n", stderr)
+                delegate.abandon()
+                Task.detached { try? await stream.stopCapture() }
+                return false
             }
         }
-        if !excludedApps.isEmpty {
-            fputs("sys capture excluding duplicate-render apps: "
-                  + excludedApps.map { $0.applicationName }
-                      .joined(separator: ", ") + "\n", stderr)
-        }
-        let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
-        let delegate = CaptureDelegate(buffer: audioBuffer,
-                                       archiveSpool: spool48Enabled ? spool48Sys : nil,
-                                       spool16: spoolDir != nil ? spoolSys : nil)
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
-        try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: DispatchQueue(label: "system-audio"))
-
-        do {
-            try await stream.startCapture()
-        } catch {
-            fputs("\nError starting capture: \(error.localizedDescription)\n", stderr)
-            Foundation.exit(1)
+        if await startSysCapture() {
+            fputs("System audio capture started\n", stderr)
+        } else {
+            // Recall over precision: a mic-only recording still carries
+            // the user's side (and BOTH sides of a speakerphone meeting);
+            // exiting here would miss the meeting entirely.
+            healthJournal.record("sys-capture-failed",
+                detail: "no system audio at startup — mic-only until recovery",
+                generation: micGeneration.current())
+            fputs("WARNING: system audio failed to start — recording MIC ONLY; retrying every 20 s\n", stderr)
         }
 
-        scStream = stream
-        scDelegate = delegate
-        fputs("System audio capture started\n", stderr)
+        // Recovery loop, one per process: startup failures and mid-flight
+        // stream deaths (didStopWithError) both converge here — the mic
+        // watchdog's rebuild-not-give-up posture, applied to sys. The
+        // spool writers stamp every append with host time, so an outage
+        // becomes silence and the stems stay wall-clock aligned across it.
+        Task.detached {
+            while micGeneration.isActive() {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                guard micGeneration.isActive(), !sysSlot.isUp() else { continue }
+                if await startSysCapture() {
+                    healthJournal.record("sys-capture-resumed",
+                        detail: "stream rebuilt",
+                        generation: micGeneration.current())
+                    fputs("System audio capture RESUMED\n", stderr)
+                }
+            }
+        }
         }
 
         // --- Microphone via AVAudioEngine ---
@@ -2127,13 +2295,17 @@ struct LocalSpeechCapture {
         routeJournalQueue.sync {}
         micEngineRef?.stop()
         micEngineRef?.inputNode.removeTap(onBus: 0)
-        if let scStream {
-            try await scStream.stopCapture()
+        if let (sysStream, sysDelegate) = sysSlot.take() {
+            // A dead stream's stopCapture can hang like its startCapture —
+            // never let it block the flush/refine handoff.
+            _ = await awaitBounded(5, { try await sysStream.stopCapture() })
+            sysDelegate.abandon()
+            // Keep the SCK delegate alive until AFTER capture stops. ARC
+            // frees a local at its last USE, not at scope end — without
+            // this read the delegate dies right after setup and sys audio
+            // silently flatlines.
+            withExtendedLifetime(sysDelegate) {}
         }
-        // Keep the SCK delegate alive until AFTER capture stops. ARC frees
-        // a local at its last USE, not at scope end — without this read the
-        // delegate dies right after setup and sys audio silently flatlines.
-        withExtendedLifetime(scDelegate) {}
 
         // Flush any buffered merged transcript lines
         transcriptMerger.flushAll()
